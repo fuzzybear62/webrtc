@@ -214,7 +214,9 @@ class WebSocketView(HomeAssistantView):
         t_start = time.perf_counter()
 
         params = request.query
-        _LOGGER.debug(f"New client: {dict(params)}")
+        # [TRACE] Capture client_id from JS for logging correlation
+        client_id = params.get("client_id", "unknown")
+        _LOGGER.debug(f"[{client_id}] New client connection request: {dict(params)}")
 
         if request.query.get("embed"):
             link_id = request.query.get("url")
@@ -241,7 +243,8 @@ class WebSocketView(HomeAssistantView):
         if "poster" in params:
             return await ws_poster(hass, params)
 
-        ws_server = web.WebSocketResponse(autoclose=False, autoping=False)
+        # FIX: Added heartbeat=30 to kill zombie connections that fail to send FIN packet
+        ws_server = web.WebSocketResponse(autoclose=False, autoping=False, heartbeat=30)
         ws_server.set_cookie(HLS_COOKIE, HLS_SESSION)
         await ws_server.prepare(request)
 
@@ -260,6 +263,9 @@ class WebSocketView(HomeAssistantView):
         except Exception:
             pass
 
+        # Track active tasks to cancel them later
+        tasks = []
+
         try:
             # ACTIVE_STREAMS += 1
             url = await ws_connect(hass, params)
@@ -268,6 +274,7 @@ class WebSocketView(HomeAssistantView):
             
             # Register Session
             SESSIONS[session_id] = {
+                "client_id": client_id, # Store for sensor inspection
                 "entity_id": params.get("entity", "url"),
                 "client_ip": remote_ip,
                 "user_agent": request.headers.get("User-Agent"),
@@ -278,7 +285,7 @@ class WebSocketView(HomeAssistantView):
             async_dispatcher_send(hass, "webrtc_sessions_updated")
 
             _LOGGER.info(
-                f"[BENCHMARK] Client: {remote_ip} | Handshake: {handshake_ms:.2f}ms | Active Streams: {len(SESSIONS)}"
+                f"[{client_id}] Client: {remote_ip} | Handshake: {handshake_ms:.2f}ms | Active Streams: {len(SESSIONS)}"
             )
 
             async with async_get_clientsession(hass).ws_connect(
@@ -293,22 +300,33 @@ class WebSocketView(HomeAssistantView):
                     "X-Forwarded-Proto": request.scheme,
                 },
             ) as ws_client:
+                
+                # Create Tasks
+                task1 = asyncio.create_task(utils.websocket_forward(ws_server, ws_client))
+                task2 = asyncio.create_task(utils.websocket_forward(ws_client, ws_server))
+                tasks = [task1, task2]
+                
+                # Wait for FIRST completion (e.g., Browser closes connection)
                 await asyncio.wait(
-                    [
-                        asyncio.create_task(
-                            utils.websocket_forward(ws_server, ws_client)
-                        ),
-                        asyncio.create_task(
-                            utils.websocket_forward(ws_client, ws_server)
-                        ),
-                    ],
+                    tasks,
                     return_when=asyncio.FIRST_COMPLETED,
                 )
 
         except Exception as e:
+            _LOGGER.error(f"[{client_id}] Stream error: {e}")
             await ws_server.send_json({"type": "error", "value": str(e)})
 
         finally:
+            # [CRITICAL FIX] Explicitly cancel pending tasks.
+            # Without this, the 'other' direction might keep running, keeping the session alive.
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            
+            # Wait for cancellations to finalize (prevents asyncio warnings)
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+
             # ACTIVE_STREAMS -= 1
             if session_id in SESSIONS:
                 SESSIONS.pop(session_id)
@@ -316,7 +334,7 @@ class WebSocketView(HomeAssistantView):
                 async_dispatcher_send(hass, "webrtc_sessions_updated")
 
             _LOGGER.info(
-                f"[BENCHMARK] Stream ended. Active Streams remaining: {len(SESSIONS)}"
+                f"[{client_id}] Stream ended. Active Streams remaining: {len(SESSIONS)}"
             )
 
         return ws_server

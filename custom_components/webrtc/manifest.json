@@ -2,16 +2,16 @@
   "domain": "webrtc",
   "name": "WebRTC Camera",
   "codeowners": [
-    "@AlexxIT"
+    "@fuzzybear62"
   ],
   "config_flow": true,
   "dependencies": [
     "http",
     "lovelace"
   ],
-  "documentation": "https://github.com/AlexxIT/WebRTC",
+  "documentation": "https://github.com/fuzzybear62/webrtc/",
   "iot_class": "calculated",
-  "issue_tracker": "https://github.com/AlexxIT/WebRTC/issues",
+  "issue_tracker": "https://github.com/fuzzybear62/webrtc/issues",
   "requirements": [],
-  "version": "v3.6.1"
+  "version": "v13.10.22"
 }

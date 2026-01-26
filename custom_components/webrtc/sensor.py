@@ -4,6 +4,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.entity import DeviceInfo
 
 from .utils import DOMAIN
 from . import SESSIONS
@@ -16,7 +17,8 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up the WebRTC connections sensor."""
-    async_add_entities([WebRTCConnectionSensor(hass)])
+    # We pass the entry_id to link the sensor to the specific integration instance
+    async_add_entities([WebRTCConnectionSensor(hass, config_entry.entry_id)])
 
 
 class WebRTCConnectionSensor(SensorEntity):
@@ -28,9 +30,18 @@ class WebRTCConnectionSensor(SensorEntity):
     _attr_icon = "mdi:lan-connect"
     _attr_native_unit_of_measurement = "clients"
 
-    def __init__(self, hass: HomeAssistant):
+    def __init__(self, hass: HomeAssistant, entry_id: str):
         self.hass = hass
         self._attr_extra_state_attributes = {}
+        
+        # LINK TO DEVICE REGISTRY
+        # This ensures the sensor appears under the "WebRTC Camera" device
+        # and not as an orphan entity.
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, entry_id)},
+            name="WebRTC Camera",
+            manufacturer="AlexxIT",
+        )
 
     async def async_added_to_hass(self) -> None:
         """Register callbacks."""

@@ -1,5 +1,5 @@
 /**
- * WebRTC Camera Card v13.10.18
+ * WebRTC Camera Card v13.10.22
  *
  * DESIGN PHILOSOPHY
  * -----------------
@@ -19,7 +19,7 @@
  * Any attempt to "optimize" by reusing the driver will almost certainly reintroduce leaks.
  */
 
-import {VideoRTC} from './video-rtc.js?v=2.2.7';
+import {VideoRTC} from './video-rtc.js?v=2.2.10';
 import {DigitalPTZ} from './digital-ptz.js?v=3.3.0';
 
 // Ensure the dumb driver is registered exactly once.
@@ -51,7 +51,7 @@ class WebRTCCamera extends HTMLElement {
         this._retryCount = 0;
         this._retryTimer = null;
 
-        console.info('[WebRTC Camera] v13.10.17');
+        console.info('[WebRTC Camera] v13.10.22');
     }
 
     setConfig(config) {
@@ -244,9 +244,14 @@ class WebRTCCamera extends HTMLElement {
             if (typeof originalOnPcVideo === 'function') {
                 originalOnPcVideo.call(this.driver, video);
             }
-            this.setStatus('RTC', this.config.title || '');
-            this._retryCount = 0;
-            this._applyPoster();
+            
+            // FIX: Only update UI to 'RTC' if the driver actually accepted the stream.
+            // If rejected (pc is null), we stay on previous status (likely MSE).
+            if (this.driver.pc) {
+                this.setStatus('RTC', this.config.title || '');
+                this._retryCount = 0;
+                this._applyPoster();
+            }
         };
 
         // Inject driver into DOM.

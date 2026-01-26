@@ -236,8 +236,17 @@ async def websocket_forward(ws_from, ws_to) -> None:
                 await ws_to.ping()
             elif msg.type is aiohttp.WSMsgType.PONG:
                 await ws_to.pong()
-            elif ws_to.closed:
-                await ws_to.close(code=ws_to.close_code, message=msg.extra)
+            # FIX: Explicitly handle CLOSE and ERROR to break the loop
+            # This ensures the 'finally' block in __init__.py is executed,
+            # clearing the session from the sensor.
+            elif msg.type is aiohttp.WSMsgType.CLOSE:
+                await ws_to.close()
+                break
+            elif msg.type is aiohttp.WSMsgType.ERROR:
+                break
+            
+            if ws_to.closed:
+                break
     except Exception as e:
         _LOGGER.debug(f"WebSocket forward exception: {repr(e)}")
     finally:

@@ -8,31 +8,20 @@
             margin: 0;
             padding: 0;
             font-family: Arial, Helvetica, sans-serif;
-            background-color: black;
         }
 
-        html, body {
+        html, body, webrtc-camera {
             height: 100%;
             width: 100%;
-            overflow: hidden;
         }
 
-        /* Style to adapt the Lit component to the full window */
-        webrtc-camera {
+        ha-card {
             display: block;
-            height: 100%;
-            width: 100%;
-            
-            /* Removes borders and shadows typical of Lovelace cards */
-            --ha-card-border-width: 0px;
-            --ha-card-box-shadow: none;
-            --ha-card-border-radius: 0px;
-            background: transparent;
         }
     </style>
 </head>
 <body>
-<script type="module" src="./webrtc-camera.js?v=4.1.0"></script>
+<script type="module" src="/webrtc/webrtc-camera.js"></script>
 <script type="module">
     const config = {};
     for (const [k, v] of new URLSearchParams(location.search)) {
@@ -41,49 +30,16 @@
         else config[k] = v;
     }
 
-    // Waits for the Lit component to be defined/registered
-    customElements.whenDefined('webrtc-camera').then(() => {
-        const card = document.createElement('webrtc-camera');
-        
-        // Robust Mock of the Home Assistant object
-        card.hass = {
-            states: {}, // Avoids crash if config uses simple templates
-            callWS: (msg) => new Promise((resolve, reject) => {
-                // Simulates the signature response (Auth)
-                // In embed mode, the backend manages auth via cookie/session
-                if (msg.type === 'auth/sign_path') {
-                    resolve({ path: msg.path });
-                } else {
-                    resolve('');
-                }
-            }),
-            hassUrl: (path) => {
-                // Handles absolute paths if returned by real auth
-                if (path && path.startsWith('http')) return path;
-                // Builds the relative websocket URL for embed mode
-                return location.origin + '/api/webrtc/ws?embed=1';
-            },
-            // Ignores service calls (PTZ/Shortcuts) in this mode
-            callService: (domain, service, data) => {
-                console.warn('[Embed] Service call ignored:', domain, service, data);
-            },
-            fire: (type, data) => {
-                console.log('[Embed] Event fired:', type, data);
-            }
-        };
+    const card = document.createElement('webrtc-camera');
+    card.setConfig(config);
+    card.hass = {
+        callWS: () => new Promise(resolve => {
+            resolve('');
+        }),
+        hassUrl: () => location.origin + '/api/webrtc/ws?embed=1'
+    };
 
-        // FIX 2: Uses setConfig instead of direct assignment
-        // This ensures that _computeConfig is executed correctly
-        try {
-            card.setConfig(config);
-        } catch (e) {
-            console.error("Config Error:", e);
-            document.body.innerHTML = `<div style="color:white; padding:20px;">Error: ${e.message}</div>`;
-            return;
-        }
-
-        document.body.appendChild(card);
-    });
+    document.body.appendChild(card);
 </script>
 </body>
 </html>

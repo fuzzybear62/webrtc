@@ -1,12 +1,18 @@
 /**
- * VideoRTC v2.2.7
- * * This class is a Custom HTML Element that acts as a "Dumb Driver".
- * It handles the complex negotiation of video streams (WebRTC, MSE, HLS)
- * but relies on the parent component for configuration and UI.
+ * VideoRTC v2.2.10 - Fix UI Sync
+ * * Changelog v2.2.10:
+ * - FIX: 'onopen' no longer wipes external message handlers (ui_sync).
+ * This fixes the issue where UI stuck on "Loading..." instead of showing "MSE".
+ * * Changelog v2.2.9:
+ * - FIX: Renamed 'this.id' to 'this.clientId' to avoid DOM conflict in constructor.
  */
 export class VideoRTC extends HTMLElement {
     constructor() {
         super();
+
+        // [TRACE] Generate a short random ID for this session (e.g., "X7K9P")
+        // Renamed to clientId to avoid conflict with HTMLElement.id
+        this.clientId = Math.random().toString(36).substring(2, 7).toUpperCase();
 
         // Timeouts to detect dead connections
         this.DISCONNECT_TIMEOUT = 5000;
@@ -65,7 +71,11 @@ export class VideoRTC extends HTMLElement {
         } else if (value.startsWith('/')) {
             value = 'ws' + location.origin.substring(4) + value;
         }
-        this.wsURL = value;
+        
+        // [TRACE] Append Client ID to URL for server-side logging correlation
+        const separator = value.includes('?') ? '&' : '?';
+        this.wsURL = value + separator + 'client_id=' + this.clientId;
+        
         this.onconnect();
     }
 
@@ -85,7 +95,7 @@ export class VideoRTC extends HTMLElement {
             // If play failed (likely due to Audio Policy), mute and try again.
             if (!this.video.muted) {
                 this.video.muted = true;
-                this.video.play().catch(e => console.warn(e));
+                this.video.play().catch(e => console.warn(`[VideoRTC:${this.clientId}] Autoplay warn:`, e));
             }
         });
     }
@@ -150,7 +160,7 @@ export class VideoRTC extends HTMLElement {
 
         this.video.addEventListener('error', ev => {
             if (this.video.error && this.video.error.code === 4) return;
-            console.warn("[VideoRTC] Video Error:", this.video.error);
+            console.warn(`[VideoRTC:${this.clientId}] Video Error:`, this.video.error);
         });
 
         // SAFARI HACK: Safari lies about supported codecs or has bugs with specific ones.
@@ -182,11 +192,11 @@ export class VideoRTC extends HTMLElement {
         this.ws.addEventListener('error', (e) => {
             if (this.strictMode) {
                 // STRICT: Fail fast on any error
-                console.warn("[VideoRTC] WebSocket Error (Strict): Force Closing", e);
+                console.warn(`[VideoRTC:${this.clientId}] WebSocket Error (Strict): Force Closing`, e);
                 this.onclose(); 
             } else {
                 // RELAXED: Log but keep trying (allows recovery from minor glitches)
-                console.warn("[VideoRTC] WebSocket Error (Relaxed): Ignored", e);
+                console.warn(`[VideoRTC:${this.clientId}] WebSocket Error (Relaxed): Ignored`, e);
             }
         });
 
@@ -255,7 +265,8 @@ export class VideoRTC extends HTMLElement {
         });
 
         this.ondata = null;
-        this.onmessage = {};
+        // FIX: Do not wipe external message handlers (e.g. ui_sync from parent)
+        this.onmessage = this.onmessage || {};
 
         // Initialize Modes based on browser support
         const modes = [];
@@ -320,7 +331,7 @@ export class VideoRTC extends HTMLElement {
      * Logic for Media Source Extensions (Low Latency Video over WS)
      */
     onmse() {
-        console.info('[VideoRTC] Mode: MSE');
+        console.info(`[VideoRTC:${this.clientId}] Mode: MSE`);
         let ms;
         // Use ManagedMediaSource (new standard) or fallback to MediaSource
         if ('ManagedMediaSource' in window) {
@@ -441,10 +452,10 @@ export class VideoRTC extends HTMLElement {
             switch (msg.type) {
                 case 'webrtc/candidate':
                     if (this.mode.includes('webrtc/tcp') && msg.value.includes(' udp ')) return;
-                    pc.addIceCandidate({candidate: msg.value, sdpMid: '0'}).catch(er => console.warn(er));
+                    pc.addIceCandidate({candidate: msg.value, sdpMid: '0'}).catch(er => console.warn(`[VideoRTC:${this.clientId}] ICE Error:`, er));
                     break;
                 case 'webrtc/answer':
-                    pc.setRemoteDescription({type: 'answer', sdp: msg.value}).catch(er => console.warn(er));
+                    pc.setRemoteDescription({type: 'answer', sdp: msg.value}).catch(er => console.warn(`[VideoRTC:${this.clientId}] SDP Error:`, er));
                     break;
                 case 'error':
                     if (!msg.value.includes('webrtc/offer')) return;
@@ -468,7 +479,7 @@ export class VideoRTC extends HTMLElement {
                 });
             }
         } catch (e) {
-            console.warn(e);
+            console.warn(`[VideoRTC:${this.clientId}] Mic Error:`, e);
         }
 
         for (const kind of ['video', 'audio']) {
@@ -504,7 +515,7 @@ export class VideoRTC extends HTMLElement {
 
             if (rtcPriority >= msePriority) {
                 // SWITCH TO WEBRTC
-                console.info('[VideoRTC] Mode: RTC (Socket Closing)');
+                console.info(`[VideoRTC:${this.clientId}] Mode: RTC (Socket Closing)`);
                 this.video.srcObject = stream;
                 this.play();
 
@@ -516,7 +527,7 @@ export class VideoRTC extends HTMLElement {
                 }
             } else {
                 // REJECT WEBRTC
-                console.info('[VideoRTC] Mode: RTC Rejected (Priority < MSE)');
+                console.info(`[VideoRTC:${this.clientId}] Mode: RTC Rejected (Priority < MSE)`);
                 if (this.pc) {
                     this.pc.close();
                     this.pc = null;
@@ -530,7 +541,7 @@ export class VideoRTC extends HTMLElement {
      * Logic for MJPEG (Motion JPEG) - Fallback mode
      */
     onmjpeg() {
-        console.info('[VideoRTC] Mode: MJPEG');
+        console.info(`[VideoRTC:${this.clientId}] Mode: MJPEG`);
         this.ondata = data => {
             this.video.controls = false;
             this.video.poster = 'data:image/jpeg;base64,' + VideoRTC.btoa(data);
@@ -542,7 +553,7 @@ export class VideoRTC extends HTMLElement {
      * Logic for HLS (HTTP Live Streaming)
      */
     onhls() {
-        console.info('[VideoRTC] Mode: HLS');
+        console.info(`[VideoRTC:${this.clientId}] Mode: HLS`);
         this.onmessage['hls'] = msg => {
             if (msg.type !== 'hls') return;
             const url = 'http' + this.wsURL.substring(2, this.wsURL.indexOf('/ws')) + '/hls/';
@@ -557,7 +568,7 @@ export class VideoRTC extends HTMLElement {
      * Logic for MP4 over WebSocket
      */
     onmp4() {
-        console.info('[VideoRTC] Mode: MP4');
+        console.info(`[VideoRTC:${this.clientId}] Mode: MP4`);
         const canvas = document.createElement('canvas');
         let context;
         const video2 = document.createElement('video');
