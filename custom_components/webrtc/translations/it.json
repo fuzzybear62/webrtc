@@ -1,0 +1,95 @@
+{
+  "config": {
+    "abort": {
+      "arch": "Architettura OS non supportata: {uname}",
+      "single_instance_allowed": "Già configurato. È possibile una sola configurazione."
+    },
+    "error": {
+      "connect": "Impossibile connettersi al server go2rtc"
+    },
+    "step": {
+      "user": {
+        "title": "URL go2rtc",
+        "description": "Seleziona la versione del server di streaming [go2rtc](https://github.com/AlexxIT/go2rtc):\n1. Lascia vuoto se vuoi la versione integrata di go2rtc (*utenti base*)\n2. Imposta `http://localhost:1984` se installi l'add-on [go2rtc](https://github.com/AlexxIT/go2rtc#go2rtc-home-assistant-add-on) o [Frigate 12+](https://docs.frigate.video/) (*utenti avanzati*)\n3. Imposta un indirizzo personalizzato se installi go2rtc su un altro server (*hacker*)",
+        "data": {
+          "url": "URL"
+        }
+      },
+      "config": {
+        "title": "Configurazione go2rtc",
+        "description": "Percorso: `{path}`",
+        "data": {
+          "api": "WebUI pubblica sulla porta 1984",
+          "rtsp": "RTSP pubblico sulla porta 8554",
+          "username": "Nome utente pubblico (Web e RTSP)",
+          "password": "Password pubblica (Web e RTSP)"
+        }
+      }
+    }
+  },
+  "entity": {
+    "sensor": {
+      "proxied_connections": {
+        "name": "Connessioni Proxy"
+      }
+    }
+  },
+  "services": {
+    "create_link": {
+      "name": "Crea Link",
+      "description": "Crea un link temporaneo o permanente a uno stream (inserisci `url` o `entity`)",
+      "fields": {
+        "link_id": {
+          "name": "ID Link",
+          "description": "Crea un ID casuale o permanente per il tuo link"
+        },
+        "url": {
+          "name": "URL",
+          "description": "Link allo stream RTSP"
+        },
+        "entity": {
+          "name": "Entità",
+          "description": "Entity_id della telecamera"
+        },
+        "open_limit": {
+          "name": "Limite aperture",
+          "description": "Quante volte il link può essere aperto (0 - illimitato)"
+        },
+        "time_to_live": {
+          "name": "Tempo di vita",
+          "description": "Quanti secondi il link rimarrà attivo (0 - illimitato)"
+        }
+      }
+    },
+    "dash_cast": {
+      "name": "DashCast",
+      "description": "Trasmetti lo stream su un dispositivo Chromecast tramite l'applicazione DashCast",
+      "fields": {
+        "entity_id": {
+          "name": "Entità Media",
+          "description": "Entity_id del lettore multimediale"
+        },
+        "url": {
+          "name": "URL",
+          "description": "Link allo stream RTSP"
+        },
+        "entity": {
+          "name": "Entità",
+          "description": "Entity_id della telecamera"
+        },
+        "extra": {
+          "name": "Extra",
+          "description": "Parametri aggiuntivi della card"
+        },
+        "force": {
+          "name": "Forza",
+          "description": "Forza il riavvio dell'applicazione DashCast"
+        },
+        "hass_url": {
+          "name": "URL Hass",
+          "description": "URL base manuale per il server Hass"
+        }
+      }
+    }
+  }
+}

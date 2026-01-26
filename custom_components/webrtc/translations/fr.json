@@ -27,6 +27,13 @@
       }
     }
   },
+  "entity": {
+    "sensor": {
+      "proxied_connections": {
+        "name": "Connexions Proxy"
+      }
+    }
+  },
   "services": {
     "create_link": {
       "name": "Créer un lien",
@@ -64,7 +71,7 @@
         },
         "url": {
           "name": "URL",
-          "description": "Link to RTSP-stream"
+          "description": "Lien vers le flux RTSP"
         },
         "entity": {
           "name": "Entité",
@@ -75,7 +82,7 @@
           "description": "Paramètres de carte supplémentaires"
         },
         "force": {
-          "name": "Forcer",
+          "name": "Forzar",
           "description": "Forcer le redémarrage de l'application DashCast"
         },
         "hass_url": {

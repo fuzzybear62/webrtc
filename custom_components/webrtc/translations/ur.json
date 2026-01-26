@@ -27,6 +27,13 @@
       }
     }
   },
+  "entity": {
+    "sensor": {
+      "proxied_connections": {
+        "name": "پراکسیڈ کنکشنز"
+      }
+    }
+  },
   "services": {
     "create_link": {
       "name": "لنک بنائیں",

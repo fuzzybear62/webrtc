@@ -1,5 +1,5 @@
 /**
- * WebRTC Camera Card v13.10.22
+ * WebRTC Camera Card v13.10.26
  *
  * DESIGN PHILOSOPHY
  * -----------------
@@ -45,13 +45,27 @@ class WebRTCCamera extends HTMLElement {
         // IMPORTANT: this reference is always temporary.
         this.driver = null;
 
+        // [SEAMLESS HANDOVER] Shadow driver reference.
+        // This driver runs in background to probe for better connections (WebRTC)
+        // without disturbing the active playback.
+        this.shadowDriver = null;
+
         // Reconnection state machine.
         // These flags exist to avoid reconnect storms and overlapping drivers.
         this._isReconnecting = false;
         this._retryCount = 0;
         this._retryTimer = null;
+        
+        // [SEAMLESS HANDOVER] Retry counter for background upgrades
+        this._shadowAttempts = 0;
+        // [SEAMLESS HANDOVER] Watchdog timer to kill stuck shadow connections
+        this._shadowTimeout = null;
+        
+        // [PHANTOM FIX] Timer for delayed upgrade trigger.
+        // Must be cancelable if WebRTC connects spontaneously.
+        this._upgradeTimer = null;
 
-        console.info('[WebRTC Camera] v13.10.22');
+        console.info('[WebRTC Camera] v13.10.26');
     }
 
     setConfig(config) {
@@ -117,7 +131,35 @@ class WebRTCCamera extends HTMLElement {
     disconnectedCallback() {
         // Component removal must fully stop retries and free all resources.
         if (this._retryTimer) clearTimeout(this._retryTimer);
+        // [PHANTOM FIX] Ensure upgrade timer is killed on unmount
+        if (this._upgradeTimer) clearTimeout(this._upgradeTimer);
         this._cleanupDriver();
+    }
+
+    // [SEAMLESS HANDOVER] Helper to clean a specific driver instance
+    _nukeDriver(driverRef, label) {
+        if (!driverRef) return;
+        
+        if (label) console.debug(`[WebRTC Camera] Nuking driver: ${label}`);
+
+        // [CRITICAL] Cleanup watchdog if we are killing the shadow driver.
+        // Failing to do so might cause the timer to kill a future valid driver.
+        if (driverRef === this.shadowDriver && this._shadowTimeout) {
+            clearTimeout(this._shadowTimeout);
+            this._shadowTimeout = null;
+        }
+        
+        driverRef.removeEventListener('connection-closed', this._handleConnectionClosed);
+        
+        // Break callbacks
+        driverRef.onmessage = () => {};
+        driverRef.onpcvideo = () => {};
+        driverRef.ondata = () => {};
+        
+        if (typeof driverRef.ondisconnect === 'function') {
+            driverRef.ondisconnect();
+        }
+        driverRef.remove();
     }
 
     _cleanupDriver() {
@@ -139,21 +181,17 @@ class WebRTCCamera extends HTMLElement {
          * Do NOT weaken this logic.
          * Memory stability depends on this exact behavior.
          */
+        
+        // [SEAMLESS HANDOVER] Cleanup both Active and Shadow drivers
         if (this.driver) {
-            this.driver.removeEventListener('connection-closed', this._handleConnectionClosed);
-
-            // Forcefully break callback references.
-            this.driver.onmessage = () => {};
-            this.driver.onpcvideo = () => {};
-            this.driver.ondata = () => {};
-
-            // Allow the driver to release its internal resources.
-            if (typeof this.driver.ondisconnect === 'function') {
-                this.driver.ondisconnect();
-            }
-
-            this.driver.remove();
+            this._nukeDriver(this.driver, 'Main');
             this.driver = null;
+        }
+        
+        if (this.shadowDriver) {
+            console.info('[WebRTC Camera] Cleaning up Shadow Driver');
+            this._nukeDriver(this.shadowDriver, 'Shadow');
+            this.shadowDriver = null;
         }
     }
 
@@ -173,12 +211,40 @@ class WebRTCCamera extends HTMLElement {
             1000 * Math.pow(2, this._retryCount),
             30000
         );
+        
+        console.debug(`[WebRTC Camera] Scheduling retry in ${delay}ms`);
 
         this._retryTimer = setTimeout(() => {
             this._retryCount++;
             this._isReconnecting = false;
             this.startStream();
         }, delay);
+    }
+
+    // [HARD RESET] Manually triggered by refresh button.
+    // Cleans everything and restarts from scratch (Cold Start).
+    hardReset() {
+        console.info('[WebRTC Camera] Hard Reset Triggered');
+        
+        // 1. Kill timers
+        if (this._retryTimer) clearTimeout(this._retryTimer);
+        if (this._upgradeTimer) clearTimeout(this._upgradeTimer);
+        if (this._shadowTimeout) clearTimeout(this._shadowTimeout);
+        
+        // 2. Kill drivers
+        this._cleanupDriver();
+        
+        // 3. Reset State
+        this._isReconnecting = false;
+        this._retryCount = 0;
+        this._shadowAttempts = 0;
+        
+        // 4. Force UI Feedback
+        const spinner = this.shadowRoot.querySelector('.spinner');
+        if (spinner) spinner.style.display = 'block';
+        
+        // 5. Restart
+        this.startStream();
     }
 
     async startStream() {
@@ -189,49 +255,120 @@ class WebRTCCamera extends HTMLElement {
         const currentStream = this.config.streams[this.streamID] || {};
         const effectiveConfig = {...this.config, ...currentStream};
 
-        this.setStatus('Loading..');
+        // [SEAMLESS HANDOVER] Decision Logic
+        // If we already have a working driver (this.driver), we are initiating a "Shadow Upgrade".
+        // If we don't, it's a "Cold Start".
+        const isShadowMode = !!this.driver && !this._isReconnecting;
 
-        // UX Spinner: Show immediately to cover Auth/WS handshake latency.
-        const spinner = this.shadowRoot.querySelector('.spinner');
-        if (spinner) spinner.style.display = 'block';
+        if (!isShadowMode) {
+            console.info('[WebRTC Camera] Cold Start: Initializing Main Driver');
+            this.setStatus('Loading..');
+            // UX Spinner: Show immediately to cover Auth/WS handshake latency.
+            const spinner = this.shadowRoot.querySelector('.spinner');
+            if (spinner) spinner.style.display = 'block';
 
-        // Always destroy any previous driver before creating a new one.
-        this._cleanupDriver();
+            // Always destroy any previous driver before creating a new one.
+            this._cleanupDriver();
+        } else {
+            console.info(`[WebRTC Camera] Seamless Handover: Launching Shadow Driver (Attempt ${this._shadowAttempts + 1})`);
+            // [DIAGNOSTICS] Set tooltip to indicate optimization is running
+            this.setStatus(null, null, 'Optimizing connection... (Attempting WebRTC Upgrade)');
+            
+            // Ensure no leftover shadow driver exists
+            if (this.shadowDriver) this._nukeDriver(this.shadowDriver, 'Stale Shadow');
+        }
 
         // Create a fresh driver instance.
         // The driver owns all media/network state.
-        this.driver = document.createElement('video-rtc');
-        this.driver.mode = effectiveConfig.mode;
-        this.driver.media = effectiveConfig.media;
-        this.driver.background = effectiveConfig.background;
-        this.driver.visibilityThreshold = effectiveConfig.intersection || 0;
+        const newDriver = document.createElement('video-rtc');
+        newDriver.mode = effectiveConfig.mode;
+        newDriver.media = effectiveConfig.media;
+        newDriver.background = effectiveConfig.background;
+        newDriver.visibilityThreshold = effectiveConfig.intersection || 0;
 
         // Network strict mode propagates directly to the driver.
-        this.driver.strictMode =
+        newDriver.strictMode =
             effectiveConfig.network_strict !== undefined
                 ? effectiveConfig.network_strict
                 : this.config.network_strict;
 
         // Any unexpected connection close triggers a controlled retry.
-        this._handleConnectionClosed = () => {
-            this._scheduleRetry();
-        };
-        this.driver.addEventListener('connection-closed', this._handleConnectionClosed);
+        // [SEAMLESS HANDOVER] Only main driver triggers global retry. Shadow driver just dies silently.
+        if (!isShadowMode) {
+            this._handleConnectionClosed = () => {
+                console.warn('[WebRTC Camera] Main Driver Connection Closed');
+                this._scheduleRetry();
+            };
+            newDriver.addEventListener('connection-closed', this._handleConnectionClosed);
+        }
 
         // Driver-to-UI messaging is intentionally minimal.
         // The driver never touches UI directly.
-        this.driver.onmessage = {
+        newDriver.onmessage = {
             ui_sync: (msg) => {
+                
+                // [SEAMLESS HANDOVER] Shadow Driver logic
+                if (isShadowMode) {
+                    if (msg.type === 'error') {
+                        console.info(`[WebRTC Camera] Shadow Driver Failed: ${msg.value}. Aborting upgrade.`);
+                        this._nukeDriver(newDriver, 'Failed Shadow'); // Kill shadow
+                        this.shadowDriver = null;
+                        
+                        // [DIAGNOSTICS] Update tooltip to reflect failure
+                        this.setStatus(null, null, `WebRTC Upgrade Failed: ${msg.value}`);
+                        
+                        // [SEAMLESS HANDOVER] Notify failure for telemetry/debug
+                        this.dispatchEvent(new CustomEvent('shadow-failed', {
+                            detail: { error: msg.value }
+                        }));
+                    }
+                    // Shadow driver ignores all other messages (it doesn't update UI)
+                    return;
+                }
+                
+                // Normal UI Logic (Main Driver)
                 switch (msg.type) {
                     case 'error':
+                        console.error(`[WebRTC Camera] Main Driver Error: ${msg.value}`);
                         this.setStatus('Error', msg.value);
                         break;
                     case 'mse':
+                        console.info('[WebRTC Camera] Main Driver negotiated: MSE');
+                        this.setStatus(msg.type.toUpperCase(), this.config.title || '', 'Stream via MSE (TCP)');
+                        
+                        // [PHANTOM FIX] Clear any pending upgrade timer before setting a new one
+                        if (this._upgradeTimer) clearTimeout(this._upgradeTimer);
+
+                        // [SEAMLESS HANDOVER] Trigger Auto-Upgrade
+                        // If we land on MSE, and we haven't exhausted shadow attempts, try to upgrade to RTC in background.
+                        if (effectiveConfig.mode.indexOf('webrtc') >= 0 && this._shadowAttempts < 2) {
+                            console.info('[WebRTC Camera] MSE detected. Scheduling Shadow Upgrade...');
+                            this._shadowAttempts++;
+                            
+                            // [PHANTOM FIX] Save timer reference to allow cancellation
+                            this._upgradeTimer = setTimeout(() => {
+                                this._upgradeTimer = null;
+                                this.startStream();
+                            }, 2000); // 2s delay to let MSE settle
+                        }
                     case 'hls':
                     case 'mp4':
                     case 'mjpeg':
                     case 'webrtc':
-                        this.setStatus(msg.type.toUpperCase(), this.config.title || '');
+                        if (msg.type !== 'mse') {
+                            console.info(`[WebRTC Camera] Main Driver negotiated: ${msg.type.toUpperCase()}`);
+                            
+                            // [PHANTOM FIX] If we upgraded to WebRTC (or anything better than MSE), 
+                            // CANCEL the pending shadow upgrade immediately.
+                            if (this._upgradeTimer) {
+                                console.debug('[WebRTC Camera] Spontaneous upgrade detected. Canceling shadow schedule.');
+                                clearTimeout(this._upgradeTimer);
+                                this._upgradeTimer = null;
+                            }
+                            
+                            this.setStatus(msg.type.toUpperCase(), this.config.title || '', 
+                                msg.type === 'webrtc' ? 'Connected via WebRTC (Low Latency)' : '');
+                        }
                         this._retryCount = 0;
                         break;
                 }
@@ -239,50 +376,156 @@ class WebRTCCamera extends HTMLElement {
         };
 
         // WebRTC success resets retry logic and updates UI.
-        const originalOnPcVideo = this.driver.onpcvideo;
-        this.driver.onpcvideo = (video) => {
+        const originalOnPcVideo = newDriver.onpcvideo;
+        newDriver.onpcvideo = (video) => {
             if (typeof originalOnPcVideo === 'function') {
-                originalOnPcVideo.call(this.driver, video);
+                originalOnPcVideo.call(newDriver, video);
             }
             
             // FIX: Only update UI to 'RTC' if the driver actually accepted the stream.
-            // If rejected (pc is null), we stay on previous status (likely MSE).
-            if (this.driver.pc) {
-                this.setStatus('RTC', this.config.title || '');
+            if (newDriver.pc) {
+                
+                // [PHANTOM FIX] Also cancel upgrade timer here if spontaneous WebRTC happens
+                if (this._upgradeTimer) {
+                    clearTimeout(this._upgradeTimer);
+                    this._upgradeTimer = null;
+                }
+
+                // [SEAMLESS HANDOVER] The Swap!
+                if (isShadowMode) {
+                    console.info('[WebRTC Camera] Shadow Driver negotiated WebRTC! SWAPPING DRIVERS NOW.');
+                    
+                    // [CRITICAL] Stop the watchdog timer immediately.
+                    if (this._shadowTimeout) {
+                        clearTimeout(this._shadowTimeout);
+                        this._shadowTimeout = null;
+                    }
+
+                    // 1. Kill old MSE driver
+                    if (this.driver) this._nukeDriver(this.driver, 'Old Main (MSE)');
+                    
+                    // 2. Promote Shadow to Main
+                    this.driver = newDriver;
+                    this.shadowDriver = null;
+                    this._shadowAttempts = 0; // Reset counter on success
+                    
+                    // 3. Inject into DOM
+                    const container = this.shadowRoot.querySelector('.ptz-transform');
+                    if (container) container.appendChild(this.driver);
+                    
+                    // 4. Update UI & Notify
+                    // [CRITICAL] Explicitly hide spinner. If the new driver sends 'waiting' event after swap
+                    // but before 'playing', the spinner might glitch back on. We force it off here.
+                    const spinner = this.shadowRoot.querySelector('.spinner');
+                    if (spinner) spinner.style.display = 'none';
+                    
+                    // [DIAGNOSTICS] Update UI to show successful handover
+                    this.setStatus('RTC', this.config.title || '', 'Seamless connection active via WebRTC (Handover Success)');
+                    this._applyPoster();
+                    
+                    this.dispatchEvent(new CustomEvent('handover-complete', {
+                        detail: { mode: 'webrtc', from: 'mse' }
+                    }));
+                    return;
+                }
+
+                console.info('[WebRTC Camera] Main Driver negotiated WebRTC directly.');
+                this.setStatus('RTC', this.config.title || '', 'Connected via WebRTC (Direct)');
                 this._retryCount = 0;
+                this._shadowAttempts = 0;
                 this._applyPoster();
             }
         };
 
         // Inject driver into DOM.
-        // The driver immediately creates its <video> element.
-        const container = this.shadowRoot.querySelector('.ptz-transform');
-        if (container) container.appendChild(this.driver);
+        // [SEAMLESS HANDOVER] Shadow driver is NOT injected yet (it works in memory).
+        // Main driver is injected immediately.
+        if (!isShadowMode) {
+            const container = this.shadowRoot.querySelector('.ptz-transform');
+            if (container) container.appendChild(newDriver);
+            this.driver = newDriver;
+        } else {
+            this.shadowDriver = newDriver;
+            
+            // [SEAMLESS HANDOVER] Watchdog: Kill shadow if it gets stuck in 'checking' for too long (15s)
+            // This prevents zombie connections when UDP is blocked by firewall.
+            this._shadowTimeout = setTimeout(() => {
+                if (this.shadowDriver && this.shadowDriver.pc?.connectionState !== 'connected') {
+                    console.info('[WebRTC Camera] Shadow timeout – killing inactive probe');
+                    this._nukeDriver(this.shadowDriver, 'Timeout Shadow');
+                    this.shadowDriver = null;
+                    this._shadowAttempts = 0; // Reset to allow future attempts
+                    
+                    // [DIAGNOSTICS] Update tooltip
+                    this.setStatus(null, null, 'WebRTC Upgrade Failed: Network Timeout');
+                    
+                    // Notify failure
+                    this.dispatchEvent(new CustomEvent('shadow-failed', {
+                        detail: { error: 'timeout' }
+                    }));
+                }
+            }, 15000);
+        }
 
         // Apply global mute synchronously.
         // This avoids autoplay failures caused by async timing.
-        if (this.driver.video) {
-            this.driver.video.controls = false;
+        if (newDriver.video) {
+            newDriver.video.controls = false;
+            
+            // [SEAMLESS HANDOVER] Apply poster to new driver immediately (including shadow)
+            if (this.config.poster) {
+                if (this.config.poster_remote) {
+                    newDriver.video.poster = this.config.poster;
+                } else if (!newDriver.video.poster) {
+                    newDriver.video.poster = this.config.poster;
+                }
+            }
 
             if (this.config.muted) {
-                this.driver.video.muted = true;
-                this.driver.video.defaultMuted = true;
-                this.driver.video.setAttribute('muted', '');
+                newDriver.video.muted = true;
+                newDriver.video.defaultMuted = true;
+                newDriver.video.setAttribute('muted', '');
+            } else if (isShadowMode) {
+                // Shadow driver MUST be muted to play in background without audio glitch
+                console.debug('[WebRTC Camera] Muting Shadow Driver for background negotiation');
+                newDriver.video.muted = true;
             }
         }
 
         // Authenticate and start the connection.
         try {
-            const url = await this._fetchWebsocketURL();
-            if (this.driver) {
-                this.driver.src = url;
-                this.setStatus('Loading...');
-                this.setupTools();
-                this._applyPoster();
+            // [CRITICAL] Pass the correct driver instance to fetch URL.
+            // If we are in shadow mode, we must apply the signed poster/URL to the shadow driver, not Main.
+            const url = await this._fetchWebsocketURL(isShadowMode ? newDriver : null);
+            
+            // Apply URL to the correct instance
+            const target = isShadowMode ? this.shadowDriver : this.driver;
+            
+            if (target) {
+                console.debug(`[WebRTC Camera] Connecting ${isShadowMode ? 'Shadow' : 'Main'} driver to WS`);
+                target.src = url;
+                if (!isShadowMode) {
+                    this.setStatus('Loading...');
+                    this.setupTools();
+                    this._applyPoster();
+                }
+            } else {
+                console.warn('[WebRTC Camera] Target driver vanished before connection');
             }
         } catch (e) {
-            this.setStatus('Auth Fail', 'Retry...');
-            this._scheduleRetry();
+            if (!isShadowMode) {
+                console.error('[WebRTC Camera] Main Driver Auth Failed', e);
+                this.setStatus('Auth Fail', 'Retry...');
+                this._scheduleRetry();
+            } else {
+                console.warn('[WebRTC Camera] Shadow Auth Failed');
+                this._nukeDriver(this.shadowDriver, 'Auth Failed Shadow');
+                this.shadowDriver = null;
+                
+                this.dispatchEvent(new CustomEvent('shadow-failed', {
+                    detail: { error: 'auth_failed' }
+                }));
+            }
         }
     }
 
@@ -302,7 +545,7 @@ class WebRTCCamera extends HTMLElement {
         }
     }
 
-    async _fetchWebsocketURL() {
+    async _fetchWebsocketURL(targetDriver = null) {
         /**
          * The WebSocket URL is always freshly signed.
          * URLs are never cached to avoid token reuse and invalid sessions.
@@ -315,11 +558,16 @@ class WebRTCCamera extends HTMLElement {
             path: '/api/webrtc/ws'
         });
 
+        // [SEAMLESS HANDOVER] Apply poster to specific driver (Main or Shadow) if provided, 
+        // otherwise fallback to Main (legacy behavior).
+        // This ensures the shadow driver gets the signed poster URL before swap.
+        const target = targetDriver || this.driver;
+
         if (this.config.poster &&
             !this.config.poster_remote &&
-            this.driver &&
-            this.driver.video) {
-            this.driver.video.poster =
+            target &&
+            target.video) {
+            target.video.poster =
                 this._hass.hassUrl(data.path) +
                 '&poster=' +
                 encodeURIComponent(this.config.poster);
@@ -343,9 +591,15 @@ class WebRTCCamera extends HTMLElement {
     nextStream() {
         // Stream switching is implemented as a full restart
         // to guarantee a clean media state.
+        console.info('[WebRTC Camera] User initiated Next Stream (Soft Handover)');
         this.streamID = (this.streamID + 1) % this.config.streams.length;
         this._retryCount = 0;
+        this._shadowAttempts = 0; // Reset shadow attempts
+        
+        // Reset timers
         if (this._retryTimer) clearTimeout(this._retryTimer);
+        if (this._upgradeTimer) clearTimeout(this._upgradeTimer);
+        
         this._isReconnecting = false;
         this.startStream();
     }
@@ -378,7 +632,16 @@ class WebRTCCamera extends HTMLElement {
                 pointer-events: none;
                 z-index: 10;
             }
-            .mode { cursor: pointer; opacity: 0.6; pointer-events: auto; }
+            .right-controls {
+                display: flex;
+                align-items: center;
+                gap: 8px; /* Space between refresh icon and mode text */
+                pointer-events: auto;
+            }
+            .mode { cursor: pointer; opacity: 0.6; }
+            .refresh { cursor: pointer; opacity: 0.6; }
+            .refresh:hover, .mode:hover { opacity: 1; }
+            
             video-rtc { width: 100%; height: 100%; display: block; }
             ha-icon { color: white; cursor: pointer; }
             
@@ -400,22 +663,40 @@ class WebRTCCamera extends HTMLElement {
             </div>
             <div class="header">
                 <div class="status"></div>
-                <div class="mode"></div>
+                <div class="right-controls">
+                    <ha-icon class="refresh" icon="mdi:refresh" title="Hard Reset"></ha-icon>
+                    <div class="mode"></div>
+                </div>
             </div>
         </ha-card>
         `;
 
-        // Stream switching is user-initiated and explicit.
+        // Bind Hard Reset to Refresh Icon
+        this.shadowRoot
+            .querySelector('.refresh')
+            .addEventListener('click', (e) => {
+                e.stopPropagation(); // Prevent bubbling issues
+                this.hardReset();
+            });
+
+        // Bind Next Stream (Soft Handover) to Mode Text
         this.shadowRoot
             .querySelector('.mode')
             .addEventListener('click', () => this.nextStream());
     }
 
-    setStatus(mode, status) {
+    // [DIAGNOSTICS] Updated to support optional tooltip
+    setStatus(mode, status, tooltip) {
         const divMode = this.shadowRoot.querySelector('.mode');
         const divStatus = this.shadowRoot.querySelector('.status');
-        if (divMode) divMode.innerText = mode;
-        if (divStatus) divStatus.innerText = status || '';
+        
+        if (divMode) {
+            if (mode) divMode.innerText = mode;
+            if (tooltip) divMode.title = tooltip;
+            else if (tooltip === null) divMode.removeAttribute('title'); // Clear if null passed explicitly
+        }
+        
+        if (divStatus && status) divStatus.innerText = status;
     }
 
     setupTools() {

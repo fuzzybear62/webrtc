@@ -25,8 +25,10 @@ class WebRTCConnectionSensor(SensorEntity):
     """Sensor that reports active WebRTC sessions."""
 
     _attr_has_entity_name = True
-    _attr_name = "Active Connections"
-    _attr_unique_id = "webrtc_active_connections"
+    # Replaced hardcoded name with translation key for I18n support
+    _attr_translation_key = "proxied_connections"
+    # Updated Unique ID to reflect the semantic change (Proxied/MSE clients)
+    _attr_unique_id = "webrtc_proxied_connections"
     _attr_icon = "mdi:lan-connect"
     _attr_native_unit_of_measurement = "clients"
 
