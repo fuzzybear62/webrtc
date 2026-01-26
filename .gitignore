@@ -1,0 +1,46 @@
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv
+venv/
+env/
+
+# ESPHome / PlatformIO specific
+.esphome/
+.pio/
+.platformio/
+pio_cache/
+managed_components/
+dependencies/
+
+# C++ / Compiled files (Clean artifacts)
+*.o
+*.obj
+*.elf
+*.bin
+*.hex
+*.map
+*.lst
+
+# IDE / Editor configuration
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Mac OS specific
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows specific
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Logs
+*.log
+

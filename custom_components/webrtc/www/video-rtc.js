@@ -1,0 +1,594 @@
+/**
+ * VideoRTC v2.2.7
+ * * This class is a Custom HTML Element that acts as a "Dumb Driver".
+ * It handles the complex negotiation of video streams (WebRTC, MSE, HLS)
+ * but relies on the parent component for configuration and UI.
+ */
+export class VideoRTC extends HTMLElement {
+    constructor() {
+        super();
+
+        // Timeouts to detect dead connections
+        this.DISCONNECT_TIMEOUT = 5000;
+        this.RECONNECT_TIMEOUT = 15000;
+
+        // List of supported codecs to announce to the server
+        this.CODECS = [
+            'avc1.640029', 'avc1.64002A', 'avc1.640033', 'hvc1.1.6.L153.B0',
+            'mp4a.40.2', 'mp4a.40.5', 'flac', 'opus',
+        ];
+
+        // CONFIGURATION FLAGS
+        // strictMode: false = Ignore minor errors (faster load). true = Disconnect on any error (safer).
+        this.strictMode = false; 
+
+        this.mode = 'webrtc,mse,hls,mjpeg';
+        this.media = 'video,audio';
+        this.background = true; 
+        this.visibilityThreshold = 0;
+        this.visibilityCheck = false; 
+
+        // Standard WebRTC Configuration (Google STUN)
+        this.pcConfig = {
+            bundlePolicy: 'max-bundle',
+            iceServers: [{urls: 'stun:stun.l.google.com:19302'}],
+            sdpSemantics: 'unified-plan',
+        };
+
+        // Internal State
+        this.video = null; // The <video> DOM element
+        this.ws = null;    // The Signaling WebSocket
+        this.wsURL = '';
+        this.pc = null;    // The WebRTC PeerConnection
+        this.connectTS = 0;
+        this.mseCodecs = '';
+        this.disconnectTID = 0;
+        this.reconnectTID = 0;
+        this.ondata = null;
+        this.onmessage = {};
+        
+        // CRITICAL: "Handoff" state.
+        // If true, it means we are closing the WebSocket on purpose because
+        // we switched to WebRTC. It prevents the "connection-closed" event
+        // from triggering a restart loop.
+        this.handoff = false;
+    }
+
+    /**
+     * Entry point: Setting 'src' triggers the connection process.
+     * Handles both absolute (http/ws) and relative (/) URLs.
+     */
+    set src(value) {
+        if (typeof value !== 'string') value = value.toString();
+        if (value.startsWith('http')) {
+            value = 'ws' + value.substring(4);
+        } else if (value.startsWith('/')) {
+            value = 'ws' + location.origin.substring(4) + value;
+        }
+        this.wsURL = value;
+        this.onconnect();
+    }
+
+    /**
+     * Safe Play Method.
+     * 1. Checks if already playing to avoid CPU waste (Promise churn).
+     * 2. Handles the "Autoplay Policy" error by muting and retrying.
+     */
+    play() {
+        // OPTIMIZATION: If video exists and is playing, do nothing.
+        // Saves CPU cycles on mobile devices.
+        if (!this.video || !this.video.paused) return;
+
+        this.video.play().catch(er => {
+            if (er.name === 'AbortError') return; // Ignore aborts (user navigated away)
+            
+            // If play failed (likely due to Audio Policy), mute and try again.
+            if (!this.video.muted) {
+                this.video.muted = true;
+                this.video.play().catch(e => console.warn(e));
+            }
+        });
+    }
+
+    /**
+     * Helper to send JSON messages over the WebSocket.
+     */
+    send(value) {
+        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+            this.ws.send(JSON.stringify(value));
+        }
+    }
+
+    /**
+     * Filter the CODECS list based on what the browser actually supports.
+     */
+    codecs(isSupported) {
+        return this.CODECS
+            .filter(codec => this.media.includes(codec.includes('vc1') ? 'video' : 'audio'))
+            .filter(codec => isSupported(`video/mp4; codecs="${codec}"`)).join();
+    }
+
+    /**
+     * Web Component Lifecycle: Called when element is added to DOM.
+     * Starts the initialization loop.
+     */
+    connectedCallback() {
+        if (this.disconnectTID) {
+            clearTimeout(this.disconnectTID);
+            this.disconnectTID = 0;
+        }
+        if (this.video) {
+            // Restore playback position if re-attaching
+            const seek = this.video.seekable;
+            if (seek.length > 0) {
+                this.video.currentTime = seek.end(seek.length - 1);
+            }
+            this.play();
+        } else {
+            this.oninit();
+        }
+    }
+
+    disconnectedCallback() { 
+        // We do not auto-disconnect here. The parent component controls lifecycle.
+    }
+
+    /**
+     * Creates the <video> element and appends it to the shadow DOM.
+     * Contains specific fixes for Safari.
+     */
+    oninit() {
+        if (this.video) return;
+        this.video = document.createElement('video');
+        this.video.controls = true;
+        this.video.playsInline = true;
+        this.video.preload = 'auto';
+        this.video.style.display = 'block';
+        this.video.style.width = '100%';
+        this.video.style.height = '100%';
+        this.appendChild(this.video);
+
+        this.video.addEventListener('error', ev => {
+            if (this.video.error && this.video.error.code === 4) return;
+            console.warn("[VideoRTC] Video Error:", this.video.error);
+        });
+
+        // SAFARI HACK: Safari lies about supported codecs or has bugs with specific ones.
+        // We filter out codecs that are known to break on specific Safari versions.
+        const m = window.navigator.userAgent.match(/Version\/(\d+).+Safari/);
+        if (m) {
+            const skip = m[1] < '13' ? 'mp4a.40.2' : m[1] < '14' ? 'flac' : 'opus';
+            const idx = this.CODECS.indexOf(skip);
+            if (idx > -1) this.CODECS.splice(idx, 1);
+        }
+    }
+
+    /**
+     * Establish the WebSocket connection.
+     */
+    onconnect() {
+        if (!this.isConnected || !this.wsURL || this.ws || this.pc) return false;
+
+        this.connectTS = Date.now();
+        this.handoff = false; // Reset handoff state
+
+        this.ws = new WebSocket(this.wsURL);
+        this.ws.binaryType = 'arraybuffer';
+        
+        this.ws.addEventListener('open', () => this.onopen());
+        this.ws.addEventListener('close', () => this.onclose());
+        
+        // Error Handling Logic
+        this.ws.addEventListener('error', (e) => {
+            if (this.strictMode) {
+                // STRICT: Fail fast on any error
+                console.warn("[VideoRTC] WebSocket Error (Strict): Force Closing", e);
+                this.onclose(); 
+            } else {
+                // RELAXED: Log but keep trying (allows recovery from minor glitches)
+                console.warn("[VideoRTC] WebSocket Error (Relaxed): Ignored", e);
+            }
+        });
+
+        return true;
+    }
+
+    /**
+     * The Destructor. Clean up ALL resources.
+     */
+    ondisconnect() {
+        this.ondata = null;
+        this.onmessage = {}; 
+        
+        // 1. Close WebSocket
+        if (this.ws) {
+            this.ws.onclose = null; 
+            this.ws.onerror = null;
+            this.ws.close();
+            this.ws = null;
+        }
+        
+        // 2. Close WebRTC
+        if (this.pc) {
+            // OPTIMIZATION: Manually nullify event handlers.
+            // Helps Safari/iOS Garbage Collector break circular references
+            // and release the hardware video decoder immediately.
+            this.pc.onicecandidate = null;
+            this.pc.ontrack = null;
+            this.pc.onconnectionstatechange = null;
+
+            this.pc.getSenders().forEach(sender => {
+                if (sender.track) sender.track.stop();
+            });
+            this.pc.close();
+            this.pc = null;
+        }
+        
+        // 3. Clear Video
+        if (this.video) {
+            this.video.src = '';
+            this.video.srcObject = null;
+        }
+    }
+
+    /**
+     * Called when WebSocket opens. Sets up message routing.
+     */
+    onopen() {
+        this.ws.addEventListener('message', ev => {
+            if (typeof ev.data === 'string') {
+                const msg = JSON.parse(ev.data);
+                // Broadcast message to all active handlers (MSE, WebRTC, etc.)
+                if (this.onmessage) {
+                    for (const mode in this.onmessage) {
+                        if (typeof this.onmessage[mode] === 'function') {
+                            this.onmessage[mode](msg);
+                        }
+                    }
+                }
+            } else {
+                // Binary data (usually MSE video chunks)
+                if (this.ondata) {
+                    this.ondata(ev.data);
+                }
+            }
+        });
+
+        this.ondata = null;
+        this.onmessage = {};
+
+        // Initialize Modes based on browser support
+        const modes = [];
+
+        if (this.mode.includes('mse') && ('MediaSource' in window || 'ManagedMediaSource' in window)) {
+            modes.push('mse');
+            this.onmse();
+        } else if (this.mode.includes('hls') && this.video.canPlayType('application/vnd.apple.mpegurl')) {
+            modes.push('hls');
+            this.onhls();
+        } else if (this.mode.includes('mp4')) {
+            modes.push('mp4');
+            this.onmp4();
+        }
+
+        if (this.mode.includes('webrtc') && 'RTCPeerConnection' in window) {
+            modes.push('webrtc');
+            this.onwebrtc();
+        }
+
+        if (this.mode.includes('mjpeg')) {
+            if (modes.length) {
+                // If we have other modes, only use MJPEG if they fail
+                this.onmessage['mjpeg'] = msg => {
+                    if (msg.type !== 'error' || msg.value.indexOf(modes[0]) !== 0) return;
+                    this.onmjpeg();
+                };
+            } else {
+                modes.push('mjpeg');
+                this.onmjpeg();
+            }
+        }
+
+        return modes;
+    }
+
+    /**
+     * Called when WebSocket closes.
+     * Returns TRUE if the parent should be notified (failure).
+     * Returns FALSE if this was an intentional handover (success).
+     */
+    onclose() {
+        // HANDOFF CHECK: The "Loop Fix".
+        // If we closed the socket intentionally to switch to WebRTC, 
+        // do NOT emit the closed event.
+        if (this.handoff) {
+            this.ws = null;
+            return false; 
+        }
+
+        if (!this.ws && !this.pc) return false;
+        
+        this.ws = null;
+        // Notify parent that connection died (triggers restart)
+        this.dispatchEvent(new CustomEvent('connection-closed', {
+            detail: { url: this.wsURL }
+        }));
+        return true;
+    }
+
+    /**
+     * Logic for Media Source Extensions (Low Latency Video over WS)
+     */
+    onmse() {
+        console.info('[VideoRTC] Mode: MSE');
+        let ms;
+        // Use ManagedMediaSource (new standard) or fallback to MediaSource
+        if ('ManagedMediaSource' in window) {
+            const MediaSource = window.ManagedMediaSource;
+            ms = new MediaSource();
+            ms.addEventListener('sourceopen', () => {
+                this.send({type: 'mse', value: this.codecs(MediaSource.isTypeSupported)});
+            }, {once: true});
+            this.video.disableRemotePlayback = true;
+            this.video.srcObject = ms;
+        } else {
+            ms = new MediaSource();
+            ms.addEventListener('sourceopen', () => {
+                URL.revokeObjectURL(this.video.src);
+                this.send({type: 'mse', value: this.codecs(MediaSource.isTypeSupported)});
+            }, {once: true});
+            this.video.src = URL.createObjectURL(ms);
+            this.video.srcObject = null;
+        }
+
+        this.play();
+        this.mseCodecs = '';
+
+        // Handle incoming MSE configuration
+        this.onmessage['mse'] = msg => {
+            if (msg.type !== 'mse') return;
+            this.mseCodecs = msg.value;
+
+            const sb = ms.addSourceBuffer(msg.value);
+            sb.mode = 'segments';
+            
+            // Handle Buffer Updates
+            sb.addEventListener('updateend', () => {
+                // If we have pending data in buffer, append it
+                if (!sb.updating && bufLen > 0) {
+                    try {
+                        const data = buf.slice(0, bufLen);
+                        sb.appendBuffer(data);
+                        bufLen = 0;
+                    } catch (e) { /* ignore */ }
+                }
+                // Memory Management: Remove old segments to prevent memory leak
+                try {
+                    if (!sb.updating && sb.buffered && sb.buffered.length) {
+                        const end = sb.buffered.end(sb.buffered.length - 1);
+                        const start = end - 5; // Keep last 5 seconds
+                        const start0 = sb.buffered.start(0);
+                        if (start > start0) {
+                            sb.remove(start0, start);
+                            ms.setLiveSeekableRange(start, end);
+                        }
+                        // Sync video time if it fell behind
+                        if (this.video.currentTime < start) {
+                            this.video.currentTime = start;
+                        }
+                        // Catch up logic (increase playback speed)
+                        const gap = end - this.video.currentTime;
+                        this.video.playbackRate = gap > 0.1 ? gap : 0.1;
+                    }
+                } catch (e) { /* ignore */ }
+            });
+
+            // 2MB Buffer for incoming binary data
+            const buf = new Uint8Array(2 * 1024 * 1024);
+            let bufLen = 0;
+
+            this.ondata = data => {
+                if (sb.updating || bufLen > 0) {
+                    // If busy, store in temp buffer
+                    const b = new Uint8Array(data);
+                    buf.set(b, bufLen);
+                    bufLen += b.byteLength;
+                } else {
+                    // If free, append directly
+                    try {
+                        sb.appendBuffer(data);
+                    } catch (e) { /* ignore */ }
+                }
+            };
+        };
+    }
+
+    /**
+     * Logic for WebRTC (UDP/TCP P2P Video)
+     */
+    onwebrtc() {
+        const pc = new RTCPeerConnection(this.pcConfig);
+
+        // Handle ICE Candidates
+        pc.addEventListener('icecandidate', ev => {
+            // Ignore UDP candidates if forced to TCP mode
+            if (ev.candidate && this.mode.includes('webrtc/tcp') && ev.candidate.protocol === 'udp') return;
+            const candidate = ev.candidate ? ev.candidate.toJSON().candidate : '';
+            this.send({type: 'webrtc/candidate', value: candidate});
+        });
+
+        // Monitor Connection State
+        pc.addEventListener('connectionstatechange', () => {
+            if (pc.connectionState === 'connected') {
+                // When connected, grab tracks and create a temp video to check stream validity
+                const tracks = pc.getTransceivers()
+                    .filter(tr => tr.currentDirection === 'recvonly')
+                    .map(tr => tr.receiver.track);
+                const video2 = document.createElement('video');
+                // Wait for data to arrive before deciding to switch
+                video2.addEventListener('loadeddata', () => this.onpcvideo(video2), {once: true});
+                video2.srcObject = new MediaStream(tracks);
+            } else if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+                // Real failure (not a handoff)
+                pc.close();
+                this.pc = null;
+                this.handoff = false; 
+                this.onclose();
+            }
+        });
+
+        this.onmessage['webrtc'] = msg => {
+            switch (msg.type) {
+                case 'webrtc/candidate':
+                    if (this.mode.includes('webrtc/tcp') && msg.value.includes(' udp ')) return;
+                    pc.addIceCandidate({candidate: msg.value, sdpMid: '0'}).catch(er => console.warn(er));
+                    break;
+                case 'webrtc/answer':
+                    pc.setRemoteDescription({type: 'answer', sdp: msg.value}).catch(er => console.warn(er));
+                    break;
+                case 'error':
+                    if (!msg.value.includes('webrtc/offer')) return;
+                    pc.close();
+            }
+        };
+
+        this.createOffer(pc).then(offer => {
+            this.send({type: 'webrtc/offer', value: offer.sdp});
+        });
+
+        this.pc = pc;
+    }
+
+    async createOffer(pc) {
+        try {
+            if (this.media.includes('microphone')) {
+                const media = await navigator.mediaDevices.getUserMedia({audio: true});
+                media.getTracks().forEach(track => {
+                    pc.addTransceiver(track, {direction: 'sendonly'});
+                });
+            }
+        } catch (e) {
+            console.warn(e);
+        }
+
+        for (const kind of ['video', 'audio']) {
+            if (this.media.includes(kind)) {
+                pc.addTransceiver(kind, {direction: 'recvonly'});
+            }
+        }
+
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        return offer;
+    }
+
+    /**
+     * Decides whether to switch from MSE to WebRTC.
+     * Prioritizes Codec quality (H265 > H264) and audio presence.
+     */
+    onpcvideo(video2) {
+        if (this.pc) {
+            let rtcPriority = 0, msePriority = 0;
+
+            const stream = video2.srcObject;
+            // Calculate priorities based on Tracks and Codecs
+            if (stream.getVideoTracks().length > 0) {
+                const isH265Supported = this.pc.remoteDescription.sdp.includes('H265/90000');
+                rtcPriority += isH265Supported ? 0x240 : 0x220;
+            }
+            if (stream.getAudioTracks().length > 0) rtcPriority += 0x102;
+
+            if (this.mseCodecs.includes('hvc1.')) msePriority += 0x230;
+            if (this.mseCodecs.includes('avc1.')) msePriority += 0x210;
+            if (this.mseCodecs.includes('mp4a.')) msePriority += 0x101;
+
+            if (rtcPriority >= msePriority) {
+                // SWITCH TO WEBRTC
+                console.info('[VideoRTC] Mode: RTC (Socket Closing)');
+                this.video.srcObject = stream;
+                this.play();
+
+                if (this.ws) {
+                    // SET HANDOFF FLAG: Close WS without triggering restart
+                    this.handoff = true; 
+                    this.ws.close();
+                    this.ws = null;
+                }
+            } else {
+                // REJECT WEBRTC
+                console.info('[VideoRTC] Mode: RTC Rejected (Priority < MSE)');
+                if (this.pc) {
+                    this.pc.close();
+                    this.pc = null;
+                }
+            }
+        }
+        video2.srcObject = null;
+    }
+
+    /**
+     * Logic for MJPEG (Motion JPEG) - Fallback mode
+     */
+    onmjpeg() {
+        console.info('[VideoRTC] Mode: MJPEG');
+        this.ondata = data => {
+            this.video.controls = false;
+            this.video.poster = 'data:image/jpeg;base64,' + VideoRTC.btoa(data);
+        };
+        this.send({type: 'mjpeg'});
+    }
+
+    /**
+     * Logic for HLS (HTTP Live Streaming)
+     */
+    onhls() {
+        console.info('[VideoRTC] Mode: HLS');
+        this.onmessage['hls'] = msg => {
+            if (msg.type !== 'hls') return;
+            const url = 'http' + this.wsURL.substring(2, this.wsURL.indexOf('/ws')) + '/hls/';
+            const playlist = msg.value.replace('hls/', url);
+            this.video.src = 'data:application/vnd.apple.mpegurl;base64,' + btoa(playlist);
+            this.play();
+        };
+        this.send({type: 'hls', value: this.codecs(type => this.video.canPlayType(type))});
+    }
+
+    /**
+     * Logic for MP4 over WebSocket
+     */
+    onmp4() {
+        console.info('[VideoRTC] Mode: MP4');
+        const canvas = document.createElement('canvas');
+        let context;
+        const video2 = document.createElement('video');
+        video2.autoplay = true;
+        video2.playsInline = true;
+        video2.muted = true;
+
+        video2.addEventListener('loadeddata', () => {
+            if (!context) {
+                canvas.width = video2.videoWidth;
+                canvas.height = video2.videoHeight;
+                context = canvas.getContext('2d');
+            }
+            context.drawImage(video2, 0, 0, canvas.width, canvas.height);
+            this.video.controls = false;
+            this.video.poster = canvas.toDataURL('image/jpeg');
+        });
+
+        this.ondata = data => {
+            video2.src = 'data:video/mp4;base64,' + VideoRTC.btoa(data);
+        };
+        this.send({type: 'mp4', value: this.codecs(this.video.canPlayType)});
+    }
+
+    static btoa(buffer) {
+        const bytes = new Uint8Array(buffer);
+        const len = bytes.byteLength;
+        let binary = '';
+        for (let i = 0; i < len; i++) {
+            binary += String.fromCharCode(bytes[i]);
+        }
+        return window.btoa(binary);
+    }
+}
