@@ -1,10 +1,12 @@
 /**
- * VideoRTC v2.2.10 - Fix UI Sync
+ * VideoRTC v2.2.11 - Observability Signals
+ * * Changelog v2.2.11:
+ * - ADDED: Emits 'signal' event with value 'rtc_rejected' when WebRTC is discarded due to lower priority.
+ * This allows the parent controller to stop upgrade timers immediately.
  * * Changelog v2.2.10:
  * - FIX: 'onopen' no longer wipes external message handlers (ui_sync).
- * This fixes the issue where UI stuck on "Loading..." instead of showing "MSE".
  * * Changelog v2.2.9:
- * - FIX: Renamed 'this.id' to 'this.clientId' to avoid DOM conflict in constructor.
+ * - FIX: Renamed 'this.id' to 'this.clientId' to avoid DOM conflict.
  */
 export class VideoRTC extends HTMLElement {
     constructor() {
@@ -528,6 +530,14 @@ export class VideoRTC extends HTMLElement {
             } else {
                 // REJECT WEBRTC
                 console.info(`[VideoRTC:${this.clientId}] Mode: RTC Rejected (Priority < MSE)`);
+                
+                // [OBSERVABILITY] Signal the rejection to the parent component.
+                // This informs the parent that WebRTC was negotiated but discarded due to lower quality,
+                // allowing it to cancel any pending upgrade timers or spinners.
+                if (this.onmessage && typeof this.onmessage['ui_sync'] === 'function') {
+                    this.onmessage['ui_sync']({ type: 'signal', value: 'rtc_rejected' });
+                }
+
                 if (this.pc) {
                     this.pc.close();
                     this.pc = null;

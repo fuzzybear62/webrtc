@@ -1,5 +1,5 @@
 /**
- * WebRTC Camera Card v13.10.26
+ * WebRTC Camera Card v13.10.27
  *
  * DESIGN PHILOSOPHY
  * -----------------
@@ -19,7 +19,8 @@
  * Any attempt to "optimize" by reusing the driver will almost certainly reintroduce leaks.
  */
 
-import {VideoRTC} from './video-rtc.js?v=2.2.10';
+// [DEPENDENCY UPDATE] Updated to v2.2.11 to support 'rtc_rejected' signal
+import {VideoRTC} from './video-rtc.js?v=2.2.11';
 import {DigitalPTZ} from './digital-ptz.js?v=3.3.0';
 
 // Ensure the dumb driver is registered exactly once.
@@ -65,7 +66,7 @@ class WebRTCCamera extends HTMLElement {
         // Must be cancelable if WebRTC connects spontaneously.
         this._upgradeTimer = null;
 
-        console.info('[WebRTC Camera] v13.10.26');
+        console.info('[WebRTC Camera] v13.10.27');
     }
 
     setConfig(config) {
@@ -307,6 +308,25 @@ class WebRTCCamera extends HTMLElement {
         newDriver.onmessage = {
             ui_sync: (msg) => {
                 
+                // [OBSERVABILITY] Handle explicit driver signals (v2.2.11+)
+                // This block handles the "RTC Rejected" scenario preventing upgrade loops.
+                if (msg.type === 'signal') {
+                    if (msg.value === 'rtc_rejected') {
+                        console.info('[WebRTC Camera] Driver Explicitly Rejected WebRTC (Quality Priority). Cancelling upgrade.');
+
+                        // [PHANTOM FIX] Critical: Stop the auto-upgrade timer immediately.
+                        // This prevents the card from spawning a useless Shadow Driver.
+                        if (this._upgradeTimer) {
+                            clearTimeout(this._upgradeTimer);
+                            this._upgradeTimer = null;
+                        }
+
+                        // Update diagnostic tooltip
+                        this.setStatus(null, null, 'WebRTC upgrade discarded by driver (Quality < MSE)');
+                    }
+                    return;
+                }
+
                 // [SEAMLESS HANDOVER] Shadow Driver logic
                 if (isShadowMode) {
                     if (msg.type === 'error') {
