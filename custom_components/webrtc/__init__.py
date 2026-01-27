@@ -59,7 +59,7 @@ HLS_SESSION = str(uuid.uuid4())
 
 async def async_setup(hass: HomeAssistant, config: dict):
     path = Path(__file__).parent / "www"
-    for name in ("video-rtc.js", "webrtc-camera.js", "digital-ptz.js"):
+    for name in ("video-rtc.js", "webrtc-camera.js", "digital-ptz.js", "ui-interaction.js"):
         await utils.register_static_path(hass, "/webrtc/" + name, str(path / name))
 
     version = getattr(hass.data["integrations"][DOMAIN], "version", 0)

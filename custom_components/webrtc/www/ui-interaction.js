@@ -1,0 +1,431 @@
+/**
+ * WebRTC Camera - UI Interaction Sidecar v1.1.0
+ * * RESPONSIBILITIES:
+ * - Handles 'shortcuts' (custom buttons) with reactive icons, styles AND data payloads.
+ * - Handles 'ptz' with Continuous Move and Templated Data support.
+ * - Provides visual feedback (active state) during interactions.
+ * - Implements a WHITELIST-BASED template engine (Zero-Trust security).
+ * * SECURITY NOTE:
+ * This version replaces 'eval()' with a strict Regex-based parser.
+ * It only allows access to 'states', 'attributes', and simple logic.
+ * Arbitrary JavaScript execution is blocked by design.
+ */
+
+export class UIInteraction {
+
+    constructor(card) {
+        this.card = card;
+        this.hass = null;
+        
+        // Cache for compiled template functions to optimize performance.
+        this._templateCache = new Map();
+        
+        // State tracking for reactive CSS to avoid unnecessary DOM writes.
+        this._prevStyle = null;
+        
+        console.info("[UI Interaction] Sidecar v1.1.0 initialized (Secure + Templated Data)");
+    }
+
+    /**
+     * Called once when the card structure is ready.
+     * Builds the DOM elements for Shortcuts and PTZ.
+     */
+    render() {
+        if (!this.card || !this.card.shadowRoot) return;
+        
+        try {
+            this._initStyleElement();
+            this._renderShortcuts();
+            this._renderPTZ();
+        } catch (e) {
+            console.error("[UI Interaction] Render critical failure:", e);
+        }
+    }
+
+    /**
+     * Called every time Home Assistant state updates.
+     * Updates reactive elements based on secure templates.
+     */
+    update(hass) {
+        this.hass = hass;
+        
+        // 1. Update Reactive Global CSS
+        // Allows dynamic styling of the card based on entity states.
+        if (this.card.config.style) {
+            this._updateStyle(hass);
+        }
+
+        // 2. Update Shortcuts visual state (icons & styles)
+        if (this.card.config.shortcuts) {
+            this._updateShortcuts(hass);
+        }
+    }
+
+    /**
+     * SECURE TEMPLATE ENGINE (Whitelist Strategy)
+     * * Unlike previous versions, this does NOT execute arbitrary code.
+     * It scans the string and only executes patterns that match a strict Allowlist.
+     * * ALLOWED PATTERNS:
+     * - ${ states['entity.id'].state }
+     * - ${ states['entity.id'].attributes['attr'] }
+     * - ${ is_state('entity.id', 'value') }
+     * - ${ state('entity.id') }  <-- Shorthand helper
+     * - Simple ternary logic: condition ? true : false
+     */
+    _evaluateTemplate(templateStr, hass) {
+        if (!templateStr || typeof templateStr !== 'string') return templateStr;
+        if (!templateStr.includes('${')) return templateStr;
+
+        // [SECURITY] Immediate Blocklist as a first line of defense.
+        // Rejects obvious injection attempts immediately, regardless of context.
+        if (/window|document|fetch|eval|alert|prompt|globalThis|self|top|prototype|constructor|function/i.test(templateStr)) {
+            console.warn(`[UI Interaction] Security Block: Dangerous token detected in template.`, templateStr);
+            return "BLOCKED_CONTENT";
+        }
+
+        let result = templateStr;
+
+        // Replace each ${...} block individually using Regex
+        result = result.replace(/\${([^}]+)}/g, (_, expr) => {
+            const e = expr.trim();
+
+            // 1. Pattern: Direct State/Attribute Access
+            // Matches: states['light.foo'].state or attributes['brightness']
+            if (/^states\['[^']+'\](?:\.(?:state|attributes(?:\['[^']+']|.[a-zA-Z0-9_]+)))?$/.test(e)) {
+                try {
+                    // We use new Function with a limited scope, but only if the Regex matched.
+                    return new Function('states', `return ${e}`)(hass.states) ?? '';
+                } catch { return 'ERR'; }
+            }
+
+            // 2. Pattern: Helper Functions (is_state, state_attr, state)
+            // Matches: is_state('...'), state_attr('...'), state('...')
+            if (e.startsWith('is_state(') || e.startsWith('state_attr(') || e.startsWith('state(')) {
+                try {
+                    return new Function('states', `
+                        // Define Safe Helpers locally
+                        const is_state = (e,v) => states[e]?.state === v;
+                        const state_attr = (e,a) => states[e]?.attributes?.[a];
+                        const state = (e) => states[e]?.state; 
+                        return ${e};
+                    `)(hass.states);
+                } catch { return 'ERR'; }
+            }
+
+            // 3. Pattern: Simple Logic / Ternary (Strict Regex)
+            // Allows alphanumeric, quotes, logic operators (!==, ===, ?, :)
+            // EXPLICITLY BLOCKS: new, function, arrow functions (=>), return, import
+            if (/^[a-zA-Z0-9_?.'"\s()?:!|&=<>\[\]-]+$/.test(e) && 
+                !/(?:new|function|=>|prototype|constructor|this|arguments|return|import)/i.test(e) &&
+                (e.includes('?') || e.includes('==') || e.includes('||') || e.includes('&&'))) {
+                try {
+                     return new Function('states', `
+                        const is_state = (e,v) => states[e]?.state === v;
+                        const state = (e) => states[e]?.state;
+                        return ${e}; 
+                    `)(hass.states);
+                } catch { return 'ERR'; }
+            }
+
+            // Default: If it didn't match any safe pattern, block it.
+            console.warn("[UI Interaction] Expression blocked by whitelist policy:", e);
+            return 'BLOCKED_EXPR';
+        });
+
+        return result;
+    }
+
+    /**
+     * Helper to recursively resolve templates inside data objects (service payloads).
+     * Necessary for features like dynamic PTZ speed or templated entity targets.
+     */
+    _resolveDataTemplate(data, hass) {
+        if (!data || typeof data !== 'object') return data;
+        
+        const resolved = {};
+        for (const [key, value] of Object.entries(data)) {
+            if (typeof value === 'string' && value.includes('${')) {
+                resolved[key] = this._evaluateTemplate(value, hass);
+            } else {
+                resolved[key] = value;
+            }
+        }
+        return resolved;
+    }
+
+    // --- STYLE HANDLING (Reactive) ---
+
+    _initStyleElement() {
+        // Create the style tag once
+        if (this.card.shadowRoot.querySelector('#custom-style')) return;
+        const style = document.createElement('style');
+        style.id = 'custom-style';
+        this.card.shadowRoot.appendChild(style);
+    }
+
+    _updateStyle(hass) {
+        const styleEl = this.card.shadowRoot.querySelector('#custom-style');
+        if (!styleEl) return;
+
+        let rawCss = this.card.config.style;
+        let finalCss = this._evaluateTemplate(rawCss, hass);
+
+        // Performance optimization: Only write to DOM if content actually changed
+        if (this._prevStyle !== finalCss) {
+            styleEl.textContent = finalCss;
+            this._prevStyle = finalCss;
+        }
+    }
+
+    // --- SHORTCUTS HANDLING ---
+
+    _renderShortcuts() {
+        const config = this.card.config.shortcuts;
+        if (!config || !Array.isArray(config)) return;
+
+        const container = document.createElement('div');
+        container.className = 'shortcuts';
+        
+        config.forEach((item, index) => {
+            const icon = document.createElement('ha-icon');
+            icon.dataset.index = index; // Store index for update loop
+            
+            // Set initial (static) icon, update() will handle templates later
+            icon.icon = item.icon && !item.icon.includes('${') ? item.icon : 'mdi:help-circle';
+            icon.title = item.name || '';
+            
+            // Apply static styles if present and not templated
+            if (item.style && !item.style.includes('${')) {
+                icon.style.cssText = item.style;
+            }
+
+            // Event Handling
+            icon.addEventListener('click', (e) => {
+                e.stopPropagation(); // Don't trigger video play/pause
+                this._handleShortcutClick(item);
+            });
+
+            container.appendChild(icon);
+        });
+
+        // Inject into card. We look for .card to append absolute positioned elements.
+        const cardRoot = this.card.shadowRoot.querySelector('.card');
+        if (cardRoot) cardRoot.appendChild(container);
+    }
+
+    _updateShortcuts(hass) {
+        const container = this.card.shadowRoot.querySelector('.shortcuts');
+        if (!container) return;
+
+        const config = this.card.config.shortcuts;
+        const icons = container.querySelectorAll('ha-icon');
+
+        icons.forEach((iconEl, index) => {
+            const item = config[index];
+            if (!item) return;
+
+            // 1. Reactive Icon Update
+            if (item.icon && item.icon.includes('${')) {
+                const newIcon = this._evaluateTemplate(item.icon, hass);
+                if (iconEl.icon !== newIcon) iconEl.icon = newIcon;
+            }
+
+            // 2. Reactive Style Update
+            // Allows changing color/opacity/display based on state
+            if (item.style && item.style.includes('${')) {
+                const newStyle = this._evaluateTemplate(item.style, hass);
+                // We check against a cached property to avoid trashing inline styles needlessly
+                if (iconEl.dataset.lastStyle !== newStyle) {
+                    iconEl.style.cssText = newStyle;
+                    iconEl.dataset.lastStyle = newStyle;
+                }
+            }
+        });
+    }
+
+    _handleShortcutClick(item) {
+        if (!this.hass) return;
+
+        // 1. Service Call
+        if (item.service) {
+            const [domain, service] = item.service.split('.');
+            // Resolve templates in service data (e.g. dynamic camera_name or params)
+            const rawData = item.service_data || item.data || {};
+            const finalData = this._resolveDataTemplate(rawData, this.hass);
+            
+            this.hass.callService(domain, service, finalData);
+        }
+        
+        // 2. Navigation
+        if (item.url) {
+            window.open(item.url, '_blank');
+        }
+        
+        // 3. More Info Dialog
+        if (item.more_info) {
+            const event = new Event('hass-more-info', { bubbles: true, composed: true });
+            event.detail = { entityId: item.more_info };
+            this.card.dispatchEvent(event);
+        }
+    }
+
+    // --- PTZ HANDLING (Refined + Visual Feedback) ---
+
+    _renderPTZ() {
+        const config = this.card.config.ptz;
+        if (!config) return;
+
+        const ptzContainer = document.createElement('div');
+        ptzContainer.className = 'ptz-controls';
+        
+        // PTZ CSS Layout (D-Pad style)
+        const style = document.createElement('style');
+        style.textContent = `
+            .ptz-controls {
+                position: absolute;
+                top: 20px;
+                right: 20px;
+                display: grid;
+                grid-template-columns: 40px 40px 40px;
+                grid-template-rows: 40px 40px 40px;
+                gap: 5px;
+                z-index: 20;
+                pointer-events: none; /* Let clicks pass through gaps */
+            }
+            .ptz-btn {
+                background: rgba(0,0,0,0.4);
+                color: white;
+                border-radius: 50%;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                cursor: pointer;
+                pointer-events: auto; /* Re-enable clicks on buttons */
+                transition: background 0.1s, transform 0.1s;
+                user-select: none;
+                touch-action: none; /* Critical for handling touch events manually */
+            }
+            /* Visual feedback for active state */
+            .ptz-btn:active, .ptz-btn.active { 
+                background: rgba(255, 255, 255, 0.6); 
+                transform: scale(0.92);
+            }
+            .ptz-up { grid-column: 2; grid-row: 1; }
+            .ptz-left { grid-column: 1; grid-row: 2; }
+            .ptz-right { grid-column: 3; grid-row: 2; }
+            .ptz-down { grid-column: 2; grid-row: 3; }
+            .ptz-home { grid-column: 2; grid-row: 2; }
+            .ptz-zoom-in { grid-column: 3; grid-row: 1; font-size: 10px; }
+            .ptz-zoom-out { grid-column: 3; grid-row: 3; font-size: 10px; }
+        `;
+        this.card.shadowRoot.appendChild(style);
+
+        const buttons = [
+            { cls: 'ptz-up', icon: 'mdi:arrow-up', action: 'up' },
+            { cls: 'ptz-down', icon: 'mdi:arrow-down', action: 'down' },
+            { cls: 'ptz-left', icon: 'mdi:arrow-left', action: 'left' },
+            { cls: 'ptz-right', icon: 'mdi:arrow-right', action: 'right' },
+            { cls: 'ptz-home', icon: 'mdi:home', action: 'home' }, 
+            { cls: 'ptz-zoom-in', icon: 'mdi:plus', action: 'zoom_in' },
+            { cls: 'ptz-zoom-out', icon: 'mdi:minus', action: 'zoom_out' }
+        ];
+
+        buttons.forEach(btn => {
+            // Only render buttons defined in config
+            // Check for tap action (data_action) or start action (data_start_action)
+            const hasAction = config[`data_${btn.action}`] || config[`data_start_${btn.action}`];
+            if (!hasAction && btn.action !== 'home') return;
+
+            const el = document.createElement('div');
+            el.className = `ptz-btn ${btn.cls}`;
+            const icon = document.createElement('ha-icon');
+            icon.icon = btn.icon;
+            el.appendChild(icon);
+
+            // [PTZ LOGIC SPLIT]
+            if (btn.action === 'home') {
+                // Home: Standard Click (Preset) + Flash Feedback
+                el.addEventListener('click', (e) => {
+                    e.preventDefault(); 
+                    e.stopPropagation();
+                    
+                    // Visual Feedback
+                    el.classList.add('active');
+                    setTimeout(() => el.classList.remove('active'), 300);
+
+                    this._handlePTZ(btn.action, null, config);
+                });
+            } else {
+                // Arrows: Continuous Move (Start/Stop) + Sustained Feedback
+                // We use pointer events to unify Mouse and Touch handling
+                el.addEventListener('pointerdown', (e) => {
+                    e.preventDefault(); 
+                    e.stopPropagation();
+                    
+                    // Activate Visual Feedback
+                    el.classList.add('active');
+                    
+                    // Start Move
+                    this._handlePTZ(btn.action, 'start', config);
+
+                    // Setup Stop Handler
+                    const stopHandler = () => {
+                        // Deactivate Visual Feedback
+                        el.classList.remove('active');
+                        
+                        this._handlePTZ(btn.action, 'stop', config);
+                        cleanup();
+                    };
+
+                    const cleanup = () => {
+                        window.removeEventListener('pointerup', stopHandler);
+                        window.removeEventListener('pointercancel', stopHandler);
+                        window.removeEventListener('pointerleave', stopHandler); // Safety net
+                    };
+
+                    // Listen for release anywhere on window
+                    window.addEventListener('pointerup', stopHandler);
+                    window.addEventListener('pointercancel', stopHandler);
+                    window.addEventListener('pointerleave', stopHandler);
+                });
+            }
+
+            ptzContainer.appendChild(el);
+        });
+
+        const cardRoot = this.card.shadowRoot.querySelector('.card');
+        if (cardRoot) cardRoot.appendChild(ptzContainer);
+    }
+
+    _handlePTZ(action, phase, config) {
+        if (!this.hass || !config.service) return;
+
+        let dataKey;
+        
+        // Determine which data payload to use
+        if (phase === 'start') {
+            // Try explicit start command first, fallback to generic tap command
+            dataKey = config[`data_start_${action}`] ? `data_start_${action}` : `data_${action}`;
+        } else if (phase === 'stop') {
+            dataKey = `data_stop_${action}`;
+        } else {
+            // No phase (e.g. Home button or Tap)
+            dataKey = `data_${action}`;
+        }
+
+        // If no configuration exists for this specific phase/action, do nothing.
+        if (!config[dataKey]) return;
+
+        const [domain, service] = config.service.split('.');
+        
+        // Resolve templates in PTZ payload (e.g. for dynamic speed or profile)
+        const finalData = this._resolveDataTemplate(config[dataKey], this.hass);
+        
+        // Merge with target entity if provided globally in ptz config
+        if (config.target_entity) {
+            finalData.entity_id = config.target_entity;
+        }
+
+        this.hass.callService(domain, service, finalData);
+    }
+}

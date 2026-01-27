@@ -1,5 +1,5 @@
 /**
- * WebRTC Camera Card v13.10.27
+ * WebRTC Camera Card v13.10.28
  *
  * DESIGN PHILOSOPHY
  * -----------------
@@ -19,9 +19,11 @@
  * Any attempt to "optimize" by reusing the driver will almost certainly reintroduce leaks.
  */
 
-// [DEPENDENCY UPDATE] Updated to v2.2.11 to support 'rtc_rejected' signal
 import {VideoRTC} from './video-rtc.js?v=2.2.11';
 import {DigitalPTZ} from './digital-ptz.js?v=3.3.0';
+// [SIDECAR INTEGRATION] Import the Interaction module.
+// This module handles legacy features (Shortcuts, PTZ, Styles) to keep the core driver clean.
+import {UIInteraction} from './ui-interaction.js?v=1.0.0';
 
 // Ensure the dumb driver is registered exactly once.
 // The driver itself contains no UI logic and must remain isolated.
@@ -51,6 +53,10 @@ class WebRTCCamera extends HTMLElement {
         // without disturbing the active playback.
         this.shadowDriver = null;
 
+        // [SIDECAR INTEGRATION] Reference to the UI Sidecar.
+        // This object manages buttons, styles and mechanical PTZ logic.
+        this.interaction = null;
+
         // Reconnection state machine.
         // These flags exist to avoid reconnect storms and overlapping drivers.
         this._isReconnecting = false;
@@ -66,7 +72,7 @@ class WebRTCCamera extends HTMLElement {
         // Must be cancelable if WebRTC connects spontaneously.
         this._upgradeTimer = null;
 
-        console.info('[WebRTC Camera] v13.10.27');
+        console.info('[WebRTC Camera] v13.10.28');
     }
 
     setConfig(config) {
@@ -123,6 +129,13 @@ class WebRTCCamera extends HTMLElement {
         if (this.shadowRoot && !this.driver && !this._isReconnecting) {
             this.startStream();
         }
+
+        // [SIDECAR INTEGRATION] Update the interaction module.
+        // We pass the new 'hass' state to the sidecar so it can update
+        // reactive templates (e.g. change icon colors) without re-rendering the video.
+        if (this.interaction) {
+            this.interaction.update(hass);
+        }
     }
 
     get hass() {
@@ -135,6 +148,9 @@ class WebRTCCamera extends HTMLElement {
         // [PHANTOM FIX] Ensure upgrade timer is killed on unmount
         if (this._upgradeTimer) clearTimeout(this._upgradeTimer);
         this._cleanupDriver();
+
+        // [SIDECAR INTEGRATION] Clear reference to help garbage collection
+        this.interaction = null;
     }
 
     // [SEAMLESS HANDOVER] Helper to clean a specific driver instance
@@ -703,6 +719,12 @@ class WebRTCCamera extends HTMLElement {
         this.shadowRoot
             .querySelector('.mode')
             .addEventListener('click', () => this.nextStream());
+        
+        // [SIDECAR INTEGRATION] Initialize legacy UI Interaction module.
+        // Now that the Shadow DOM structure is built, we can safely attach
+        // the sidecar to render shortcuts, styles and PTZ.
+        this.interaction = new UIInteraction(this);
+        this.interaction.render();
     }
 
     // [DIAGNOSTICS] Updated to support optional tooltip
