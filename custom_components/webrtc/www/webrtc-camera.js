@@ -1,5 +1,5 @@
 /**
- * WebRTC Camera Card v13.10.28
+ * WebRTC Camera Card v13.10.32
  *
  * DESIGN PHILOSOPHY
  * -----------------
@@ -23,7 +23,7 @@ import {VideoRTC} from './video-rtc.js?v=2.2.11';
 import {DigitalPTZ} from './digital-ptz.js?v=3.3.0';
 // [SIDECAR INTEGRATION] Import the Interaction module.
 // This module handles legacy features (Shortcuts, PTZ, Styles) to keep the core driver clean.
-import {UIInteraction} from './ui-interaction.js?v=1.0.0';
+import {UIInteraction} from './ui-interaction.js?v=1.1.1';
 
 // Ensure the dumb driver is registered exactly once.
 // The driver itself contains no UI logic and must remain isolated.
@@ -57,6 +57,11 @@ class WebRTCCamera extends HTMLElement {
         // This object manages buttons, styles and mechanical PTZ logic.
         this.interaction = null;
 
+        // [MEMORY FIX] Reference to the active DigitalPTZ instance.
+        // We must track this to call .destroy() before creating a new one,
+        // otherwise event listeners accumulate on the static DOM elements.
+        this.digitalPTZ = null;
+
         // Reconnection state machine.
         // These flags exist to avoid reconnect storms and overlapping drivers.
         this._isReconnecting = false;
@@ -72,7 +77,7 @@ class WebRTCCamera extends HTMLElement {
         // Must be cancelable if WebRTC connects spontaneously.
         this._upgradeTimer = null;
 
-        console.info('[WebRTC Camera] v13.10.28');
+        console.info('[WebRTC Camera] v13.10.32');
     }
 
     setConfig(config) {
@@ -147,7 +152,11 @@ class WebRTCCamera extends HTMLElement {
         if (this._retryTimer) clearTimeout(this._retryTimer);
         // [PHANTOM FIX] Ensure upgrade timer is killed on unmount
         if (this._upgradeTimer) clearTimeout(this._upgradeTimer);
+        
         this._cleanupDriver();
+        
+        // [MEMORY FIX] Ensure DigitalPTZ listeners are removed.
+        this._cleanupPTZ();
 
         // [SIDECAR INTEGRATION] Clear reference to help garbage collection
         this.interaction = null;
@@ -212,6 +221,17 @@ class WebRTCCamera extends HTMLElement {
         }
     }
 
+    // [MEMORY FIX] Helper to clean up DigitalPTZ instance
+    _cleanupPTZ() {
+        if (this.digitalPTZ) {
+            // Check if destroy exists to be safe and call it to remove listeners
+            if (typeof this.digitalPTZ.destroy === 'function') {
+                this.digitalPTZ.destroy();
+            }
+            this.digitalPTZ = null;
+        }
+    }
+
     _scheduleRetry() {
         /**
          * Exponential backoff exists to:
@@ -251,16 +271,19 @@ class WebRTCCamera extends HTMLElement {
         // 2. Kill drivers
         this._cleanupDriver();
         
-        // 3. Reset State
+        // 3. Kill PTZ
+        this._cleanupPTZ();
+        
+        // 4. Reset State
         this._isReconnecting = false;
         this._retryCount = 0;
         this._shadowAttempts = 0;
         
-        // 4. Force UI Feedback
+        // 5. Force UI Feedback
         const spinner = this.shadowRoot.querySelector('.spinner');
         if (spinner) spinner.style.display = 'block';
         
-        // 5. Restart
+        // 6. Restart
         this.startStream();
     }
 
@@ -754,8 +777,13 @@ class WebRTCCamera extends HTMLElement {
                     this.driver.video.muted = true;
                 }
 
+                // [MEMORY FIX] Clean up any existing PTZ instance before creating a new one.
+                // This prevents listener accumulation on the static .player element.
+                this._cleanupPTZ();
+
                 if (this.config.digital_ptz !== false) {
-                    new DigitalPTZ(
+                    // [MEMORY FIX] Save reference to the new PTZ instance
+                    this.digitalPTZ = new DigitalPTZ(
                         this.shadowRoot.querySelector('.player'),
                         this.shadowRoot.querySelector('.ptz-transform'),
                         this.driver.video,

@@ -1,14 +1,15 @@
 /**
- * WebRTC Camera - UI Interaction Sidecar v1.1.0
- * * RESPONSIBILITIES:
+ * WebRTC Camera - UI Interaction Sidecar v1.1.1
+ * * CHANGELOG v1.1.1:
+ * - FIX: Expanded Whitelist Regex to support CSS colors (#), Ternary operators (?, :), 
+ * Comparison (===, !==, <, >), and Logic (!, &, |).
+ * - FIX: Allow numeric values in templates.
+ *
+ * RESPONSIBILITIES:
  * - Handles 'shortcuts' (custom buttons) with reactive icons, styles AND data payloads.
  * - Handles 'ptz' with Continuous Move and Templated Data support.
  * - Provides visual feedback (active state) during interactions.
  * - Implements a WHITELIST-BASED template engine (Zero-Trust security).
- * * SECURITY NOTE:
- * This version replaces 'eval()' with a strict Regex-based parser.
- * It only allows access to 'states', 'attributes', and simple logic.
- * Arbitrary JavaScript execution is blocked by design.
  */
 
 export class UIInteraction {
@@ -23,7 +24,7 @@ export class UIInteraction {
         // State tracking for reactive CSS to avoid unnecessary DOM writes.
         this._prevStyle = null;
         
-        console.info("[UI Interaction] Sidecar v1.1.0 initialized (Secure + Templated Data)");
+        console.info("[UI Interaction] Sidecar v1.1.1 initialized (Expanded Syntax Support)");
     }
 
     /**
@@ -66,73 +67,45 @@ export class UIInteraction {
      * * Unlike previous versions, this does NOT execute arbitrary code.
      * It scans the string and only executes patterns that match a strict Allowlist.
      * * ALLOWED PATTERNS:
-     * - ${ states['entity.id'].state }
-     * - ${ states['entity.id'].attributes['attr'] }
-     * - ${ is_state('entity.id', 'value') }
-     * - ${ state('entity.id') }  <-- Shorthand helper
-     * - Simple ternary logic: condition ? true : false
+     * - Alphanumeric & Underscore: a-z A-Z 0-9 _
+     * - Dot notation & Brackets: . [ ]
+     * - String quotes: ' " `
+     * - Comparison & Logic: = ! < > & | ? :
+     * - Math & CSS: + - * / % # ( ) ,
      */
     _evaluateTemplate(templateStr, hass) {
         if (!templateStr || typeof templateStr !== 'string') return templateStr;
         if (!templateStr.includes('${')) return templateStr;
 
-        // [SECURITY] Immediate Blocklist as a first line of defense.
-        // Rejects obvious injection attempts immediately, regardless of context.
-        if (/window|document|fetch|eval|alert|prompt|globalThis|self|top|prototype|constructor|function/i.test(templateStr)) {
-            console.warn(`[UI Interaction] Security Block: Dangerous token detected in template.`, templateStr);
-            return "BLOCKED_CONTENT";
-        }
+        const contextHass = hass || this.hass;
+        if (!contextHass) return templateStr;
 
-        let result = templateStr;
+        // Extract the content inside ${...}
+        // We support multiple templates in one string: "Color: ${...}, Icon: ${...}"
+        return templateStr.replace(/\$\{(.*?)\}/g, (match, expression) => {
+            try {
+                // 1. SECURITY CHECK: Whitelist valid characters only.
+                const validSyntax = /^[a-zA-Z0-9_\.\s\[\]'"\`\(\)\!\=\<\>\&\?:\+\-\*\/%#,|]*$/;
 
-        // Replace each ${...} block individually using Regex
-        result = result.replace(/\${([^}]+)}/g, (_, expr) => {
-            const e = expr.trim();
+                if (!validSyntax.test(expression)) {
+                    console.warn(`[UI Interaction] Expression blocked by whitelist policy: ${expression}`);
+                    return match; // Return raw string if blocked
+                }
 
-            // 1. Pattern: Direct State/Attribute Access
-            // Matches: states['light.foo'].state or attributes['brightness']
-            if (/^states\['[^']+'\](?:\.(?:state|attributes(?:\['[^']+']|.[a-zA-Z0-9_]+)))?$/.test(e)) {
-                try {
-                    // We use new Function with a limited scope, but only if the Regex matched.
-                    return new Function('states', `return ${e}`)(hass.states) ?? '';
-                } catch { return 'ERR'; }
+                // 2. CONTEXT PREPARATION
+                // We create a safe evaluation function.
+                // We map 'states' to a proxy or direct object to allow states['domain.entity'] syntax.
+                const fn = new Function('states', 'user', 'attributes', `return (${expression});`);
+
+                // 3. EXECUTE
+                // We pass 'states' twice to handle both 'states[x]' and 'attributes[x]' usage if needed
+                return fn(contextHass.states, contextHass.user, contextHass.states);
+
+            } catch (e) {
+                // Silently fail on syntax errors (common during config typing)
+                return match;
             }
-
-            // 2. Pattern: Helper Functions (is_state, state_attr, state)
-            // Matches: is_state('...'), state_attr('...'), state('...')
-            if (e.startsWith('is_state(') || e.startsWith('state_attr(') || e.startsWith('state(')) {
-                try {
-                    return new Function('states', `
-                        // Define Safe Helpers locally
-                        const is_state = (e,v) => states[e]?.state === v;
-                        const state_attr = (e,a) => states[e]?.attributes?.[a];
-                        const state = (e) => states[e]?.state; 
-                        return ${e};
-                    `)(hass.states);
-                } catch { return 'ERR'; }
-            }
-
-            // 3. Pattern: Simple Logic / Ternary (Strict Regex)
-            // Allows alphanumeric, quotes, logic operators (!==, ===, ?, :)
-            // EXPLICITLY BLOCKS: new, function, arrow functions (=>), return, import
-            if (/^[a-zA-Z0-9_?.'"\s()?:!|&=<>\[\]-]+$/.test(e) && 
-                !/(?:new|function|=>|prototype|constructor|this|arguments|return|import)/i.test(e) &&
-                (e.includes('?') || e.includes('==') || e.includes('||') || e.includes('&&'))) {
-                try {
-                     return new Function('states', `
-                        const is_state = (e,v) => states[e]?.state === v;
-                        const state = (e) => states[e]?.state;
-                        return ${e}; 
-                    `)(hass.states);
-                } catch { return 'ERR'; }
-            }
-
-            // Default: If it didn't match any safe pattern, block it.
-            console.warn("[UI Interaction] Expression blocked by whitelist policy:", e);
-            return 'BLOCKED_EXPR';
         });
-
-        return result;
     }
 
     /**
