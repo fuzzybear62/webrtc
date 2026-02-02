@@ -42,7 +42,7 @@ class WebRTCConnectionSensor(SensorEntity):
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, entry_id)},
             name="WebRTC Camera",
-            manufacturer="AlexxIT",
+            manufacturer="Fuzzybear",
         )
 
     async def async_added_to_hass(self) -> None:
