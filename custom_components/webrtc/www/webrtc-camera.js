@@ -109,7 +109,7 @@ class WebRTCCamera extends HTMLElement {
         this._io = null;           // IntersectionObserver instance
         this._visAbort = null;     // AbortController for the document visibilitychange listener
 
-        console.info('[WebRTC Camera] v14.1.8');
+        console.info('[WebRTC Camera] v14.1.9');
     }
 
     setConfig(config) {
@@ -807,6 +807,18 @@ class WebRTCCamera extends HTMLElement {
                 this._retryCount = 0;
                 this._streamHealthy = true;
                 this._shadowAttempts = 0;
+                // [ORPHAN FIX] The main upgraded to WebRTC on its own while a shadow
+                // probe was still in flight (launched by the 2s _upgradeTimer or by the
+                // re-probe loop). _stopReprobe() below only cancels the *timer*; the
+                // shadow's already-open WebSocket would otherwise linger as a second
+                // go2rtc consumer for a camera that is now on RTC (observed: the MSE/
+                // client counter never drops back from 2 to 1 after a direct upgrade).
+                // Tear it down here, exactly as the handover-swap branch does. Nuking
+                // this.shadowDriver also clears its 15s watchdog (see _nukeDriver).
+                if (this.shadowDriver) {
+                    this._nukeDriver(this.shadowDriver, 'Orphaned Shadow (main went RTC)');
+                    this.shadowDriver = null;
+                }
                 // [RTC RE-PROBE] Already on WebRTC — no periodic upgrade needed.
                 this._activeMode = 'rtc';
                 this._stopReprobe();
@@ -841,11 +853,16 @@ class WebRTCCamera extends HTMLElement {
 
             this.shadowDriver = newDriver;
 
-            // [SEAMLESS HANDOVER] Watchdog: Kill shadow if it gets stuck in 'checking' for too long (15s)
-            // This prevents zombie connections when UDP is blocked by firewall.
+            // [SEAMLESS HANDOVER] Watchdog: kill any shadow that has not been PROMOTED
+            // within 15s. A successful promotion nulls this.shadowDriver well before the
+            // timer fires, so a shadow still referenced here is stuck — whether its pc is
+            // 'checking' (UDP blocked by firewall) OR 'connected' but never swapped (video
+            // never produced 'loadeddata', so onpcvideo/handover never ran). The old guard
+            // spared a 'connected' shadow on the assumption the swap was imminent; when it
+            // wasn't, that left a permanent zombie holding a second go2rtc connection.
             this._shadowTimeout = setTimeout(() => {
-                if (this.shadowDriver && this.shadowDriver.pc?.connectionState !== 'connected') {
-                    console.info('[WebRTC Camera] Shadow timeout – killing inactive probe');
+                if (this.shadowDriver) {
+                    console.info('[WebRTC Camera] Shadow timeout – killing unpromoted probe');
                     this._nukeDriver(this.shadowDriver, 'Timeout Shadow');
                     this.shadowDriver = null;
                     this._shadowAttempts = 0; // Reset to allow future attempts
