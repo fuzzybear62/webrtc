@@ -1,5 +1,5 @@
 /**
- * WebRTC Camera Card v14.0.0
+ * WebRTC Camera Card v14.1.0
  *
  * DESIGN PHILOSOPHY
  * -----------------
@@ -77,7 +77,7 @@ class WebRTCCamera extends HTMLElement {
         // Must be cancelable if WebRTC connects spontaneously.
         this._upgradeTimer = null;
 
-        console.info('[WebRTC Camera] v14.0.0');
+        console.info('[WebRTC Camera] v14.1.0');
     }
 
     setConfig(config) {
@@ -771,8 +771,15 @@ class WebRTCCamera extends HTMLElement {
         
         if (divMode) {
             if (mode) divMode.innerText = mode;
-            if (tooltip) divMode.title = tooltip;
-            else if (tooltip === null) divMode.removeAttribute('title'); // Clear if null passed explicitly
+            if (tooltip) {
+                divMode.title = tooltip;
+            } else if (tooltip === null || mode) {
+                // Clear a stale tooltip when explicitly cleared (null), or when a new
+                // mode is set without its own tooltip — otherwise the previous state's
+                // message (e.g. "Connected via WebRTC") would linger on an error/loading.
+                // Tooltip-only updates pass mode=null with a tooltip, so they are preserved.
+                divMode.removeAttribute('title');
+            }
         }
         
         if (divStatus && status) divStatus.innerText = status;
@@ -802,7 +809,9 @@ class WebRTCCamera extends HTMLElement {
                         this.shadowRoot.querySelector('.ptz-transform'),
                         this.driver.video,
                         Object.assign({}, this.config.digital_ptz, {
-                            persist_key: this.config.url
+                            // Fall back to entity so entity-based streams keep a distinct
+                            // zoom-persistence bucket instead of all sharing `undefined`.
+                            persist_key: this.config.url || this.config.entity
                         })
                     );
                 }
@@ -889,7 +898,7 @@ class WebRTCCamera extends HTMLElement {
             else if (icon === 'mdi:rectangle') document.exitPictureInPicture().catch(console.warn);
             
             else if (ev.target.className === 'stream') {
-                this.nextStream(true);
+                this.nextStream();
                 ev.target.innerText = this.streamName;
             }
         });
@@ -936,6 +945,13 @@ class WebRTCCamera extends HTMLElement {
             v.webkitAudioDecodedByteCount ||
             (v.audioTracks && v.audioTracks.length)
         );
+    }
+
+    // Human-readable label for the active stream, used by the multi-stream UI.
+    // Falls back through name -> entity -> url -> a 1-based index.
+    get streamName() {
+        const stream = this.config.streams[this.streamID] || {};
+        return stream.name || stream.entity || stream.url || `Stream ${this.streamID + 1}`;
     }
 
     getCardSize() { return 5; }
