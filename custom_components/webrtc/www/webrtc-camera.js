@@ -85,7 +85,18 @@ class WebRTCCamera extends HTMLElement {
         // in one shot on every rebuild (idempotent renderCustomUI).
         this._uiAbort = null;
 
-        console.info('[WebRTC Camera] v14.1.0');
+        // [AUTO-PAUSE] Off-screen / tab-hidden lifecycle. Disabled unless the
+        // user opts in with `background: false`. Because our driver is a hard
+        // teardown, "pause" means _cleanupDriver() (frees decoder, closes the WS
+        // so go2rtc stops pushing) and "resume" is a cold startStream().
+        this._paused = false;      // stream torn down because it is not watchable
+        this._docHidden = false;   // document.visibilityState === 'hidden'
+        this._offScreen = false;   // host is outside the viewport (IntersectionObserver)
+        this._pauseTimer = null;   // debounce so a quick scroll/flick doesn't tear down
+        this._io = null;           // IntersectionObserver instance
+        this._visAbort = null;     // AbortController for the document visibilitychange listener
+
+        console.info('[WebRTC Camera] v14.1.3');
     }
 
     setConfig(config) {
@@ -138,6 +149,120 @@ class WebRTCCamera extends HTMLElement {
         // Reflect live `ui` / stream-count changes on the built-in overlay too.
         // Safe no-op until a driver is connected (guarded inside renderCustomUI).
         this.renderCustomUI();
+
+        // [AUTO-PAUSE] (Re)wire off-screen / tab-hidden watching from the current
+        // config. Idempotent: tears down any previous observer/listener first.
+        this._setupVisibility();
+    }
+
+    connectedCallback() {
+        // Re-arm visibility watching if the card was detached and re-attached
+        // (HA can move cards around the masonry). No-op until setConfig ran.
+        if (this.config) this._setupVisibility();
+    }
+
+    // [AUTO-PAUSE] Wire (or re-wire) the off-screen + tab-hidden observers.
+    // Only active when the user opts in with `background: false`; otherwise the
+    // stream runs 24/7 as before. Fully idempotent so a live config edit or a
+    // re-attach never stacks duplicate observers/listeners.
+    _setupVisibility() {
+        // Always clear any previous wiring first.
+        this._teardownVisibility();
+
+        // Opt-in only. `background: true` (default) => never auto-pause.
+        if (this.config.background !== false) return;
+
+        // Off-screen detection on the host element. `intersection` (0..1) is the
+        // visible fraction below which the stream counts as off-screen.
+        const threshold = this.config.intersection || 0;
+        this._io = new IntersectionObserver((entries) => {
+            // isIntersecting is true while the visible fraction is at/above the
+            // threshold, false once it drops below it.
+            const e = entries[entries.length - 1];
+            this._offScreen = !e.isIntersecting;
+            this._evaluateVisibility();
+        }, {threshold: [threshold]});
+        this._io.observe(this);
+
+        // Tab-hidden / minimized / screen-off detection.
+        this._visAbort = new AbortController();
+        this._docHidden = document.visibilityState === 'hidden';
+        document.addEventListener('visibilitychange', () => {
+            this._docHidden = document.visibilityState === 'hidden';
+            this._evaluateVisibility();
+        }, {signal: this._visAbort.signal});
+
+        // Reconcile immediately with the current state.
+        this._evaluateVisibility();
+    }
+
+    _teardownVisibility() {
+        if (this._io) {
+            this._io.disconnect();
+            this._io = null;
+        }
+        if (this._visAbort) {
+            this._visAbort.abort();
+            this._visAbort = null;
+        }
+        if (this._pauseTimer) {
+            clearTimeout(this._pauseTimer);
+            this._pauseTimer = null;
+        }
+    }
+
+    // [AUTO-PAUSE] Decide whether the stream should be running and act on it,
+    // debounced so a quick scroll-past or tab flick never tears the stream down.
+    _evaluateVisibility() {
+        const shouldStream = !this._docHidden && !this._offScreen;
+
+        if (shouldStream) {
+            // Became watchable again: cancel any pending pause, resume if paused.
+            if (this._pauseTimer) {
+                clearTimeout(this._pauseTimer);
+                this._pauseTimer = null;
+            }
+            if (this._paused) this._resumeStream();
+            return;
+        }
+
+        // Not watchable: schedule a debounced teardown (once).
+        if (this._paused || this._pauseTimer) return;
+        const delay = this.config.pause_delay != null ? this.config.pause_delay : 5000;
+        this._pauseTimer = setTimeout(() => {
+            this._pauseTimer = null;
+            this._pauseStream();
+        }, delay);
+    }
+
+    // [AUTO-PAUSE] Hard teardown: frees the decoder and closes the WS so go2rtc
+    // stops pushing. This is the whole point — a soft video.pause() would keep
+    // burning bandwidth and hold the decoder.
+    _pauseStream() {
+        if (this._paused) return;
+        console.info('[WebRTC Camera] Auto-pause: off-screen/hidden, tearing down stream');
+        this._paused = true;
+
+        // Kill every pending timer so nothing revives the stream while paused.
+        if (this._retryTimer) { clearTimeout(this._retryTimer); this._retryTimer = null; }
+        if (this._upgradeTimer) { clearTimeout(this._upgradeTimer); this._upgradeTimer = null; }
+        if (this._shadowTimeout) { clearTimeout(this._shadowTimeout); this._shadowTimeout = null; }
+        this._isReconnecting = false;
+
+        this._cleanupDriver();
+        this._streamHealthy = false;
+        this.setStatus(null, null, 'Paused (off-screen)');
+    }
+
+    // [AUTO-PAUSE] Resume with a clean cold start.
+    _resumeStream() {
+        if (!this._paused) return;
+        console.info('[WebRTC Camera] Auto-resume: back on-screen, restarting stream');
+        this._paused = false;
+        this._retryCount = 0;
+        if (this._hass && this.config && this.shadowRoot && !this.driver) {
+            this.startStream();
+        }
     }
 
     // [SIDECAR INTEGRATION] (Re)create the UI sidecar overlays (shortcuts, PTZ, style).
@@ -164,7 +289,7 @@ class WebRTCCamera extends HTMLElement {
         // - the DOM exists
         // - no driver is currently alive
         // - we are not already reconnecting
-        if (this.shadowRoot && !this.driver && !this._isReconnecting) {
+        if (this.shadowRoot && !this.driver && !this._isReconnecting && !this._paused) {
             this.startStream();
         }
 
@@ -188,6 +313,11 @@ class WebRTCCamera extends HTMLElement {
 
         // Drop the .ui overlay listeners bound to the (soon-to-be-gone) video.
         if (this._uiAbort) this._uiAbort.abort();
+
+        // [AUTO-PAUSE] Disconnect the IntersectionObserver and remove the document
+        // visibilitychange listener — the document outlives the card, so leaving it
+        // wired would leak the card (and fire on a dead element).
+        this._teardownVisibility();
 
         this._cleanupDriver();
         
@@ -330,6 +460,8 @@ class WebRTCCamera extends HTMLElement {
 
     async startStream() {
         if (!this._hass || !this.config) return;
+        // [AUTO-PAUSE] Never start (or resurrect) a stream while paused off-screen.
+        if (this._paused) return;
 
         // Resolve the effective stream configuration.
         // Stream-specific overrides are merged here only.
@@ -628,7 +760,15 @@ class WebRTCCamera extends HTMLElement {
             // [CRITICAL] Pass the correct driver instance to fetch URL.
             // If we are in shadow mode, we must apply the signed poster/URL to the shadow driver, not Main.
             const url = await this._fetchWebsocketURL(isShadowMode ? newDriver : null);
-            
+
+            // [AUTO-PAUSE] The card may have been paused off-screen while we were
+            // awaiting the signed URL. Abandon this connection so we don't leave a
+            // live driver running behind a paused card.
+            if (this._paused) {
+                this._cleanupDriver();
+                return;
+            }
+
             // Apply URL to the correct instance
             const target = isShadowMode ? this.shadowDriver : this.driver;
             
