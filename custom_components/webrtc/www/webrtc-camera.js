@@ -96,7 +96,7 @@ class WebRTCCamera extends HTMLElement {
         this._io = null;           // IntersectionObserver instance
         this._visAbort = null;     // AbortController for the document visibilitychange listener
 
-        console.info('[WebRTC Camera] v14.1.3');
+        console.info('[WebRTC Camera] v14.1.4');
     }
 
     setConfig(config) {
@@ -665,7 +665,16 @@ class WebRTCCamera extends HTMLElement {
                         newDriver.video.muted = false;
                     }
                     
-                    // 3. Inject into DOM
+                    // 3. Reveal the promoted driver: it was attached hidden as a shadow,
+                    // so clear the inline overrides and let the `video-rtc` CSS rule size
+                    // it back to full frame. It is already inside .ptz-transform; the
+                    // appendChild below is a harmless same-parent reorder that also puts
+                    // it last (on top of the now-nuked MSE slot).
+                    this.driver.style.position = '';
+                    this.driver.style.width = '';
+                    this.driver.style.height = '';
+                    this.driver.style.opacity = '';
+                    this.driver.style.pointerEvents = '';
                     const container = this.shadowRoot.querySelector('.ptz-transform');
                     if (container) container.appendChild(this.driver);
                     
@@ -701,15 +710,32 @@ class WebRTCCamera extends HTMLElement {
         };
 
         // Inject driver into DOM.
-        // [SEAMLESS HANDOVER] Shadow driver is NOT injected yet (it works in memory).
-        // Main driver is injected immediately.
+        // [SEAMLESS HANDOVER] Both drivers are injected: the main one visibly, the
+        // shadow one hidden (see below). The shadow must be in the DOM to connect at
+        // all — the driver gates onconnect() on `isConnected`.
         if (!isShadowMode) {
             const container = this.shadowRoot.querySelector('.ptz-transform');
             if (container) container.appendChild(newDriver);
             this.driver = newDriver;
         } else {
+            // [SEAMLESS HANDOVER] The shadow probe MUST be attached to the DOM: the
+            // driver's onconnect() bails while `isConnected` is false, and its <video>
+            // is created lazily in connectedCallback()->oninit(). A detached shadow can
+            // therefore never open its WebSocket, so it always timed out at 15s and the
+            // upgrade never happened. Attach it hidden — inline styles override the
+            // `video-rtc { width/height:100%; display:block }` rule, and position:absolute
+            // pulls it out of the flex flow so it neither resizes nor covers the main
+            // picture. Never display:none: that would suspend decoding and stall the probe.
+            newDriver.style.position = 'absolute';
+            newDriver.style.width = '1px';
+            newDriver.style.height = '1px';
+            newDriver.style.opacity = '0';
+            newDriver.style.pointerEvents = 'none';
+            const shadowContainer = this.shadowRoot.querySelector('.ptz-transform');
+            if (shadowContainer) shadowContainer.appendChild(newDriver);
+
             this.shadowDriver = newDriver;
-            
+
             // [SEAMLESS HANDOVER] Watchdog: Kill shadow if it gets stuck in 'checking' for too long (15s)
             // This prevents zombie connections when UDP is blocked by firewall.
             this._shadowTimeout = setTimeout(() => {
