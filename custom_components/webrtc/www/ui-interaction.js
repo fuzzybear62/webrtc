@@ -252,7 +252,9 @@ export class UIInteraction {
         ptzContainer.className = 'ptz-controls';
         
         // PTZ CSS Layout (D-Pad style)
+        // Tagged with an id so destroy() can remove it on a config-driven rebuild.
         const style = document.createElement('style');
+        style.id = 'ptz-style';
         style.textContent = `
             .ptz-controls {
                 position: absolute;
@@ -400,5 +402,26 @@ export class UIInteraction {
         }
 
         this.hass.callService(domain, service, finalData);
+    }
+
+    /**
+     * Tears down every DOM node this sidecar owns.
+     * Called before a rebuild when the card config changes at runtime.
+     * Removing the containers detaches the click/pointer listeners bound to
+     * their children; the PTZ window listeners are transient (added on
+     * pointerdown, removed on pointerup/cancel) so none are left orphaned.
+     */
+    destroy() {
+        const root = this.card && this.card.shadowRoot;
+        if (!root) return;
+
+        root.querySelector('.shortcuts')?.remove();
+        root.querySelector('.ptz-controls')?.remove();
+        root.querySelector('#ptz-style')?.remove();
+        root.querySelector('#custom-style')?.remove();
+
+        // Drop caches so a fresh instance never inherits stale state.
+        this._templateCache.clear();
+        this._prevStyle = null;
     }
 }

@@ -121,6 +121,27 @@ class WebRTCCamera extends HTMLElement {
         }
 
         this.renderStructure();
+
+        // Build (or rebuild) the interaction sidecar from the current config.
+        // HA reuses the element and calls setConfig again when the card is edited,
+        // so this must run every time to reflect live shortcuts/ptz/style changes.
+        this._initSidecar();
+    }
+
+    // [SIDECAR INTEGRATION] (Re)create the UI sidecar overlays (shortcuts, PTZ, style).
+    // Tears down the previous instance first so a config-driven rebuild never
+    // duplicates the .shortcuts / .ptz-controls DOM or their listeners.
+    _initSidecar() {
+        if (this.interaction && typeof this.interaction.destroy === 'function') {
+            this.interaction.destroy();
+        }
+        this.interaction = new UIInteraction(this);
+        this.interaction.render();
+
+        // Resolve reactive templates immediately if HA state is already available.
+        if (this._hass) {
+            this.interaction.update(this._hass);
+        }
     }
 
     set hass(hass) {
@@ -756,12 +777,9 @@ class WebRTCCamera extends HTMLElement {
         this.shadowRoot
             .querySelector('.mode')
             .addEventListener('click', () => this.nextStream());
-        
-        // [SIDECAR INTEGRATION] Initialize legacy UI Interaction module.
-        // Now that the Shadow DOM structure is built, we can safely attach
-        // the sidecar to render shortcuts, styles and PTZ.
-        this.interaction = new UIInteraction(this);
-        this.interaction.render();
+
+        // The interaction sidecar is created/rebuilt by _initSidecar(), invoked
+        // from setConfig(), so it can reflect live config changes.
     }
 
     // [DIAGNOSTICS] Updated to support optional tooltip
