@@ -67,7 +67,11 @@ class WebRTCCamera extends HTMLElement {
         this._isReconnecting = false;
         this._retryCount = 0;
         this._retryTimer = null;
-        
+        // True once a media mode has actually come up. Lets us tell a fatal
+        // "stream never started" error (retry) from a non-fatal per-mode error
+        // on an already-playing stream (ignore).
+        this._streamHealthy = false;
+
         // [SEAMLESS HANDOVER] Retry counter for background upgrades
         this._shadowAttempts = 0;
         // [SEAMLESS HANDOVER] Watchdog timer to kill stuck shadow connections
@@ -275,17 +279,22 @@ class WebRTCCamera extends HTMLElement {
         if (this._isReconnecting) return;
 
         this._isReconnecting = true;
+        this._streamHealthy = false;
 
         const delay = Math.min(
             1000 * Math.pow(2, this._retryCount),
             30000
         );
-        
+
         console.debug(`[WebRTC Camera] Scheduling retry in ${delay}ms`);
 
         this._retryTimer = setTimeout(() => {
             this._retryCount++;
             this._isReconnecting = false;
+            // The previous driver is dead. Drop it explicitly so startStream()
+            // does a clean cold start instead of mistaking the stale driver for a
+            // live one and launching a shadow probe (which would never revive it).
+            this._cleanupDriver();
             this.startStream();
         }, delay);
     }
@@ -334,6 +343,7 @@ class WebRTCCamera extends HTMLElement {
 
         if (!isShadowMode) {
             console.info('[WebRTC Camera] Cold Start: Initializing Main Driver');
+            this._streamHealthy = false;
             this.setStatus('Loading..');
             // UX Spinner: Show immediately to cover Auth/WS handshake latency.
             const spinner = this.shadowRoot.querySelector('.spinner');
@@ -426,6 +436,14 @@ class WebRTCCamera extends HTMLElement {
                     case 'error':
                         console.error(`[WebRTC Camera] Main Driver Error: ${msg.value}`);
                         this.setStatus('Error', msg.value);
+                        // [RESILIENCE] When the source is unreachable (e.g. "no route to
+                        // host", "context deadline exceeded") go2rtc reports it as an error
+                        // frame while the socket stays open, so no 'connection-closed' ever
+                        // fires. Retry only if the stream never came up: on an already-healthy
+                        // stream this is a non-fatal per-mode error (e.g. a failed webrtc/offer
+                        // while MSE plays) and must NOT tear it down — a genuine mid-stream
+                        // freeze is caught by the driver's no-data watchdog instead.
+                        if (!this._streamHealthy) this._scheduleRetry();
                         break;
                     case 'mse':
                         console.info('[WebRTC Camera] Main Driver negotiated: MSE');
@@ -464,10 +482,11 @@ class WebRTCCamera extends HTMLElement {
                                 this._upgradeTimer = null;
                             }
                             
-                            this.setStatus(msg.type.toUpperCase(), this.config.title || '', 
+                            this.setStatus(msg.type.toUpperCase(), this.config.title || '',
                                 msg.type === 'webrtc' ? 'Connected via WebRTC (Low Latency)' : '');
                         }
                         this._retryCount = 0;
+                        this._streamHealthy = true;
                         break;
                 }
             }
@@ -526,6 +545,7 @@ class WebRTCCamera extends HTMLElement {
                     
                     // [DIAGNOSTICS] Update UI to show successful handover
                     this.setStatus('RTC', this.config.title || '', 'Seamless connection active via WebRTC (Handover Success)');
+                    this._streamHealthy = true;
                     this._applyPoster();
 
                     // [SEAMLESS HANDOVER] Rebind tools/PTZ to the promoted video.
@@ -542,6 +562,7 @@ class WebRTCCamera extends HTMLElement {
                 console.info('[WebRTC Camera] Main Driver negotiated WebRTC directly.');
                 this.setStatus('RTC', this.config.title || '', 'Connected via WebRTC (Direct)');
                 this._retryCount = 0;
+                this._streamHealthy = true;
                 this._shadowAttempts = 0;
                 this._applyPoster();
             }

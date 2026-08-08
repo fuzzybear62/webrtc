@@ -16,9 +16,9 @@ export class VideoRTC extends HTMLElement {
         // Renamed to clientId to avoid conflict with HTMLElement.id
         this.clientId = Math.random().toString(36).substring(2, 7).toUpperCase();
 
-        // Timeouts to detect dead connections
+        // No-media watchdog: if the socket stays open but no media bytes arrive
+        // for this long, treat the stream as stalled and force a reconnect.
         this.DISCONNECT_TIMEOUT = 5000;
-        this.RECONNECT_TIMEOUT = 15000;
 
         // List of supported codecs to announce to the server
         this.CODECS = [
@@ -206,11 +206,38 @@ export class VideoRTC extends HTMLElement {
     }
 
     /**
+     * No-media watchdog.
+     * Re-armed on every media byte. If media stops flowing while the socket is
+     * still technically open (frozen MSE, or a black-holed path that never sends
+     * a FIN/RST), no 'close' event ever fires and the parent never learns the
+     * stream is dead. When the timer elapses we force onclose(), which dispatches
+     * 'connection-closed' and lets the card reconnect.
+     */
+    _feedWatchdog() {
+        if (!this.DISCONNECT_TIMEOUT) return;
+        if (this.reconnectTID) clearTimeout(this.reconnectTID);
+        this.reconnectTID = setTimeout(() => {
+            this.reconnectTID = 0;
+            console.warn(`[VideoRTC:${this.clientId}] No-data watchdog fired (${this.DISCONNECT_TIMEOUT}ms silent). Forcing close.`);
+            this.handoff = false; // a stall is a failure, not an intentional handover
+            this.onclose();
+        }, this.DISCONNECT_TIMEOUT);
+    }
+
+    _clearWatchdog() {
+        if (this.reconnectTID) {
+            clearTimeout(this.reconnectTID);
+            this.reconnectTID = 0;
+        }
+    }
+
+    /**
      * The Destructor. Clean up ALL resources.
      */
     ondisconnect() {
+        this._clearWatchdog();
         this.ondata = null;
-        this.onmessage = {}; 
+        this.onmessage = {};
         
         // 1. Close WebSocket
         if (this.ws) {
@@ -259,7 +286,9 @@ export class VideoRTC extends HTMLElement {
                     }
                 }
             } else {
-                // Binary data (usually MSE video chunks)
+                // Binary data (usually MSE video chunks). Media is flowing,
+                // so pet the no-data watchdog.
+                this._feedWatchdog();
                 if (this.ondata) {
                     this.ondata(ev.data);
                 }
@@ -311,6 +340,9 @@ export class VideoRTC extends HTMLElement {
      * Returns FALSE if this was an intentional handover (success).
      */
     onclose() {
+        // Any close cancels the no-data watchdog so it can't fire afterwards.
+        this._clearWatchdog();
+
         // HANDOFF CHECK: The "Loop Fix".
         // If we closed the socket intentionally to switch to WebRTC, 
         // do NOT emit the closed event.
