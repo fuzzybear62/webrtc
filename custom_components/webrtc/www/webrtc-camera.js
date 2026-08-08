@@ -81,6 +81,19 @@ class WebRTCCamera extends HTMLElement {
         // Must be cancelable if WebRTC connects spontaneously.
         this._upgradeTimer = null;
 
+        // [RTC RE-PROBE] Periodic background WebRTC re-probe while settled on MSE.
+        // The initial _upgradeTimer is a single fast attempt right after MSE lands;
+        // this loop is the long-term safety net. Since a failed WebRTC no longer
+        // tears down MSE (driver v2.2.14 #6), a stream that started on MSE because
+        // WebRTC was momentarily unavailable (UDP briefly blocked, TURN down, ICE
+        // timeout) can still be upgraded minutes later, without ever disturbing the
+        // live MSE picture. Attempts back off (30s, 60s, 120s ... capped at 10min)
+        // so a permanently WebRTC-incapable network settles to one cheap probe every
+        // 10 minutes. Opt out with `rtc_reprobe: false`.
+        this._reprobeTimer = null;   // pending re-probe timer handle
+        this._reprobeDelay = 0;      // current backoff delay in ms (0 = loop idle)
+        this._activeMode = null;     // last negotiated main-driver transport: 'mse' | 'rtc'
+
         // Groups the .ui overlay's video/click listeners so they can be dropped
         // in one shot on every rebuild (idempotent renderCustomUI).
         this._uiAbort = null;
@@ -96,7 +109,7 @@ class WebRTCCamera extends HTMLElement {
         this._io = null;           // IntersectionObserver instance
         this._visAbort = null;     // AbortController for the document visibilitychange listener
 
-        console.info('[WebRTC Camera] v14.1.7');
+        console.info('[WebRTC Camera] v14.1.8');
     }
 
     setConfig(config) {
@@ -247,10 +260,12 @@ class WebRTCCamera extends HTMLElement {
         if (this._retryTimer) { clearTimeout(this._retryTimer); this._retryTimer = null; }
         if (this._upgradeTimer) { clearTimeout(this._upgradeTimer); this._upgradeTimer = null; }
         if (this._shadowTimeout) { clearTimeout(this._shadowTimeout); this._shadowTimeout = null; }
+        this._stopReprobe(); // [RTC RE-PROBE] no background upgrades while paused
         this._isReconnecting = false;
 
         this._cleanupDriver();
         this._streamHealthy = false;
+        this._activeMode = null;
         this.setStatus(null, null, 'Paused (off-screen)');
     }
 
@@ -310,6 +325,8 @@ class WebRTCCamera extends HTMLElement {
         if (this._retryTimer) clearTimeout(this._retryTimer);
         // [PHANTOM FIX] Ensure upgrade timer is killed on unmount
         if (this._upgradeTimer) clearTimeout(this._upgradeTimer);
+        // [RTC RE-PROBE] Kill the periodic re-probe loop on unmount.
+        this._stopReprobe();
 
         // Drop the .ui overlay listeners bound to the (soon-to-be-gone) video.
         if (this._uiAbort) this._uiAbort.abort();
@@ -410,6 +427,10 @@ class WebRTCCamera extends HTMLElement {
 
         this._isReconnecting = true;
         this._streamHealthy = false;
+        // [RTC RE-PROBE] The driver is being torn down and cold-restarted; a fresh
+        // negotiation re-arms the loop from scratch, so drop the stale backoff now.
+        this._stopReprobe();
+        this._activeMode = null;
 
         const delay = Math.min(
             1000 * Math.pow(2, this._retryCount),
@@ -429,6 +450,51 @@ class WebRTCCamera extends HTMLElement {
         }, delay);
     }
 
+    // [RTC RE-PROBE] Arm the next periodic upgrade attempt, backing off each time.
+    // Idempotent: a second call while a probe is already armed is a no-op, so the
+    // various failure paths can all call this without stacking timers.
+    _scheduleReprobe() {
+        if (this.config && this.config.rtc_reprobe === false) return; // opt-out
+        if (this._reprobeTimer) return;                               // already armed
+        const mode = (this.config && this.config.mode) || '';
+        if (mode.indexOf('webrtc') < 0) return;                       // WebRTC not wanted
+
+        const base = (this.config && this.config.rtc_reprobe_base) || 30000;
+        const max  = (this.config && this.config.rtc_reprobe_max)  || 600000;
+        this._reprobeDelay = this._reprobeDelay
+            ? Math.min(this._reprobeDelay * 2, max)
+            : base;
+
+        console.debug(`[WebRTC Camera] RTC re-probe armed in ${this._reprobeDelay}ms`);
+        this._reprobeTimer = setTimeout(() => {
+            this._reprobeTimer = null;
+            this._attemptReprobe();
+        }, this._reprobeDelay);
+    }
+
+    // [RTC RE-PROBE] Fire one background upgrade attempt if conditions still hold.
+    _attemptReprobe() {
+        // Settled non-MSE state (already upgraded, or stream gone) ends the loop by
+        // NOT rescheduling. Transient blockers (paused, reconnecting, a probe already
+        // in flight) reschedule so we retry once they clear.
+        if (!this._hass || !this.config || !this.shadowRoot) return;
+        if (this._activeMode !== 'mse' || !this.driver) return; // upgraded/not streaming -> stop
+        if (this._paused || this._isReconnecting) { this._scheduleReprobe(); return; }
+        if (this.shadowDriver) { this._scheduleReprobe(); return; } // a probe is already running
+
+        console.info('[WebRTC Camera] Periodic RTC re-probe: launching background shadow upgrade');
+        // startStream() sees the live main driver and runs the shadow path. On success
+        // the swap sets _activeMode='rtc' and stops the loop; every failure path
+        // (shadow error / timeout / auth) re-arms _scheduleReprobe().
+        this.startStream();
+    }
+
+    // [RTC RE-PROBE] Stop the loop and reset the backoff (upgrade succeeded, or teardown).
+    _stopReprobe() {
+        if (this._reprobeTimer) { clearTimeout(this._reprobeTimer); this._reprobeTimer = null; }
+        this._reprobeDelay = 0;
+    }
+
     // [HARD RESET] Manually triggered by refresh button.
     // Cleans everything and restarts from scratch (Cold Start).
     hardReset() {
@@ -438,7 +504,9 @@ class WebRTCCamera extends HTMLElement {
         if (this._retryTimer) clearTimeout(this._retryTimer);
         if (this._upgradeTimer) clearTimeout(this._upgradeTimer);
         if (this._shadowTimeout) clearTimeout(this._shadowTimeout);
-        
+        this._stopReprobe(); // [RTC RE-PROBE] reset the loop on manual refresh
+        this._activeMode = null;
+
         // 2. Kill drivers
         this._cleanupDriver();
         
@@ -476,6 +544,10 @@ class WebRTCCamera extends HTMLElement {
         if (!isShadowMode) {
             console.info('[WebRTC Camera] Cold Start: Initializing Main Driver');
             this._streamHealthy = false;
+            // [RTC RE-PROBE] Fresh connection: drop any stale re-probe loop/backoff so
+            // this negotiation starts clean. The loop re-arms once we settle on MSE.
+            this._stopReprobe();
+            this._activeMode = null;
             this.setStatus('Loading..');
             // UX Spinner: Show immediately to cover Auth/WS handshake latency.
             const spinner = this.shadowRoot.querySelector('.spinner');
@@ -543,6 +615,19 @@ class WebRTCCamera extends HTMLElement {
                             : 'WebRTC upgrade discarded by driver (Quality < MSE)';
                         console.info(`[WebRTC Camera] ${reason}. Cancelling upgrade.`);
                         this.setStatus(null, null, reason);
+
+                        // [RTC RE-PROBE] rtc_failed is a *network* failure (ICE gave up):
+                        // exactly what the periodic loop exists to recover from, so arm it.
+                        // (It also covers the fast-fail case where WebRTC dies before the
+                        // initial 2s _upgradeTimer ever fired a shadow probe.) rtc_rejected
+                        // is a deliberate *quality* decision, stable for this connection —
+                        // re-probing would only be rejected again, so stop the loop instead.
+                        if (msg.value === 'rtc_failed') {
+                            this._activeMode = 'mse';
+                            this._scheduleReprobe();
+                        } else {
+                            this._stopReprobe();
+                        }
                     }
                     return;
                 }
@@ -561,6 +646,9 @@ class WebRTCCamera extends HTMLElement {
                         this.dispatchEvent(new CustomEvent('shadow-failed', {
                             detail: { error: msg.value }
                         }));
+
+                        // [RTC RE-PROBE] This probe failed; try again later on backoff.
+                        this._scheduleReprobe();
                     }
                     // Shadow driver ignores all other messages (it doesn't update UI)
                     return;
@@ -583,7 +671,15 @@ class WebRTCCamera extends HTMLElement {
                     case 'mse':
                         console.info('[WebRTC Camera] Main Driver negotiated: MSE');
                         this.setStatus(msg.type.toUpperCase(), this.config.title || '', 'Stream via MSE (TCP)');
-                        
+
+                        // [RTC RE-PROBE] Settled on MSE. Arm the periodic upgrade loop as a
+                        // long-term safety net (the fast _upgradeTimer below is the first,
+                        // immediate attempt; _scheduleReprobe is idempotent so the two never
+                        // stack). This also covers the case where the initial attempt is
+                        // skipped because _shadowAttempts is already exhausted.
+                        this._activeMode = 'mse';
+                        this._scheduleReprobe();
+
                         // [PHANTOM FIX] Clear any pending upgrade timer before setting a new one
                         if (this._upgradeTimer) clearTimeout(this._upgradeTimer);
 
@@ -690,6 +786,9 @@ class WebRTCCamera extends HTMLElement {
                     // [DIAGNOSTICS] Update UI to show successful handover
                     this.setStatus('RTC', this.config.title || '', 'Seamless connection active via WebRTC (Handover Success)');
                     this._streamHealthy = true;
+                    // [RTC RE-PROBE] We are on WebRTC now — the loop has done its job.
+                    this._activeMode = 'rtc';
+                    this._stopReprobe();
                     this._applyPoster();
 
                     // [SEAMLESS HANDOVER] Rebind tools/PTZ to the promoted video.
@@ -708,6 +807,9 @@ class WebRTCCamera extends HTMLElement {
                 this._retryCount = 0;
                 this._streamHealthy = true;
                 this._shadowAttempts = 0;
+                // [RTC RE-PROBE] Already on WebRTC — no periodic upgrade needed.
+                this._activeMode = 'rtc';
+                this._stopReprobe();
                 this._applyPoster();
             }
         };
@@ -755,6 +857,9 @@ class WebRTCCamera extends HTMLElement {
                     this.dispatchEvent(new CustomEvent('shadow-failed', {
                         detail: { error: 'timeout' }
                     }));
+
+                    // [RTC RE-PROBE] Probe timed out; schedule the next attempt on backoff.
+                    this._scheduleReprobe();
                 }
             }, 15000);
         }
@@ -821,10 +926,13 @@ class WebRTCCamera extends HTMLElement {
                 console.warn('[WebRTC Camera] Shadow Auth Failed');
                 this._nukeDriver(this.shadowDriver, 'Auth Failed Shadow');
                 this.shadowDriver = null;
-                
+
                 this.dispatchEvent(new CustomEvent('shadow-failed', {
                     detail: { error: 'auth_failed' }
                 }));
+
+                // [RTC RE-PROBE] Auth hiccup on the probe; retry later on backoff.
+                this._scheduleReprobe();
             }
         }
     }
