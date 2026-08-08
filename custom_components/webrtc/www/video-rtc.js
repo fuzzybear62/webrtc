@@ -1,5 +1,9 @@
 /**
- * VideoRTC v2.2.12 - Resilience & cleanup
+ * VideoRTC v2.2.13 - Resilience & cleanup
+ * * Changelog v2.2.13:
+ * - FIX: a PeerConnection failure AFTER a successful MSE->RTC handover now
+ * notifies the card (retry) instead of silently freezing. onclose() is called
+ * before this.pc is nulled so its (!ws && !pc) guard no longer short-circuits.
  * * Changelog v2.2.12:
  * - FIX: onclose() now actually closes the WebSocket on proactive-close paths
  * (no-data watchdog, strict-mode WS error, PC failure) instead of only nulling
@@ -509,11 +513,17 @@ export class VideoRTC extends HTMLElement {
                 video2.addEventListener('loadeddata', () => this.onpcvideo(video2), {once: true});
                 video2.srcObject = new MediaStream(tracks);
             } else if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
-                // Real failure (not a handoff)
+                // Real failure (not a handoff).
+                // Notify BEFORE nulling this.pc. After a successful MSE->RTC handover
+                // the socket is already closed, so if we nulled pc first onclose()'s
+                // (!this.ws && !this.pc) guard would short-circuit and never fire
+                // 'connection-closed' -> a dead RTC stream would freeze with no retry.
+                // Calling onclose() while pc is still set lets the guard pass; onclose()
+                // never touches pc, so closing it right after is safe.
+                this.handoff = false;
+                this.onclose();
                 pc.close();
                 this.pc = null;
-                this.handoff = false; 
-                this.onclose();
             }
         });
 

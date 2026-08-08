@@ -19,7 +19,7 @@
  * Any attempt to "optimize" by reusing the driver will almost certainly reintroduce leaks.
  */
 
-import {VideoRTC} from './video-rtc.js?v=2.2.12';
+import {VideoRTC} from './video-rtc.js?v=2.2.13';
 import {DigitalPTZ} from './digital-ptz.js?v=3.3.0';
 // [SIDECAR INTEGRATION] Import the Interaction module.
 // This module handles legacy features (Shortcuts, PTZ, Styles) to keep the core driver clean.
@@ -96,7 +96,7 @@ class WebRTCCamera extends HTMLElement {
         this._io = null;           // IntersectionObserver instance
         this._visAbort = null;     // AbortController for the document visibilitychange listener
 
-        console.info('[WebRTC Camera] v14.1.5');
+        console.info('[WebRTC Camera] v14.1.6');
     }
 
     setConfig(config) {
