@@ -19,7 +19,7 @@
  * Any attempt to "optimize" by reusing the driver will almost certainly reintroduce leaks.
  */
 
-import {VideoRTC} from './video-rtc.js?v=2.2.13';
+import {VideoRTC} from './video-rtc.js?v=2.2.14';
 import {DigitalPTZ} from './digital-ptz.js?v=3.3.0';
 // [SIDECAR INTEGRATION] Import the Interaction module.
 // This module handles legacy features (Shortcuts, PTZ, Styles) to keep the core driver clean.
@@ -96,7 +96,7 @@ class WebRTCCamera extends HTMLElement {
         this._io = null;           // IntersectionObserver instance
         this._visAbort = null;     // AbortController for the document visibilitychange listener
 
-        console.info('[WebRTC Camera] v14.1.6');
+        console.info('[WebRTC Camera] v14.1.7');
     }
 
     setConfig(config) {
@@ -524,20 +524,25 @@ class WebRTCCamera extends HTMLElement {
             ui_sync: (msg) => {
                 
                 // [OBSERVABILITY] Handle explicit driver signals (v2.2.11+)
-                // This block handles the "RTC Rejected" scenario preventing upgrade loops.
+                // Prevents the card from chasing a WebRTC upgrade that the driver has
+                // already ruled out on this connection.
                 if (msg.type === 'signal') {
-                    if (msg.value === 'rtc_rejected') {
-                        console.info('[WebRTC Camera] Driver Explicitly Rejected WebRTC (Quality Priority). Cancelling upgrade.');
-
-                        // [PHANTOM FIX] Critical: Stop the auto-upgrade timer immediately.
-                        // This prevents the card from spawning a useless Shadow Driver.
+                    if (msg.value === 'rtc_rejected' || msg.value === 'rtc_failed') {
+                        // rtc_rejected: WebRTC negotiated but discarded (quality < MSE).
+                        // rtc_failed:   WebRTC could not connect (e.g. ICE failed); the
+                        //               driver kept the MSE stream alive (v2.2.14+).
+                        // Either way, cancel the pending shadow-upgrade probe: retrying
+                        // WebRTC on this same connection would only fail/reject again.
                         if (this._upgradeTimer) {
                             clearTimeout(this._upgradeTimer);
                             this._upgradeTimer = null;
                         }
 
-                        // Update diagnostic tooltip
-                        this.setStatus(null, null, 'WebRTC upgrade discarded by driver (Quality < MSE)');
+                        const reason = msg.value === 'rtc_failed'
+                            ? 'WebRTC unavailable on this network — staying on MSE'
+                            : 'WebRTC upgrade discarded by driver (Quality < MSE)';
+                        console.info(`[WebRTC Camera] ${reason}. Cancelling upgrade.`);
+                        this.setStatus(null, null, reason);
                     }
                     return;
                 }

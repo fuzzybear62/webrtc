@@ -1,5 +1,10 @@
 /**
- * VideoRTC v2.2.13 - Resilience & cleanup
+ * VideoRTC v2.2.14 - Resilience & cleanup
+ * * Changelog v2.2.14:
+ * - FIX: in parallel webrtc+mse mode a WebRTC ICE failure no longer tears down a
+ * working MSE stream. When MSE is a live fallback (socket open + codecs
+ * negotiated) only WebRTC is dropped and an 'rtc_failed' signal is emitted; the
+ * full-teardown/retry path is reserved for when no fallback remains.
  * * Changelog v2.2.13:
  * - FIX: a PeerConnection failure AFTER a successful MSE->RTC handover now
  * notifies the card (retry) instead of silently freezing. onclose() is called
@@ -513,17 +518,31 @@ export class VideoRTC extends HTMLElement {
                 video2.addEventListener('loadeddata', () => this.onpcvideo(video2), {once: true});
                 video2.srcObject = new MediaStream(tracks);
             } else if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
-                // Real failure (not a handoff).
-                // Notify BEFORE nulling this.pc. After a successful MSE->RTC handover
-                // the socket is already closed, so if we nulled pc first onclose()'s
-                // (!this.ws && !this.pc) guard would short-circuit and never fire
-                // 'connection-closed' -> a dead RTC stream would freeze with no retry.
-                // Calling onclose() while pc is still set lets the guard pass; onclose()
-                // never touches pc, so closing it right after is safe.
-                this.handoff = false;
-                this.onclose();
-                pc.close();
-                this.pc = null;
+                // WebRTC died. Two very different situations:
+                if (this.ws && this.mseCodecs !== '') {
+                    // (a) MSE is still a live fallback: the signaling socket is open and
+                    // MSE has negotiated. In parallel webrtc+mse mode a WebRTC ICE failure
+                    // must NOT tear the whole thing down - that would kill a working MSE
+                    // stream and, on networks where WebRTC can never establish (UDP
+                    // blocked, no TURN), reconnect-loop on every ICE timeout. Drop ONLY
+                    // WebRTC and let MSE keep playing; a real MSE stall is caught by the
+                    // no-data watchdog. Signal the card so it stops chasing the upgrade.
+                    console.warn(`[VideoRTC:${this.clientId}] WebRTC failed; keeping active MSE stream.`);
+                    pc.close();
+                    this.pc = null;
+                    if (this.onmessage && typeof this.onmessage['ui_sync'] === 'function') {
+                        this.onmessage['ui_sync']({ type: 'signal', value: 'rtc_failed' });
+                    }
+                } else {
+                    // (b) No MSE fallback (e.g. pure RTC after a successful handover).
+                    // Notify the card to retry. onclose() is called BEFORE nulling pc so
+                    // its (!this.ws && !this.pc) guard does not short-circuit; onclose()
+                    // never touches pc, so closing it right after is safe.
+                    this.handoff = false;
+                    this.onclose();
+                    pc.close();
+                    this.pc = null;
+                }
             }
         });
 
