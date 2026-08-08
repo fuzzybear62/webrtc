@@ -1,5 +1,16 @@
 /**
- * VideoRTC v2.2.11 - Observability Signals
+ * VideoRTC v2.2.12 - Resilience & cleanup
+ * * Changelog v2.2.12:
+ * - FIX: onclose() now actually closes the WebSocket on proactive-close paths
+ * (no-data watchdog, strict-mode WS error, PC failure) instead of only nulling
+ * the reference, which left an orphaned open socket streaming into a discarded
+ * driver. Added a re-entrancy guard so the self-triggered close event can't
+ * double-fire 'connection-closed'.
+ * - FIX: MSE staging buffer now bounds-checks before buf.set(), preventing an
+ * uncaught RangeError when the SourceBuffer stalls while media keeps arriving.
+ * - CLEANUP: removed dead fields (disconnectTID, background, visibilityThreshold,
+ * visibilityCheck) left over from the driver-internal auto-pause that now lives
+ * in the card.
  * * Changelog v2.2.11:
  * - ADDED: Emits 'signal' event with value 'rtc_rejected' when WebRTC is discarded due to lower priority.
  * This allows the parent controller to stop upgrade timers immediately.
@@ -32,9 +43,6 @@ export class VideoRTC extends HTMLElement {
 
         this.mode = 'webrtc,mse,hls,mjpeg';
         this.media = 'video,audio';
-        this.background = true; 
-        this.visibilityThreshold = 0;
-        this.visibilityCheck = false; 
 
         // Standard WebRTC Configuration (Google STUN)
         this.pcConfig = {
@@ -50,10 +58,14 @@ export class VideoRTC extends HTMLElement {
         this.pc = null;    // The WebRTC PeerConnection
         this.connectTS = 0;
         this.mseCodecs = '';
-        this.disconnectTID = 0;
-        this.reconnectTID = 0;
+        this.reconnectTID = 0; // no-data watchdog timer handle
         this.ondata = null;
         this.onmessage = {};
+
+        // Re-entrancy guard for onclose(): once we've dispatched 'connection-closed'
+        // for this connection we must not dispatch it again when the socket we
+        // proactively closed fires its own (async) close event.
+        this._notifiedClosed = false;
         
         // CRITICAL: "Handoff" state.
         // If true, it means we are closing the WebSocket on purpose because
@@ -125,10 +137,6 @@ export class VideoRTC extends HTMLElement {
      * Starts the initialization loop.
      */
     connectedCallback() {
-        if (this.disconnectTID) {
-            clearTimeout(this.disconnectTID);
-            this.disconnectTID = 0;
-        }
         if (this.video) {
             // Restore playback position if re-attaching
             const seek = this.video.seekable;
@@ -183,6 +191,7 @@ export class VideoRTC extends HTMLElement {
 
         this.connectTS = Date.now();
         this.handoff = false; // Reset handoff state
+        this._notifiedClosed = false; // Fresh connection: allow one close notification
 
         this.ws = new WebSocket(this.wsURL);
         this.ws.binaryType = 'arraybuffer';
@@ -344,16 +353,31 @@ export class VideoRTC extends HTMLElement {
         this._clearWatchdog();
 
         // HANDOFF CHECK: The "Loop Fix".
-        // If we closed the socket intentionally to switch to WebRTC, 
+        // If we closed the socket intentionally to switch to WebRTC,
         // do NOT emit the closed event.
         if (this.handoff) {
-            this.ws = null;
-            return false; 
+            // onpcvideo already closed the socket, but close defensively.
+            if (this.ws) { this.ws.close(); this.ws = null; }
+            return false;
         }
 
+        // Re-entrancy guard: closing the socket ourselves (below) makes the
+        // browser fire another 'close' event asynchronously. If the PeerConnection
+        // is still alive at that point the (!this.ws && !this.pc) test would not
+        // short-circuit, and we'd dispatch 'connection-closed' twice -> double retry.
+        if (this._notifiedClosed) return false;
+
         if (!this.ws && !this.pc) return false;
-        
-        this.ws = null;
+
+        // Proactive closes (no-data watchdog, strict-mode WS error, PC failure)
+        // reach here with the socket still OPEN. Only nulling the reference would
+        // leave an orphaned WebSocket: go2rtc keeps pushing media and the message
+        // listener keeps feeding a driver the card is tearing down, wasting
+        // bandwidth - the very thing the watchdog exists to prevent. close() is a
+        // harmless no-op when the server already closed the socket.
+        if (this.ws) { this.ws.close(); this.ws = null; }
+
+        this._notifiedClosed = true;
         // Notify parent that connection died (triggers restart)
         this.dispatchEvent(new CustomEvent('connection-closed', {
             detail: { url: this.wsURL }
@@ -436,6 +460,17 @@ export class VideoRTC extends HTMLElement {
                 if (sb.updating || bufLen > 0) {
                     // If busy, store in temp buffer
                     const b = new Uint8Array(data);
+                    // Bounds guard: if the SourceBuffer stays busy while media keeps
+                    // arriving, bufLen can exceed the fixed 2MB staging buffer and
+                    // buf.set() would throw an uncaught RangeError inside the socket
+                    // message handler. The no-data watchdog can't catch this (bytes ARE
+                    // arriving). Drop the backlog and this chunk: a brief glitch is
+                    // recoverable, an exception kills the whole pipeline.
+                    if (bufLen + b.byteLength > buf.length) {
+                        console.warn(`[VideoRTC:${this.clientId}] MSE staging buffer overflow (${bufLen}+${b.byteLength} > ${buf.length}). Dropping backlog.`);
+                        bufLen = 0;
+                        return;
+                    }
                     buf.set(b, bufLen);
                     bufLen += b.byteLength;
                 } else {
