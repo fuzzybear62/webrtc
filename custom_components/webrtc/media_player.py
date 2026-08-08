@@ -90,7 +90,7 @@ class WebRTCPlayer(MediaPlayerEntity):
             resp = await r.json(content_type=None)
             playing = any("type" in p for p in resp["producers"])
             self._attr_state = STATE_PLAYING if playing else STATE_IDLE
-        except:
+        except Exception:
             pass
 
     async def async_browse_media(

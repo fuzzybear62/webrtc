@@ -8,13 +8,11 @@ import subprocess
 import zipfile
 import asyncio
 import time
-from threading import Thread
 from typing import Optional
 from urllib.parse import urljoin
 
 import aiohttp
 import jwt
-import requests
 from aiohttp import web
 from homeassistant.components.frontend import add_extra_js_url
 from homeassistant.components.http.auth import DATA_SIGN_SECRET, SIGN_QUERY_PARAM
@@ -80,7 +78,7 @@ async def validate_binary(hass: HomeAssistant) -> Optional[str]:
             )
             if version_check.startswith(b"go2rtc"):
                 return filename
-    except:
+    except Exception:
         pass
 
     for file in await hass.async_add_executor_job(os.listdir, hass.config.config_dir):
@@ -195,15 +193,6 @@ def validate_signed_request(request: web.Request) -> bool:
         return claims["path"] == request.path
     except Exception:
         return False
-
-
-def get_token_expiration(token: str) -> int:
-    """Extract expiration from JWT token without verification."""
-    try:
-        payload = jwt.decode(token, options={"verify_signature": False})
-        return payload.get("exp", 0)
-    except Exception:
-        return 0
 
 
 async def check_go2rtc(hass: HomeAssistant, url: str = DEFAULT_URL) -> Optional[str]:

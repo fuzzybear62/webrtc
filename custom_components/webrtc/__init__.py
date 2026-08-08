@@ -9,12 +9,11 @@ import jwt
 import voluptuous as vol
 from aiohttp import web
 from aiohttp.web_exceptions import HTTPUnauthorized, HTTPGone, HTTPNotFound
-from homeassistant.components.binary_sensor import HomeAssistant
 from homeassistant.components.camera import async_get_stream_source, async_get_image
 from homeassistant.components.http import HomeAssistantView
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import ATTR_ENTITY_ID, CONF_URL, EVENT_HOMEASSISTANT_STOP, Platform
-from homeassistant.core import ServiceCall
+from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.dispatcher import async_dispatcher_send
@@ -50,7 +49,7 @@ DASH_CAST_SCHEMA = vol.Schema(
 )
 
 LINKS = {}
-# SESSIONS replaces ACTIVE_STREAMS to track details of every connection
+# Tracks details of every active connection (exposed via the sensor platform)
 SESSIONS = {}
 
 HLS_COOKIE = "webrtc-hls-session"
@@ -210,7 +209,6 @@ class WebSocketView(HomeAssistantView):
     requires_auth = False
 
     async def get(self, request: web.Request):
-        # global ACTIVE_STREAMS
         t_start = time.perf_counter()
 
         params = request.query
@@ -267,7 +265,6 @@ class WebSocketView(HomeAssistantView):
         tasks = []
 
         try:
-            # ACTIVE_STREAMS += 1
             url = await ws_connect(hass, params)
 
             handshake_ms = (time.perf_counter() - t_start) * 1000
@@ -275,7 +272,7 @@ class WebSocketView(HomeAssistantView):
             # Register Session
             SESSIONS[session_id] = {
                 "client_id": client_id, # Store for sensor inspection
-                "entity_id": params.get("entity", "url"),
+                "entity_id": params.get("entity") or params.get("url"),
                 "client_ip": remote_ip,
                 "user_agent": request.headers.get("User-Agent"),
                 "connected_at": time.time(),
@@ -327,7 +324,6 @@ class WebSocketView(HomeAssistantView):
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
 
-            # ACTIVE_STREAMS -= 1
             if session_id in SESSIONS:
                 SESSIONS.pop(session_id)
                 # Notify sensor to update
