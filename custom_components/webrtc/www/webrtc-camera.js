@@ -77,6 +77,10 @@ class WebRTCCamera extends HTMLElement {
         // Must be cancelable if WebRTC connects spontaneously.
         this._upgradeTimer = null;
 
+        // Groups the .ui overlay's video/click listeners so they can be dropped
+        // in one shot on every rebuild (idempotent renderCustomUI).
+        this._uiAbort = null;
+
         console.info('[WebRTC Camera] v14.1.0');
     }
 
@@ -126,6 +130,10 @@ class WebRTCCamera extends HTMLElement {
         // HA reuses the element and calls setConfig again when the card is edited,
         // so this must run every time to reflect live shortcuts/ptz/style changes.
         this._initSidecar();
+
+        // Reflect live `ui` / stream-count changes on the built-in overlay too.
+        // Safe no-op until a driver is connected (guarded inside renderCustomUI).
+        this.renderCustomUI();
     }
 
     // [SIDECAR INTEGRATION] (Re)create the UI sidecar overlays (shortcuts, PTZ, style).
@@ -173,7 +181,10 @@ class WebRTCCamera extends HTMLElement {
         if (this._retryTimer) clearTimeout(this._retryTimer);
         // [PHANTOM FIX] Ensure upgrade timer is killed on unmount
         if (this._upgradeTimer) clearTimeout(this._upgradeTimer);
-        
+
+        // Drop the .ui overlay listeners bound to the (soon-to-be-gone) video.
+        if (this._uiAbort) this._uiAbort.abort();
+
         this._cleanupDriver();
         
         // [MEMORY FIX] Ensure DigitalPTZ listeners are removed.
@@ -516,7 +527,12 @@ class WebRTCCamera extends HTMLElement {
                     // [DIAGNOSTICS] Update UI to show successful handover
                     this.setStatus('RTC', this.config.title || '', 'Seamless connection active via WebRTC (Handover Success)');
                     this._applyPoster();
-                    
+
+                    // [SEAMLESS HANDOVER] Rebind tools/PTZ to the promoted video.
+                    // Without this the .ui controls and digital PTZ would stay attached
+                    // to the old (nuked) MSE video element after the upgrade.
+                    this.setupTools();
+
                     this.dispatchEvent(new CustomEvent('handover-complete', {
                         detail: { mode: 'webrtc', from: 'mse' }
                     }));
@@ -846,22 +862,45 @@ class WebRTCCamera extends HTMLElement {
     // UI state is always rebuilt when the driver changes.
 
     renderCustomUI() {
+        // Detach listeners bound by a previous invocation. After a driver swap
+        // these may live on an old (already nuked) video element, so aborting is
+        // the only reliable way to drop them and avoid duplicate handlers.
+        if (this._uiAbort) {
+            this._uiAbort.abort();
+            this._uiAbort = null;
+        }
+
+        const root = this.shadowRoot;
+
+        // Remove any existing overlay so a rebuild — or a runtime `ui: false` —
+        // always starts from a clean slate.
+        const existingUI = root.querySelector('.ui');
+        if (existingUI) existingUI.remove();
+
         if (!this.config.ui) return;
 
-        // Clean up previous UI overlays.
-        const existingUI = this.shadowRoot.querySelector('.ui');
-        if (existingUI) existingUI.remove();
-        
-        const card = this.shadowRoot.querySelector('.card');
-        
-        // Insert new UI overlay.
-        card.insertAdjacentHTML('beforeend', `
-            <style>
+        // Needs a live video to bind to. If the driver isn't ready yet the overlay
+        // will be (re)built by setupTools() once it connects.
+        if (!this.driver || !this.driver.video) return;
+
+        const card = root.querySelector('.card');
+
+        // Inject the static overlay stylesheet once. `.card` is persistent across
+        // reconnects, so a per-call <style> would otherwise accumulate on it.
+        if (!root.querySelector('#ui-style')) {
+            const style = document.createElement('style');
+            style.id = 'ui-style';
+            style.textContent = `
                 .controls { position: absolute; left: 5px; right: 5px; bottom: 5px; display: flex; align-items: center; z-index: 21; }
                 .space { width: 100%; }
                 .stream { padding-top: 2px; margin-left: 2px; font-weight: 400; font-size: 20px; color: white; display: none; cursor: pointer; text-shadow: 0 0 2px black;}
                 .volume { display: none; }
-            </style>
+            `;
+            card.appendChild(style);
+        }
+
+        // Insert the overlay markup.
+        card.insertAdjacentHTML('beforeend', `
             <div class="ui">
                 <div class="controls">
                     <ha-icon class="fullscreen" icon="mdi:fullscreen"></ha-icon>
@@ -875,33 +914,38 @@ class WebRTCCamera extends HTMLElement {
             </div>
         `);
 
+        // Every listener below is tied to this AbortController so the next
+        // renderCustomUI() call removes them all in one shot.
+        this._uiAbort = new AbortController();
+        const {signal} = this._uiAbort;
+
         // Bind tools to the current driver video
         const video = this.driver.video;
-        const ui = this.shadowRoot.querySelector('.ui');
-        
+        const ui = root.querySelector('.ui');
+
         // Select the persistent spinner created in renderStructure
-        const spinner = this.shadowRoot.querySelector('.spinner');
-        
-        const playBtn = this.shadowRoot.querySelector('.play');
-        const volBtn = this.shadowRoot.querySelector('.volume');
-        const pipIcon = this.shadowRoot.querySelector('.pictureinpicture');
+        const spinner = root.querySelector('.spinner');
+
+        const playBtn = root.querySelector('.play');
+        const volBtn = root.querySelector('.volume');
+        const pipIcon = root.querySelector('.pictureinpicture');
 
         // Apply initial icon state
         volBtn.icon = video.muted ? 'mdi:volume-mute' : 'mdi:volume-high';
 
         // [FIX 1/2] Bind video events to the persistent spinner
-        video.addEventListener('waiting', () => { if(spinner) spinner.style.display = 'block'; });
-        video.addEventListener('playing', () => { if(spinner) spinner.style.display = 'none'; });
-        
-        video.addEventListener('play', () => playBtn.style.display = 'none');
-        video.addEventListener('pause', () => playBtn.style.display = 'block');
-        video.addEventListener('loadeddata', () => volBtn.style.display = this.hasAudio ? 'block' : 'none');
+        video.addEventListener('waiting', () => { if(spinner) spinner.style.display = 'block'; }, {signal});
+        video.addEventListener('playing', () => { if(spinner) spinner.style.display = 'none'; }, {signal});
+
+        video.addEventListener('play', () => playBtn.style.display = 'none', {signal});
+        video.addEventListener('pause', () => playBtn.style.display = 'block', {signal});
+        video.addEventListener('loadeddata', () => volBtn.style.display = this.hasAudio ? 'block' : 'none', {signal});
         video.addEventListener('volumechange', () => {
              volBtn.icon = video.muted ? 'mdi:volume-mute' : 'mdi:volume-high';
-        });
-        
-        video.addEventListener('enterpictureinpicture', () => pipIcon.icon = 'mdi:rectangle');
-        video.addEventListener('leavepictureinpicture', () => pipIcon.icon = 'mdi:picture-in-picture-bottom-right');
+        }, {signal});
+
+        video.addEventListener('enterpictureinpicture', () => pipIcon.icon = 'mdi:rectangle', {signal});
+        video.addEventListener('leavepictureinpicture', () => pipIcon.icon = 'mdi:picture-in-picture-bottom-right', {signal});
 
         ui.addEventListener('click', ev => {
             const {icon} = ev.target;
@@ -909,19 +953,19 @@ class WebRTCCamera extends HTMLElement {
             else if (icon === 'mdi:volume-mute') video.muted = false;
             else if (icon === 'mdi:volume-high') video.muted = true;
             else if (icon === 'mdi:floppy') this.saveScreenshot();
-            
+
             else if (icon === 'mdi:fullscreen') this.requestFullscreen(video);
-            
+
             else if (icon === 'mdi:picture-in-picture-bottom-right') video.requestPictureInPicture().catch(console.warn);
             else if (icon === 'mdi:rectangle') document.exitPictureInPicture().catch(console.warn);
-            
+
             else if (ev.target.className === 'stream') {
                 this.nextStream();
                 ev.target.innerText = this.streamName;
             }
-        });
+        }, {signal});
 
-        const streamLabel = this.shadowRoot.querySelector('.stream');
+        const streamLabel = root.querySelector('.stream');
         if (streamLabel) {
             streamLabel.style.display = this.config.streams.length > 1 ? 'block' : 'none';
         }
