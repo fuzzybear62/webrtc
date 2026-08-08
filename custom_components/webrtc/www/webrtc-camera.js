@@ -1,5 +1,5 @@
 /**
- * WebRTC Camera Card v13.10.32
+ * WebRTC Camera Card v14.0.0
  *
  * DESIGN PHILOSOPHY
  * -----------------
@@ -77,7 +77,7 @@ class WebRTCCamera extends HTMLElement {
         // Must be cancelable if WebRTC connects spontaneously.
         this._upgradeTimer = null;
 
-        console.info('[WebRTC Camera] v13.10.32');
+        console.info('[WebRTC Camera] v14.0.0');
     }
 
     setConfig(config) {
@@ -321,7 +321,11 @@ class WebRTCCamera extends HTMLElement {
         // Create a fresh driver instance.
         // The driver owns all media/network state.
         const newDriver = document.createElement('video-rtc');
-        newDriver.mode = effectiveConfig.mode;
+        // [SEAMLESS HANDOVER] The shadow probe negotiates WebRTC only: it must stay a
+        // lightweight upgrade probe, not a second full stream. Running the full mode set
+        // would open a redundant parallel MSE stream (doubling bandwidth) and would make
+        // the shadow re-arm the MSE auto-upgrade scheduler, killing its own in-flight probe.
+        newDriver.mode = isShadowMode ? 'webrtc' : effectiveConfig.mode;
         newDriver.media = effectiveConfig.media;
         newDriver.background = effectiveConfig.background;
         newDriver.visibilityThreshold = effectiveConfig.intersection || 0;
@@ -410,6 +414,9 @@ class WebRTCCamera extends HTMLElement {
                                 this.startStream();
                             }, 2000); // 2s delay to let MSE settle
                         }
+                    // falls through: MSE shares the tail below (reset _retryCount).
+                    // The shared block is guarded by `msg.type !== 'mse'` so the "negotiated"
+                    // log is skipped for MSE. Do NOT add a `break` here.
                     case 'hls':
                     case 'mp4':
                     case 'mjpeg':
@@ -467,6 +474,13 @@ class WebRTCCamera extends HTMLElement {
                     this.driver = newDriver;
                     this.shadowDriver = null;
                     this._shadowAttempts = 0; // Reset counter on success
+
+                    // [AUDIO] The shadow was force-muted for background negotiation.
+                    // Restore the user's configured audio state now that it is the main driver,
+                    // otherwise streams with sound would stay silent after every handover.
+                    if (newDriver.video && !this.config.muted) {
+                        newDriver.video.muted = false;
+                    }
                     
                     // 3. Inject into DOM
                     const container = this.shadowRoot.querySelector('.ptz-transform');
