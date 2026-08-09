@@ -1,5 +1,18 @@
 /**
- * VideoRTC v2.3.0 - Resilience & cleanup
+ * VideoRTC v2.3.1 - Resilience & cleanup
+ * * Changelog v2.3.1:
+ * - FIX: reversible handoff still crash-looped on the COMMIT step. v2.3.0 committed
+ * (released MSE + closed ws) after a fixed 30s from promote; a bursty repeater camera
+ * held RTC for 30s, got committed, then the next inevitable stall had no MSE to fall
+ * back on -> failWebRTC -> connection-closed -> nuke -> cold start -> loop (log 4IRQL:
+ * promoted @14s, committed @44s, Connection Closed). Commit is the ONLY irreversible
+ * step, so it is now reserved for genuinely rock-solid paths: it requires CONTINUOUS
+ * gapless decode for RTC_COMMIT_MS (raised 30s -> 180s), and ANY decode gap
+ * > RTC_STALL_RESET restarts that clock. Bursty cameras therefore never commit — they
+ * stay in warm-MSE mode and revert harmlessly on each stall (one frame, no reconnect).
+ * Also restored RTC_LIVENESS_TIMEOUT 8s -> 15s (the value the historically-working
+ * handoff used; 8s reverted on ordinary congestion bursts). Dual bandwidth while warm
+ * is LAN-side (go2rtc->viewer), not on the constrained camera->go2rtc repeater path.
  * * Changelog v2.3.0:
  * - FIX (major): the MSE->WebRTC handoff is now REVERSIBLE on the main parallel driver,
  * so reaching WebRTC can no longer crash the working MSE stream. Root problem across
@@ -121,9 +134,11 @@ export class VideoRTC extends HTMLElement {
         // handoff self-heals in seconds instead of staying black forever. Tunable.
         // Post-promotion stall deadline (framesDecoded stops advancing this long).
         // In the reversible flow (see onwebrtc) a stall BEFORE commit reverts to the
-        // still-warm MSE instantly; AFTER commit it reconnects. Short enough to self-heal
-        // fast, long enough to ride a brief congestion pause. Tunable.
-        this.RTC_LIVENESS_TIMEOUT = 8000;
+        // still-warm MSE instantly (one frame, no reconnect); AFTER commit it reconnects.
+        // 15s matches the value the historically-working handoff used: short enough to
+        // self-heal fast, long enough to ride the brief congestion pauses that are normal
+        // on repeater paths (8s was too twitchy and reverted on ordinary bursts). Tunable.
+        this.RTC_LIVENESS_TIMEOUT = 15000;
         // [LEGACY / SHADOW ONLY] How much ACTUALLY-flowing decode WebRTC must show before
         // the one-shot irreversible handoff (switch visible element + close MSE). Used by
         // the non-reversible branch (shadow probes), where the card swaps whole drivers.
@@ -140,19 +155,29 @@ export class VideoRTC extends HTMLElement {
         this.reversible = false;   // set true by the card for the main parallel driver
         this._rtcVideo = null;     // overlaid <video> carrying the RTC MediaStream
         this._committed = false;   // true once MSE was released (fully on RTC)
-        this._commitTID = 0;       // stability timer: promote -> commit
+        this._commitTID = 0;       // unused in the poll-driven commit model; kept for _clearRtcTimers
         this._mseWanted = false;   // desired mute state of the MSE element, restored on revert/commit
         // Flowing decode required before we REVEAL RTC (make it visible). Small because
         // the overlay is rendered (full-rate decode) and promotion is reversible, so we can
         // be aggressive and restore near-instant RTC on good paths. Tunable.
         this.RTC_PROMOTE_MS = 2000;
-        // Continued liveness required AFTER promotion before we commit (release MSE). Long
-        // enough to filter the burst-then-stall paths (measured to die within ~15s of a
-        // premature promote) while bounding the dual-bandwidth (MSE+RTC) window. Tunable.
-        this.RTC_COMMIT_MS = 30000;
+        // CONTINUOUS gapless liveness required AFTER promotion before we commit (release MSE).
+        // Committing is the ONLY irreversible step (MSE gone -> a later stall must reconnect),
+        // so it must be reserved for paths that are genuinely rock-solid. This is deliberately
+        // long: any decode gap > RTC_STALL_RESET restarts the clock (see the poll below), so a
+        // bursty repeater camera never reaches it — it just stays in warm-MSE mode and reverts
+        // harmlessly on each stall. Only a camera that decodes essentially gaplessly for this
+        // whole window releases MSE (freeing the 2nd decoder + the LAN-side dual bandwidth), and
+        // for such a camera a post-commit stall is rare. 30s was far too short: cameras that
+        // held RTC briefly got committed and then crash-looped on the next stall. Tunable.
+        this.RTC_COMMIT_MS = 180000;
+        // A decode gap longer than this (but shorter than RTC_LIVENESS_TIMEOUT) counts as
+        // instability and restarts the commit stability clock without reverting. Tunable.
+        this.RTC_STALL_RESET = 2000;
 
         this._promoted = false;    // true once the RTC overlay is revealed (reversible flow)
         this._lastLiveness = 0;    // Date.now() of the last framesDecoded advance
+        this._stableSince = 0;     // start of the current gapless run (drives the commit clock)
 
         // List of supported codecs to announce to the server
         this.CODECS = [
@@ -891,6 +916,7 @@ export class VideoRTC extends HTMLElement {
             console.info(`[VideoRTC:${this.clientId}] RTC promoted (${flowingMs}ms flowing) @${Date.now() - pcStart}ms — MSE kept warm`);
             this._promoted = true;
             this._lastLiveness = Date.now();
+            this._stableSince = Date.now();   // commit only after RTC_COMMIT_MS of GAPLESS decode
             // The give-up watchdog is done; from here the liveness watchdog governs.
             if (this._firstFrameTID) { clearTimeout(this._firstFrameTID); this._firstFrameTID = 0; }
             // Reveal RTC; mute the (now hidden) MSE so its delayed audio can't echo.
@@ -901,8 +927,8 @@ export class VideoRTC extends HTMLElement {
             // Notify the card (status -> RTC, stop reprobe). Our onpcvideo is a no-op in
             // the reversible flow (it must NOT close the ws); the card's wrapper still runs.
             this.onpcvideo(rtcVideo);
-            // Arm the commit deadline.
-            this._commitTID = setTimeout(commit, this.RTC_COMMIT_MS);
+            // Commit is now driven by the liveness poll (continuous-stability gate), not a
+            // fixed timer: see the post-promote branch below.
         };
 
         // Release MSE: RTC has been stable long enough to trust.
@@ -944,13 +970,28 @@ export class VideoRTC extends HTMLElement {
                     }
                 } else if (advanced) {
                     this._lastLiveness = Date.now();
-                } else if (Date.now() - this._lastLiveness > this.RTC_LIVENESS_TIMEOUT) {
-                    if (!this._committed) {
-                        // Pre-commit: MSE is warm — snap back instantly, no reconnect.
-                        this._revertToWarmMSE(`RTC stalled ${this.RTC_LIVENESS_TIMEOUT}ms before commit`);
-                    } else {
-                        // Post-commit: MSE already released — the no-MSE branch reconnects.
-                        failWebRTC(`RTC media stalled ${this.RTC_LIVENESS_TIMEOUT}ms after commit`);
+                    // Commit (release MSE) only after a fully GAPLESS run of RTC_COMMIT_MS.
+                    // Any stall > RTC_STALL_RESET below pushes _stableSince forward, so a bursty
+                    // camera never gets here and just keeps MSE warm. Reserving commit for
+                    // rock-solid paths is what stops the post-commit stall -> reconnect crash loop.
+                    if (!this._committed && Date.now() - this._stableSince >= this.RTC_COMMIT_MS) {
+                        commit();
+                    }
+                } else {
+                    const gap = Date.now() - this._lastLiveness;
+                    if (gap > this.RTC_LIVENESS_TIMEOUT) {
+                        if (!this._committed) {
+                            // Pre-commit: MSE is warm — snap back instantly, no reconnect.
+                            this._revertToWarmMSE(`RTC stalled ${this.RTC_LIVENESS_TIMEOUT}ms before commit`);
+                        } else {
+                            // Post-commit: MSE already released — the no-MSE branch reconnects.
+                            // Rare: only genuinely gapless paths ever commit.
+                            failWebRTC(`RTC media stalled ${this.RTC_LIVENESS_TIMEOUT}ms after commit`);
+                        }
+                    } else if (gap > this.RTC_STALL_RESET) {
+                        // A real (but not yet fatal) stall: this path is not rock-solid, so
+                        // restart the commit stability clock. It keeps MSE warm and never commits.
+                        this._stableSince = Date.now();
                     }
                 }
             }).catch(() => {});
