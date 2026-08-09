@@ -19,7 +19,7 @@
  * Any attempt to "optimize" by reusing the driver will almost certainly reintroduce leaks.
  */
 
-import {VideoRTC} from './video-rtc.js?v=2.2.19';
+import {VideoRTC} from './video-rtc.js?v=2.3.0';
 import {DigitalPTZ} from './digital-ptz.js?v=3.3.0';
 // [SIDECAR INTEGRATION] Import the Interaction module.
 // This module handles legacy features (Shortcuts, PTZ, Styles) to keep the core driver clean.
@@ -109,7 +109,7 @@ class WebRTCCamera extends HTMLElement {
         this._io = null;           // IntersectionObserver instance
         this._visAbort = null;     // AbortController for the document visibilitychange listener
 
-        console.info('[WebRTC Camera] v14.1.17');
+        console.info('[WebRTC Camera] v14.2.0');
     }
 
     setConfig(config) {
@@ -573,6 +573,11 @@ class WebRTCCamera extends HTMLElement {
         // the shadow re-arm the MSE auto-upgrade scheduler, killing its own in-flight probe.
         newDriver.mode = isShadowMode ? 'webrtc' : effectiveConfig.mode;
         newDriver.media = effectiveConfig.media;
+
+        // [REVERSIBLE HANDOFF] Only the main parallel driver keeps MSE warm and promotes
+        // WebRTC reversibly. Shadow probes stay on the legacy prove-before-commit path: the
+        // card swaps whole drivers on shadow success, so warm-MSE-in-driver does not apply.
+        newDriver.reversible = !isShadowMode;
 
         // Network strict mode propagates directly to the driver.
         newDriver.strictMode =
