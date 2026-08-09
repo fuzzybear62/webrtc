@@ -1,10 +1,21 @@
 /**
- * VideoRTC v2.2.16 - Resilience & cleanup
+ * VideoRTC v2.2.17 - Resilience & cleanup
+ * * Changelog v2.2.17:
+ * - FIX: promote to WebRTC on the first actually-DECODED frame, not on 'loadeddata'.
+ * On a WebRTC MediaStream loadeddata fires the moment the track is attached, long
+ * before RTP video flows on slow repeater paths — promoting then swapped the visible
+ * element to a BLACK video AND tore down the working MSE stream (observed: black
+ * screen for minutes until RTP finally started). Gate the swap on
+ * inbound-rtp.framesDecoded > 0 (compositing-independent proof a real picture
+ * exists), polled from getStats(); loadeddata is no longer used as the success edge.
+ * - CHANGE: FIRSTFRAME_TIMEOUT 15000 -> 600000. With the swap gated on a real frame,
+ * MSE keeps serving the user while the pc waits, so a slow-but-real first frame (seen
+ * to take minutes) must not be reaped early; 15s was far below the observed latency.
  * * Changelog v2.2.16:
  * - ADDED: first-frame watchdog on the WebRTC pc. 'connectionState=connected' is
  * not proof of a working stream — on multi-hop paths ICE/DTLS checks pass while
  * RTP media never flows, leaving the pc "connected" but medialess forever. If no
- * first frame (loadeddata) lands within FIRSTFRAME_TIMEOUT of 'connected', the pc
+ * first frame lands within FIRSTFRAME_TIMEOUT of 'connected', the pc
  * is reaped and rtc_failed is signalled so the card retries with a fresh ICE
  * gather (was: main waited forever; shadow was killed blindly by the card's 15s).
  * - CHANGE: a rejected webrtc/offer now routes through the shared failWebRTC path
@@ -53,15 +64,17 @@ export class VideoRTC extends HTMLElement {
         // First-frame watchdog: 'connectionState=connected' is NOT proof of a working
         // WebRTC stream. On multi-hop paths ICE/DTLS connectivity checks (tiny packets)
         // can pass while the sustained RTP media never traverses, so the pc sits
-        // "connected" but no decodable frame ever arrives (loadeddata never fires).
-        // If the first frame doesn't land within this long after 'connected', treat it
-        // as a WebRTC failure so the connection can be dropped and retried with a
-        // freshly gathered ICE path instead of lingering as a media-less zombie.
-        // 15s matches the card's long-standing shadow cap: generous enough for a slow
-        // but real first frame, while media-less paths (observed: frame never arrives)
-        // are reaped regardless. Tunable if a camera legitimately needs longer.
-        this.FIRSTFRAME_TIMEOUT = 15000;
-        this._firstFrameTID = 0; // first-frame watchdog timer handle
+        // "connected" but no frame is ever decoded. If no frame decodes within this long
+        // after 'connected', treat it as a WebRTC failure so the connection can be
+        // dropped and retried with a freshly gathered ICE path instead of lingering as a
+        // media-less zombie.
+        // 600s: because the swap is gated on a real decoded frame (see onwebrtc), MSE
+        // keeps serving the user while the pc waits, so a slow-but-real first frame
+        // (observed to take minutes on repeater paths) must not be reaped early. Only
+        // genuinely media-less paths hit this deadline. Tunable.
+        this.FIRSTFRAME_TIMEOUT = 600000;
+        this._firstFrameTID = 0;   // first-frame watchdog timer handle
+        this._firstFramePoll = 0;  // getStats() poll interval handle (framesDecoded)
 
         // List of supported codecs to announce to the server
         this.CODECS = [
@@ -280,6 +293,10 @@ export class VideoRTC extends HTMLElement {
         if (this._firstFrameTID) {
             clearTimeout(this._firstFrameTID);
             this._firstFrameTID = 0;
+        }
+        if (this._firstFramePoll) {
+            clearInterval(this._firstFramePoll);
+            this._firstFramePoll = 0;
         }
         this.ondata = null;
         this.onmessage = {};
@@ -545,6 +562,10 @@ export class VideoRTC extends HTMLElement {
                 clearTimeout(this._firstFrameTID);
                 this._firstFrameTID = 0;
             }
+            if (this._firstFramePoll) {
+                clearInterval(this._firstFramePoll);
+                this._firstFramePoll = 0;
+            }
             if (this.ws && this.mseCodecs !== '') {
                 // (a) MSE is still a live fallback: the signaling socket is open and
                 // MSE has negotiated. In parallel webrtc+mse mode a WebRTC failure must
@@ -578,32 +599,52 @@ export class VideoRTC extends HTMLElement {
             console.info(`[VideoRTC:${this.clientId}] pc ${pc.connectionState} (ice=${pc.iceConnectionState}) @${Date.now() - pcStart}ms`);
 
             if (pc.connectionState === 'connected') {
-                // When connected, grab tracks and create a temp video to check stream validity
+                // Arm the first-frame detection + watchdog exactly once per pc. (In
+                // practice 'connected' fires once before any reap, but guard anyway so a
+                // transient connected->connecting->connected can't leak a 2nd poll/timer.)
+                if (this._firstFrameTID || this._firstFramePoll) return;
+
                 const tracks = pc.getTransceivers()
                     .filter(tr => tr.currentDirection === 'recvonly')
                     .map(tr => tr.receiver.track);
                 const video2 = document.createElement('video');
-                // Wait for data to arrive before deciding to switch. The first frame
-                // landing (loadeddata) is the ONLY real success signal — clear the
-                // watchdog here, not on 'connected'.
-                video2.addEventListener('loadeddata', () => {
-                    if (this._firstFrameTID) {
-                        clearTimeout(this._firstFrameTID);
-                        this._firstFrameTID = 0;
-                    }
-                    this.onpcvideo(video2);
-                }, {once: true});
+                video2.muted = true;        // allow the offscreen probe to decode/play
+                video2.playsInline = true;
                 video2.srcObject = new MediaStream(tracks);
+                video2.play().catch(() => {});
 
-                // [FIRST-FRAME WATCHDOG] Arm the media-arrival deadline. If loadeddata
-                // never fires (ICE connected but RTP media never flows), reap the pc
-                // and signal rtc_failed so the card retries with a fresh ICE gather.
-                if (!this._firstFrameTID) {
-                    this._firstFrameTID = setTimeout(() => {
-                        this._firstFrameTID = 0;
-                        failWebRTC(`connected but delivered no media within ${this.FIRSTFRAME_TIMEOUT}ms`);
-                    }, this.FIRSTFRAME_TIMEOUT);
-                }
+                // [FIRST REAL FRAME] Promote only when a frame has actually DECODED.
+                // 'loadeddata' on a WebRTC MediaStream fires the instant the track is
+                // attached, long before RTP video flows on slow repeater paths — promoting
+                // then swaps the visible element to a BLACK video and tears down the
+                // working MSE stream (observed: black for minutes until RTP starts).
+                // inbound-rtp.framesDecoded > 0 is the compositing-independent proof that a
+                // real picture exists (the first decoded frame is necessarily a keyframe).
+                const promoteOnRealFrame = () => {
+                    if (this._firstFrameTID) { clearTimeout(this._firstFrameTID); this._firstFrameTID = 0; }
+                    if (this._firstFramePoll) { clearInterval(this._firstFramePoll); this._firstFramePoll = 0; }
+                    console.info(`[VideoRTC:${this.clientId}] first frame decoded @${Date.now() - pcStart}ms`);
+                    this.onpcvideo(video2);
+                };
+                this._firstFramePoll = setInterval(() => {
+                    if (!this.pc) { clearInterval(this._firstFramePoll); this._firstFramePoll = 0; return; }
+                    this.pc.getStats().then(stats => {
+                        for (const r of stats.values()) {
+                            if (r.type === 'inbound-rtp' && r.kind === 'video' && r.framesDecoded > 0) {
+                                promoteOnRealFrame();
+                                break;
+                            }
+                        }
+                    }).catch(() => {});
+                }, 500);
+
+                // [FIRST-FRAME WATCHDOG] Arm the media-arrival deadline. If no frame ever
+                // decodes (ICE connected but RTP media never flows), reap the pc and
+                // signal rtc_failed so the card retries with a fresh ICE gather.
+                this._firstFrameTID = setTimeout(() => {
+                    this._firstFrameTID = 0;
+                    failWebRTC(`connected but decoded no video within ${this.FIRSTFRAME_TIMEOUT}ms`);
+                }, this.FIRSTFRAME_TIMEOUT);
             } else if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
                 failWebRTC('failed');
             }
