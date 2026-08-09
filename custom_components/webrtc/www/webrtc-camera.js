@@ -19,7 +19,7 @@
  * Any attempt to "optimize" by reusing the driver will almost certainly reintroduce leaks.
  */
 
-import {VideoRTC} from './video-rtc.js?v=2.2.15';
+import {VideoRTC} from './video-rtc.js?v=2.2.16';
 import {DigitalPTZ} from './digital-ptz.js?v=3.3.0';
 // [SIDECAR INTEGRATION] Import the Interaction module.
 // This module handles legacy features (Shortcuts, PTZ, Styles) to keep the core driver clean.
@@ -109,7 +109,7 @@ class WebRTCCamera extends HTMLElement {
         this._io = null;           // IntersectionObserver instance
         this._visAbort = null;     // AbortController for the document visibilitychange listener
 
-        console.info('[WebRTC Camera] v14.1.13');
+        console.info('[WebRTC Camera] v14.1.14');
     }
 
     setConfig(config) {
@@ -601,10 +601,12 @@ class WebRTCCamera extends HTMLElement {
                 if (msg.type === 'signal') {
                     if (msg.value === 'rtc_rejected' || msg.value === 'rtc_failed') {
                         // rtc_rejected: WebRTC negotiated but discarded (quality < MSE).
-                        // rtc_failed:   WebRTC could not connect (e.g. ICE failed); the
-                        //               driver kept the MSE stream alive (v2.2.14+).
-                        // Either way, cancel the pending shadow-upgrade probe: retrying
-                        // WebRTC on this same connection would only fail/reject again.
+                        // rtc_failed:   WebRTC could not deliver — ICE failed, the offer was
+                        //               rejected, or ICE "connected" but no first frame ever
+                        //               arrived (first-frame watchdog, v2.2.15+). The driver
+                        //               kept the MSE stream alive in all cases.
+                        // Defensively clear any pending shadow-upgrade timer (unused under
+                        // Option 3, kept for safety across config paths).
                         if (this._upgradeTimer) {
                             clearTimeout(this._upgradeTimer);
                             this._upgradeTimer = null;
@@ -616,12 +618,11 @@ class WebRTCCamera extends HTMLElement {
                         console.info(`[WebRTC Camera] ${reason}. Cancelling upgrade.`);
                         this.setStatus(null, null, reason);
 
-                        // [RTC RE-PROBE] rtc_failed is a *network* failure (ICE gave up):
-                        // exactly what the periodic loop exists to recover from, so arm it.
-                        // (It also covers the fast-fail case where WebRTC dies before the
-                        // initial 2s _upgradeTimer ever fired a shadow probe.) rtc_rejected
-                        // is a deliberate *quality* decision, stable for this connection —
-                        // re-probing would only be rejected again, so stop the loop instead.
+                        // [RTC RE-PROBE / OPTION 3] rtc_failed means the main's own WebRTC
+                        // attempt has actually given up: this is the ONLY point at which a
+                        // background retry is warranted, so arm the backed-off loop here.
+                        // rtc_rejected is a deliberate *quality* decision, stable for this
+                        // connection — re-probing would only be rejected again, so stop instead.
                         if (msg.value === 'rtc_failed') {
                             this._activeMode = 'mse';
                             this._scheduleReprobe();
@@ -672,29 +673,17 @@ class WebRTCCamera extends HTMLElement {
                         console.info('[WebRTC Camera] Main Driver negotiated: MSE');
                         this.setStatus(msg.type.toUpperCase(), this.config.title || '', 'Stream via MSE (TCP)');
 
-                        // [RTC RE-PROBE] Settled on MSE. Arm the periodic upgrade loop as a
-                        // long-term safety net (the fast _upgradeTimer below is the first,
-                        // immediate attempt; _scheduleReprobe is idempotent so the two never
-                        // stack). This also covers the case where the initial attempt is
-                        // skipped because _shadowAttempts is already exhausted.
+                        // [OPTION 3] Settle on MSE and do nothing else. The parallel WebRTC
+                        // attempt started at onopen is still running on this same connection —
+                        // uncapped, but now bounded by the driver's first-frame watchdog — and
+                        // will either promote itself (onpcvideo) or emit rtc_failed. Firing a
+                        // shadow now would only race a still-trying main and lose (proven: every
+                        // such shadow connected ICE in <500ms yet 0/12 ever got a frame before
+                        // being reaped). A WebRTC retry is meaningful ONLY once the main's attempt
+                        // has actually failed, so the re-probe loop is armed from the rtc_failed
+                        // signal (see the 'signal' handler above), never from a plain MSE landing.
                         this._activeMode = 'mse';
-                        this._scheduleReprobe();
-
-                        // [PHANTOM FIX] Clear any pending upgrade timer before setting a new one
-                        if (this._upgradeTimer) clearTimeout(this._upgradeTimer);
-
-                        // [SEAMLESS HANDOVER] Trigger Auto-Upgrade
-                        // If we land on MSE, and we haven't exhausted shadow attempts, try to upgrade to RTC in background.
-                        if (effectiveConfig.mode.indexOf('webrtc') >= 0 && this._shadowAttempts < 2) {
-                            console.info('[WebRTC Camera] MSE detected. Scheduling Shadow Upgrade...');
-                            this._shadowAttempts++;
-                            
-                            // [PHANTOM FIX] Save timer reference to allow cancellation
-                            this._upgradeTimer = setTimeout(() => {
-                                this._upgradeTimer = null;
-                                this.startStream();
-                            }, 2000); // 2s delay to let MSE settle
-                        }
+                        if (this._upgradeTimer) { clearTimeout(this._upgradeTimer); this._upgradeTimer = null; }
                     // falls through: MSE shares the tail below (reset _retryCount).
                     // The shared block is guarded by `msg.type !== 'mse'` so the "negotiated"
                     // log is skipped for MSE. Do NOT add a `break` here.
