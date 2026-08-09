@@ -1,5 +1,13 @@
 /**
- * VideoRTC v2.3.1 - Resilience & cleanup
+ * VideoRTC v2.3.2 - Resilience & cleanup
+ * * Changelog v2.3.2:
+ * - FIX: the shadow-swap upgrade path was still the legacy IRREVERSIBLE mechanism and the
+ * remaining crash vector. The card now makes EVERY driver reversible (webrtc+mse), so a
+ * shadow that swaps in as the new main carries its own warm MSE and reverts to it on a
+ * stall instead of freezing black. New applyAudio(muted) routes the configured mute state
+ * to the on-screen element (RTC overlay while promoted, else this.video), which the card
+ * calls after the swap to un-mute (the shadow negotiates force-muted); un-muting
+ * this.video directly would have played the hidden warm-MSE audio under the RTC video.
  * * Changelog v2.3.1:
  * - FIX: reversible handoff still crash-looped on the COMMIT step. v2.3.0 committed
  * (released MSE + closed ws) after a fixed 30s from promote; a bursty repeater camera
@@ -1038,6 +1046,23 @@ export class VideoRTC extends HTMLElement {
         this._committed = false;
         if (this.onmessage && typeof this.onmessage['ui_sync'] === 'function') {
             this.onmessage['ui_sync']({ type: 'signal', value: 'rtc_failed' });
+        }
+    }
+
+    /**
+     * Sets the desired mute state and routes it to whichever element is currently ON SCREEN.
+     * While RTC is promoted, sound must come from the overlay (this._rtcVideo) and the warm
+     * MSE element MUST stay muted, else its audio plays under the RTC video and desyncs. Once
+     * committed (or never promoted) the single visible element is this.video. Called by the
+     * card after a shadow→main swap to restore the configured audio (the shadow ran muted).
+     */
+    applyAudio(muted) {
+        this._mseWanted = muted;
+        if (this._rtcVideo && this._promoted) {
+            this._rtcVideo.muted = muted;
+            this.video.muted = true;
+        } else {
+            this.video.muted = muted;
         }
     }
 
