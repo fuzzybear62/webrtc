@@ -1,5 +1,15 @@
 /**
- * VideoRTC v2.2.14 - Resilience & cleanup
+ * VideoRTC v2.2.16 - Resilience & cleanup
+ * * Changelog v2.2.16:
+ * - ADDED: first-frame watchdog on the WebRTC pc. 'connectionState=connected' is
+ * not proof of a working stream — on multi-hop paths ICE/DTLS checks pass while
+ * RTP media never flows, leaving the pc "connected" but medialess forever. If no
+ * first frame (loadeddata) lands within FIRSTFRAME_TIMEOUT of 'connected', the pc
+ * is reaped and rtc_failed is signalled so the card retries with a fresh ICE
+ * gather (was: main waited forever; shadow was killed blindly by the card's 15s).
+ * - CHANGE: a rejected webrtc/offer now routes through the shared failWebRTC path
+ * (emits rtc_failed) instead of a bare pc.close() that fired no signal.
+ * - ADDED: [DIAGNOSTIC] pc connectionstatechange logging with elapsed ICE time.
  * * Changelog v2.2.14:
  * - FIX: in parallel webrtc+mse mode a WebRTC ICE failure no longer tears down a
  * working MSE stream. When MSE is a live fallback (socket open + codecs
@@ -39,6 +49,19 @@ export class VideoRTC extends HTMLElement {
         // No-media watchdog: if the socket stays open but no media bytes arrive
         // for this long, treat the stream as stalled and force a reconnect.
         this.DISCONNECT_TIMEOUT = 5000;
+
+        // First-frame watchdog: 'connectionState=connected' is NOT proof of a working
+        // WebRTC stream. On multi-hop paths ICE/DTLS connectivity checks (tiny packets)
+        // can pass while the sustained RTP media never traverses, so the pc sits
+        // "connected" but no decodable frame ever arrives (loadeddata never fires).
+        // If the first frame doesn't land within this long after 'connected', treat it
+        // as a WebRTC failure so the connection can be dropped and retried with a
+        // freshly gathered ICE path instead of lingering as a media-less zombie.
+        // 15s matches the card's long-standing shadow cap: generous enough for a slow
+        // but real first frame, while media-less paths (observed: frame never arrives)
+        // are reaped regardless. Tunable if a camera legitimately needs longer.
+        this.FIRSTFRAME_TIMEOUT = 15000;
+        this._firstFrameTID = 0; // first-frame watchdog timer handle
 
         // List of supported codecs to announce to the server
         this.CODECS = [
@@ -254,6 +277,10 @@ export class VideoRTC extends HTMLElement {
      */
     ondisconnect() {
         this._clearWatchdog();
+        if (this._firstFrameTID) {
+            clearTimeout(this._firstFrameTID);
+            this._firstFrameTID = 0;
+        }
         this.ondata = null;
         this.onmessage = {};
         
@@ -511,12 +538,43 @@ export class VideoRTC extends HTMLElement {
             this.send({type: 'webrtc/candidate', value: candidate});
         });
 
+        // Tear down a WebRTC pc that could not deliver a usable stream. Two very
+        // different situations, plus the shared first-frame-watchdog cleanup.
+        const failWebRTC = (why) => {
+            if (this._firstFrameTID) {
+                clearTimeout(this._firstFrameTID);
+                this._firstFrameTID = 0;
+            }
+            if (this.ws && this.mseCodecs !== '') {
+                // (a) MSE is still a live fallback: the signaling socket is open and
+                // MSE has negotiated. In parallel webrtc+mse mode a WebRTC failure must
+                // NOT tear the whole thing down - that would kill a working MSE stream
+                // and, on networks where WebRTC can never establish (UDP blocked, no
+                // TURN, or media-less "connected" paths), reconnect-loop endlessly.
+                // Drop ONLY WebRTC and let MSE keep playing; a real MSE stall is caught
+                // by the no-data watchdog. Signal the card so it can retry the upgrade
+                // later with a freshly gathered ICE path.
+                console.warn(`[VideoRTC:${this.clientId}] WebRTC ${why}; keeping active MSE stream.`);
+                pc.close();
+                this.pc = null;
+                if (this.onmessage && typeof this.onmessage['ui_sync'] === 'function') {
+                    this.onmessage['ui_sync']({ type: 'signal', value: 'rtc_failed' });
+                }
+            } else {
+                // (b) No MSE fallback (e.g. pure RTC after a successful handover).
+                // Notify the card to retry. onclose() is called BEFORE nulling pc so
+                // its (!this.ws && !this.pc) guard does not short-circuit; onclose()
+                // never touches pc, so closing it right after is safe.
+                this.handoff = false;
+                this.onclose();
+                pc.close();
+                this.pc = null;
+            }
+        };
+
         // Monitor Connection State
         pc.addEventListener('connectionstatechange', () => {
-            // [DIAGNOSTIC] Log every transition with elapsed time + ICE state. This is
-            // what tells us, on the cameras that stay on MSE, whether their main pc is
-            // still 'checking' (favours letting the uncapped main finish) or 'failed'
-            // early (favours a shadow retry) — and how a >15s ICE path actually looks.
+            // [DIAGNOSTIC] Log every transition with elapsed time + ICE state.
             console.info(`[VideoRTC:${this.clientId}] pc ${pc.connectionState} (ice=${pc.iceConnectionState}) @${Date.now() - pcStart}ms`);
 
             if (pc.connectionState === 'connected') {
@@ -525,35 +583,29 @@ export class VideoRTC extends HTMLElement {
                     .filter(tr => tr.currentDirection === 'recvonly')
                     .map(tr => tr.receiver.track);
                 const video2 = document.createElement('video');
-                // Wait for data to arrive before deciding to switch
-                video2.addEventListener('loadeddata', () => this.onpcvideo(video2), {once: true});
-                video2.srcObject = new MediaStream(tracks);
-            } else if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
-                // WebRTC died. Two very different situations:
-                if (this.ws && this.mseCodecs !== '') {
-                    // (a) MSE is still a live fallback: the signaling socket is open and
-                    // MSE has negotiated. In parallel webrtc+mse mode a WebRTC ICE failure
-                    // must NOT tear the whole thing down - that would kill a working MSE
-                    // stream and, on networks where WebRTC can never establish (UDP
-                    // blocked, no TURN), reconnect-loop on every ICE timeout. Drop ONLY
-                    // WebRTC and let MSE keep playing; a real MSE stall is caught by the
-                    // no-data watchdog. Signal the card so it stops chasing the upgrade.
-                    console.warn(`[VideoRTC:${this.clientId}] WebRTC failed; keeping active MSE stream.`);
-                    pc.close();
-                    this.pc = null;
-                    if (this.onmessage && typeof this.onmessage['ui_sync'] === 'function') {
-                        this.onmessage['ui_sync']({ type: 'signal', value: 'rtc_failed' });
+                // Wait for data to arrive before deciding to switch. The first frame
+                // landing (loadeddata) is the ONLY real success signal — clear the
+                // watchdog here, not on 'connected'.
+                video2.addEventListener('loadeddata', () => {
+                    if (this._firstFrameTID) {
+                        clearTimeout(this._firstFrameTID);
+                        this._firstFrameTID = 0;
                     }
-                } else {
-                    // (b) No MSE fallback (e.g. pure RTC after a successful handover).
-                    // Notify the card to retry. onclose() is called BEFORE nulling pc so
-                    // its (!this.ws && !this.pc) guard does not short-circuit; onclose()
-                    // never touches pc, so closing it right after is safe.
-                    this.handoff = false;
-                    this.onclose();
-                    pc.close();
-                    this.pc = null;
+                    this.onpcvideo(video2);
+                }, {once: true});
+                video2.srcObject = new MediaStream(tracks);
+
+                // [FIRST-FRAME WATCHDOG] Arm the media-arrival deadline. If loadeddata
+                // never fires (ICE connected but RTP media never flows), reap the pc
+                // and signal rtc_failed so the card retries with a fresh ICE gather.
+                if (!this._firstFrameTID) {
+                    this._firstFrameTID = setTimeout(() => {
+                        this._firstFrameTID = 0;
+                        failWebRTC(`connected but delivered no media within ${this.FIRSTFRAME_TIMEOUT}ms`);
+                    }, this.FIRSTFRAME_TIMEOUT);
                 }
+            } else if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+                failWebRTC('failed');
             }
         });
 
@@ -568,7 +620,11 @@ export class VideoRTC extends HTMLElement {
                     break;
                 case 'error':
                     if (!msg.value.includes('webrtc/offer')) return;
-                    pc.close();
+                    // go2rtc rejected our offer: WebRTC is dead on this connection.
+                    // Route through failWebRTC so it emits rtc_failed (keeping MSE) and
+                    // the card can arm a retry — a bare pc.close() moves the pc to
+                    // 'closed', which the state handler ignores, so no signal would fire.
+                    failWebRTC('offer rejected');
             }
         };
 
