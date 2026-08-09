@@ -874,6 +874,7 @@ export class VideoRTC extends HTMLElement {
                 this._dropRtcOverlay();
                 this.video.muted = this._mseWanted;
                 if (this.pc) { this.pc.close(); this.pc = null; }
+                this._setPhase('warm');   // overlay dropped + pc closed -> back on MSE only
                 if (this.onmessage && typeof this.onmessage['ui_sync'] === 'function') {
                     this.onmessage['ui_sync']({ type: 'signal', value: 'rtc_rejected' });
                 }
