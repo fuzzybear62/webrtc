@@ -20,6 +20,10 @@
  *
  * CHANGELOG
  * ---------
+ * v14.2.4 — Tunable RTC knobs. New per-card YAML options `rtc_swap_prove_ms` (default 30000,
+ *   raised from 20000) and `firstframe_timeout` (default 120000, lowered from 600000) are
+ *   injected into the driver in startStream(). Defaults revised per the good-vs-badass-net
+ *   log analysis: both changes only affect degraded paths, not the clean direct-upgrade path.
  * v14.2.3 — Prove-gated shadow swap. The background shadow no longer swaps in at its 2s RTC
  *   PROMOTE; the working MSE main stays visible until the shadow's RTC has held gaplessly for
  *   RTC_SWAP_PROVE_MS (~20s), signalled by `rtc_sustained` from the driver. On throttled paths
@@ -28,7 +32,7 @@
  *   _promoteShadowToMain().
  */
 
-import {VideoRTC} from './video-rtc.js?v=2.3.3';
+import {VideoRTC} from './video-rtc.js?v=2.3.4';
 import {DigitalPTZ} from './digital-ptz.js?v=3.3.0';
 // [SIDECAR INTEGRATION] Import the Interaction module.
 // This module handles legacy features (Shortcuts, PTZ, Styles) to keep the core driver clean.
@@ -118,7 +122,7 @@ class WebRTCCamera extends HTMLElement {
         this._io = null;           // IntersectionObserver instance
         this._visAbort = null;     // AbortController for the document visibilitychange listener
 
-        console.info('[WebRTC Camera] v14.2.3');
+        console.info('[WebRTC Camera] v14.2.4');
     }
 
     setConfig(config) {
@@ -671,6 +675,13 @@ class WebRTCCamera extends HTMLElement {
         newDriver.media = effectiveConfig.media;
         newDriver.reversible = true;
 
+        // [TUNABLES] Optional per-card overrides for the reversible-RTC timing knobs; defaults
+        // live in the driver constructor. Accept only sane positive numbers, else keep default.
+        const proveMs = Number(effectiveConfig.rtc_swap_prove_ms);
+        if (Number.isFinite(proveMs) && proveMs > 0) newDriver.RTC_SWAP_PROVE_MS = proveMs;
+        const firstFrameMs = Number(effectiveConfig.firstframe_timeout);
+        if (Number.isFinite(firstFrameMs) && firstFrameMs > 0) newDriver.FIRSTFRAME_TIMEOUT = firstFrameMs;
+
         // Network strict mode propagates directly to the driver.
         newDriver.strictMode =
             effectiveConfig.network_strict !== undefined
@@ -939,7 +950,7 @@ class WebRTCCamera extends HTMLElement {
             // shadow; this card timer stays a backstop that ALSO covers the case the driver
             // can't (pc stuck in ICE 'checking' forever, no 'connected'/'failed' transition,
             // so the driver's state handler never arms) and drives the reprobe on failure.
-            const shadowCap = (newDriver.FIRSTFRAME_TIMEOUT || 600000) + 5000;
+            const shadowCap = (newDriver.FIRSTFRAME_TIMEOUT || 120000) + 5000;
             this._shadowTimeout = setTimeout(() => {
                 if (this.shadowDriver) {
                     console.info('[WebRTC Camera] Shadow timeout – killing unpromoted probe');

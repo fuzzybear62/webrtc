@@ -1,5 +1,10 @@
 /**
- * VideoRTC v2.3.3 - Resilience & cleanup
+ * VideoRTC v2.3.4 - Resilience & cleanup
+ * * Changelog v2.3.4:
+ * - TUNE: RTC_SWAP_PROVE_MS 20000 -> 30000 (wider evidence window before a shadow may swap in;
+ * zero effect on good nets, which upgrade directly and never swap). FIRSTFRAME_TIMEOUT
+ * 600000 -> 120000 (reap a connected-but-frameless pc in 2min instead of 10). Both are now
+ * overridable per-card via `rtc_swap_prove_ms` / `firstframe_timeout` (ms) in the card YAML.
  * * Changelog v2.3.3:
  * - ADD: RTC_SWAP_PROVE_MS (~20s) + one-shot `rtc_sustained` signal. After PROMOTE, once RTC
  * has decoded gaplessly for RTC_SWAP_PROVE_MS the driver emits ui_sync {signal:'rtc_sustained'}
@@ -138,7 +143,11 @@ export class VideoRTC extends HTMLElement {
         // keeps serving the user while the pc waits, so a slow-but-real first frame
         // (observed to take minutes on repeater paths) must not be reaped early. Only
         // genuinely media-less paths hit this deadline. Tunable.
-        this.FIRSTFRAME_TIMEOUT = 600000;
+        // Default 120s (v2.3.4, was 600000): on a path where the pc reaches "connected" but
+        // never decodes a frame (e.g. cloudflared tunnel), 10min was a wasteful zombie pc;
+        // 2min gives a slow-but-real repeater first frame ample room while reaping dead paths
+        // far sooner. Overridable per-card via `firstframe_timeout` (ms) in the card YAML.
+        this.FIRSTFRAME_TIMEOUT = 120000;
         this._firstFrameTID = 0;   // first-frame watchdog timer handle
         this._firstFramePoll = 0;  // getStats() poll interval handle (framesDecoded)
         // After handoff the RTC media flows P2P off the ws, so the MSE no-data
@@ -194,10 +203,13 @@ export class VideoRTC extends HTMLElement {
         // swaps a background shadow in AFTER the shadow's RTC has held gaplessly this long — so
         // a shadow that promotes at 2s but stalls (bursty/throttled path) NEVER triggers a swap,
         // and the working MSE main is never destroyed for an unproven replacement. Deliberately
-        // set a few seconds beyond RTC_LIVENESS_TIMEOUT (15s) so surviving it is real evidence
-        // the path is better than the reverted main, while staying far below the full 180s
-        // commit so a genuinely good upgrade still lands quickly. Tunable.
-        this.RTC_SWAP_PROVE_MS = 20000;
+        // set well beyond RTC_LIVENESS_TIMEOUT (15s) so surviving it is real evidence the path
+        // is better than the reverted main, while staying far below the full 180s commit so a
+        // genuinely good upgrade still lands quickly. Default 30s (v2.3.4, was 20000): on a
+        // throttled path RTC dies at ~15s, so a 5s margin let the odd "lucky" shadow swap in
+        // only to fall back seconds later; 30s doubles the evidence window (zero effect on good
+        // nets, which never use the swap). Overridable per-card via `rtc_swap_prove_ms` (ms).
+        this.RTC_SWAP_PROVE_MS = 30000;
 
         this._promoted = false;    // true once the RTC overlay is revealed (reversible flow)
         this._lastLiveness = 0;    // Date.now() of the last framesDecoded advance
