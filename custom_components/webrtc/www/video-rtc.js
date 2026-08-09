@@ -498,6 +498,11 @@ export class VideoRTC extends HTMLElement {
     onwebrtc() {
         const pc = new RTCPeerConnection(this.pcConfig);
 
+        // [DIAGNOSTIC] When did this pc start negotiating? Lets the state log below
+        // report how long ICE spent in 'checking' before it connected or failed — the
+        // datum that decides whether a shadow retry needs a longer/adaptive cap.
+        const pcStart = Date.now();
+
         // Handle ICE Candidates
         pc.addEventListener('icecandidate', ev => {
             // Ignore UDP candidates if forced to TCP mode
@@ -508,6 +513,12 @@ export class VideoRTC extends HTMLElement {
 
         // Monitor Connection State
         pc.addEventListener('connectionstatechange', () => {
+            // [DIAGNOSTIC] Log every transition with elapsed time + ICE state. This is
+            // what tells us, on the cameras that stay on MSE, whether their main pc is
+            // still 'checking' (favours letting the uncapped main finish) or 'failed'
+            // early (favours a shadow retry) — and how a >15s ICE path actually looks.
+            console.info(`[VideoRTC:${this.clientId}] pc ${pc.connectionState} (ice=${pc.iceConnectionState}) @${Date.now() - pcStart}ms`);
+
             if (pc.connectionState === 'connected') {
                 // When connected, grab tracks and create a temp video to check stream validity
                 const tracks = pc.getTransceivers()
