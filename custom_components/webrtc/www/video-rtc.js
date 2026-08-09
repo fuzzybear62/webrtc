@@ -1,5 +1,16 @@
 /**
- * VideoRTC v2.3.4 - Resilience & cleanup
+ * VideoRTC v2.3.5 - Explicit RTC phase machine + dead-path removal
+ * * Changelog v2.3.5:
+ * - REFACTOR (smell #1): the RTC handoff is now an explicit 4-state machine on `_rtcPhase`
+ * ('warm' | 'negotiating' | 'promoted' | 'committed') driven through a single `_setPhase()`
+ * transition point (which logs every edge — free observability, no counters). Replaces the
+ * old implicit `_promoted`/`_committed` boolean constellation; illegal combinations are no
+ * longer representable and the poll loop reads as phase comparisons.
+ * - REMOVE: the legacy/non-reversible RTC branch (irreversible one-shot handoff) and the
+ * `reversible` flag are gone. The card made EVERY driver reversible, so that branch — plus
+ * the whole non-reversible body of onpcvideo() and the `RTC_PROVE_MS` knob — was dead code
+ * that still shared state fields with the live path (the actual root of smell #1). onpcvideo()
+ * is now a no-op the card wraps for its UI update; net −122 lines. Behaviour unchanged.
  * * Changelog v2.3.4:
  * - TUNE: RTC_SWAP_PROVE_MS 20000 -> 30000 (wider evidence window before a shadow may swap in;
  * zero effect on good nets, which upgrade directly and never swap). FIRSTFRAME_TIMEOUT
@@ -163,22 +174,20 @@ export class VideoRTC extends HTMLElement {
         // self-heal fast, long enough to ride the brief congestion pauses that are normal
         // on repeater paths (8s was too twitchy and reverted on ordinary bursts). Tunable.
         this.RTC_LIVENESS_TIMEOUT = 15000;
-        // [LEGACY / SHADOW ONLY] How much ACTUALLY-flowing decode WebRTC must show before
-        // the one-shot irreversible handoff (switch visible element + close MSE). Used by
-        // the non-reversible branch (shadow probes), where the card swaps whole drivers.
-        this.RTC_PROVE_MS = 15000;
 
-        // [REVERSIBLE HANDOFF, v2.3.0] The main (parallel) driver keeps its MSE stream
-        // ATTACHED and warm on this.video and shows WebRTC on a second, overlaid <video>.
-        // Promotion (revealing the overlay) is therefore reversible: a post-promote stall
-        // snaps back to MSE in one frame with no reconnect and no black. Only after RTC has
-        // proven itself stable for RTC_COMMIT_MS do we "commit" — collapse the overlay onto
-        // this.video (which detaches/closes the now-unneeded MSE) and close the signalling
-        // ws to free bandwidth. The card enables this per-driver via `reversible` so the
-        // delicate shadow-swap path stays on the legacy branch, byte-for-byte unchanged.
-        this.reversible = false;   // set true by the card for the main parallel driver
+        // [REVERSIBLE RTC — EXPLICIT PHASE, v2.3.5] The driver keeps its MSE stream ATTACHED
+        // and warm on this.video and decodes WebRTC on a second, overlaid <video>
+        // (this._rtcVideo). The handoff is a 4-state machine on this._rtcPhase:
+        //   'warm'        no RTC overlay — MSE only (initial state, and after a revert).
+        //   'negotiating' overlay decoding, still hidden (opacity 0); MSE warm. REVERSIBLE.
+        //   'promoted'    overlay revealed to the user; MSE still warm underneath. REVERSIBLE.
+        //   'committed'   overlay collapsed onto this.video, MSE released, ws closed. This is
+        //                 the ONLY irreversible state (a later stall must reconnect).
+        // Legal edges: warm -> negotiating -> promoted -> committed, plus
+        // negotiating/promoted -> warm (revert). Every edge goes through _setPhase() so the
+        // transition is logged in exactly one place (free observability, no counters).
         this._rtcVideo = null;     // overlaid <video> carrying the RTC MediaStream
-        this._committed = false;   // true once MSE was released (fully on RTC)
+        this._rtcPhase = 'warm';   // 'warm' | 'negotiating' | 'promoted' | 'committed'
         this._commitTID = 0;       // unused in the poll-driven commit model; kept for _clearRtcTimers
         this._mseWanted = false;   // desired mute state of the MSE element, restored on revert/commit
         // Flowing decode required before we REVEAL RTC (make it visible). Small because
@@ -211,7 +220,6 @@ export class VideoRTC extends HTMLElement {
         // nets, which never use the swap). Overridable per-card via `rtc_swap_prove_ms` (ms).
         this.RTC_SWAP_PROVE_MS = 30000;
 
-        this._promoted = false;    // true once the RTC overlay is revealed (reversible flow)
         this._lastLiveness = 0;    // Date.now() of the last framesDecoded advance
         this._stableSince = 0;     // start of the current gapless run (drives the commit clock)
         this._sustainedSignaled = false; // guards the one-shot rtc_sustained (shadow-swap) signal
@@ -711,7 +719,7 @@ export class VideoRTC extends HTMLElement {
             // released, ANY failure (pc failed/disconnected, offer rejected) must snap back
             // to the warm MSE — dropping the overlay and restoring MSE audio — not just
             // close the pc and leave a frozen overlay on top of a muted MSE.
-            if (this.reversible && this._rtcVideo && !this._committed) {
+            if (this._rtcVideo && this._rtcPhase !== 'committed') {
                 this._revertToWarmMSE(`WebRTC ${why}`);
                 return;
             }
@@ -761,88 +769,10 @@ export class VideoRTC extends HTMLElement {
                 // transient connected->connecting->connected can't leak a 2nd poll/timer.)
                 if (this._firstFrameTID || this._firstFramePoll) return;
 
-                // [REVERSIBLE HANDOFF] Main parallel driver: keep MSE warm, show RTC on an
-                // overlay, promote fast, commit only once RTC proves durably stable.
-                if (this.reversible) {
-                    this._startReversibleRTC(pc, pcStart, failWebRTC);
-                    return;
-                }
-
-                // ---- LEGACY / SHADOW: one-shot irreversible prove-before-commit ----
-                const tracks = pc.getTransceivers()
-                    .filter(tr => tr.currentDirection === 'recvonly')
-                    .map(tr => tr.receiver.track);
-                const video2 = document.createElement('video');
-                video2.muted = true;        // allow the offscreen probe to decode/play
-                video2.playsInline = true;
-                video2.srcObject = new MediaStream(tracks);
-                video2.play().catch(() => {});
-
-                this._promoted = false;
-                let lastDecoded = -1;   // framesDecoded on the previous poll (-1 = none yet)
-                let flowingMs = 0;      // accumulated wall-time of ACTUALLY-advancing decode
-
-                // [PROVE BEFORE COMMIT] Keep the visible element on MSE until WebRTC has
-                // proven it can deliver video CONTINUOUSLY. The handoff closes the MSE ws
-                // and is irreversible without a full reconnect, so on congested repeater
-                // paths a stream that decodes a short burst then stalls must NOT trigger it:
-                // doing so froze the picture black, or thrashed a reconnect loop that tore
-                // down the working MSE every ~15s (and, going through connection-closed
-                // rather than rtc_failed, never armed the reprobe/shadow). We accumulate
-                // only polls where framesDecoded actually advanced; a burst-then-stall path
-                // never reaches RTC_PROVE_MS, so MSE is never interrupted and the 600s
-                // watchdog eventually gives up with rtc_failed (-> reprobe/shadow). The
-                // offscreen probe (video2) keeps the decoder pulling frames meanwhile.
-                const commitHandoff = () => {
-                    if (this._firstFrameTID) { clearTimeout(this._firstFrameTID); this._firstFrameTID = 0; }
-                    console.info(`[VideoRTC:${this.clientId}] RTC proven (${flowingMs}ms flowing) @${Date.now() - pcStart}ms — handing off`);
-                    this._promoted = true;
-                    this._lastLiveness = Date.now();
-                    this.onpcvideo(video2);
-                    // NB: _firstFramePoll is intentionally NOT cleared — it converts into
-                    // the post-handoff liveness watchdog below.
-                };
-                this._firstFramePoll = setInterval(() => {
-                    if (!this.pc) { clearInterval(this._firstFramePoll); this._firstFramePoll = 0; return; }
-                    this.pc.getStats().then(stats => {
-                        let fd = -1;
-                        for (const r of stats.values()) {
-                            if (r.type === 'inbound-rtp' && r.kind === 'video') { fd = r.framesDecoded || 0; break; }
-                        }
-                        if (fd < 0) return;   // no inbound video report yet
-                        const advanced = lastDecoded >= 0 && fd > lastDecoded;
-                        lastDecoded = fd;
-
-                        if (!this._promoted) {
-                            // PROVING (visible element still on MSE): only real progress
-                            // counts, so a burst-then-stall never crosses the threshold.
-                            if (advanced) {
-                                flowingMs += 500;
-                                if (flowingMs >= this.RTC_PROVE_MS) commitHandoff();
-                            }
-                        } else if (advanced) {
-                            // POST-HANDOFF: frames still advancing -> stream is alive.
-                            this._lastLiveness = Date.now();
-                        } else if (Date.now() - this._lastLiveness > this.RTC_LIVENESS_TIMEOUT) {
-                            // POST-HANDOFF STALL: a proven stream later died. The pc is still
-                            // 'connected' (ICE/DTLS fine) so no state change fires and nothing
-                            // else catches it — the picture would stay black forever with MSE
-                            // already gone. Recover via failWebRTC's no-MSE branch:
-                            // handoff=false -> onclose() -> 'connection-closed' -> the card
-                            // reconnects (MSE back) and re-probes WebRTC afresh.
-                            failWebRTC(`RTC media stalled ${this.RTC_LIVENESS_TIMEOUT}ms after handoff`);
-                        }
-                    }).catch(() => {});
-                }, 500);
-
-                // [FIRST-FRAME WATCHDOG] Arm the media-arrival deadline. If no sustained
-                // video ever decodes (ICE connected but RTP media never flows), reap the pc
-                // and signal rtc_failed so the card retries with a fresh ICE gather. MSE
-                // keeps serving the picture untouched during this whole window.
-                this._firstFrameTID = setTimeout(() => {
-                    this._firstFrameTID = 0;
-                    failWebRTC(`connected but decoded no sustained video within ${this.FIRSTFRAME_TIMEOUT}ms`);
-                }, this.FIRSTFRAME_TIMEOUT);
+                // Keep MSE warm, decode RTC on a hidden overlay, promote fast, and commit
+                // only once RTC proves durably stable — the whole handoff lives in
+                // _startReversibleRTC and the this._rtcPhase machine.
+                this._startReversibleRTC(pc, pcStart, failWebRTC);
             } else if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
                 failWebRTC('failed');
             }
@@ -919,8 +849,7 @@ export class VideoRTC extends HTMLElement {
         // even if we give up before ever muting it at promote.
         this._mseWanted = this.video.muted;
 
-        this._promoted = false;
-        this._committed = false;
+        this._setPhase('negotiating');
         this._sustainedSignaled = false;
         let lastDecoded = -1;
         let flowingMs = 0;
@@ -952,7 +881,7 @@ export class VideoRTC extends HTMLElement {
             }
 
             console.info(`[VideoRTC:${this.clientId}] RTC promoted (${flowingMs}ms flowing) @${Date.now() - pcStart}ms — MSE kept warm`);
-            this._promoted = true;
+            this._setPhase('promoted');
             this._lastLiveness = Date.now();
             this._stableSince = Date.now();   // commit only after RTC_COMMIT_MS of GAPLESS decode
             // The give-up watchdog is done; from here the liveness watchdog governs.
@@ -972,9 +901,9 @@ export class VideoRTC extends HTMLElement {
         // Release MSE: RTC has been stable long enough to trust.
         const commit = () => {
             this._commitTID = 0;
-            if (!this.pc || !this._promoted || !this._rtcVideo) return;
+            if (!this.pc || this._rtcPhase !== 'promoted' || !this._rtcVideo) return;
             console.info(`[VideoRTC:${this.clientId}] RTC stable ${this.RTC_COMMIT_MS}ms @${Date.now() - pcStart}ms — committing (releasing MSE)`);
-            this._committed = true;
+            this._setPhase('committed');
             // Collapse onto the primary element (keeps the card's tools/PTZ bound to
             // this.video). Both show the same MediaStream during the swap -> no flash.
             const stream = this._rtcVideo.srcObject;
@@ -1001,7 +930,7 @@ export class VideoRTC extends HTMLElement {
                 const advanced = lastDecoded >= 0 && fd > lastDecoded;
                 lastDecoded = fd;
 
-                if (!this._promoted) {
+                if (this._rtcPhase === 'negotiating') {
                     if (advanced) {
                         flowingMs += 500;
                         if (flowingMs >= this.RTC_PROMOTE_MS) promote();
@@ -1023,13 +952,13 @@ export class VideoRTC extends HTMLElement {
                     // Any stall > RTC_STALL_RESET below pushes _stableSince forward, so a bursty
                     // camera never gets here and just keeps MSE warm. Reserving commit for
                     // rock-solid paths is what stops the post-commit stall -> reconnect crash loop.
-                    if (!this._committed && gapless >= this.RTC_COMMIT_MS) {
+                    if (this._rtcPhase === 'promoted' && gapless >= this.RTC_COMMIT_MS) {
                         commit();
                     }
                 } else {
                     const gap = Date.now() - this._lastLiveness;
                     if (gap > this.RTC_LIVENESS_TIMEOUT) {
-                        if (!this._committed) {
+                        if (this._rtcPhase === 'promoted') {
                             // Pre-commit: MSE is warm — snap back instantly, no reconnect.
                             this._revertToWarmMSE(`RTC stalled ${this.RTC_LIVENESS_TIMEOUT}ms before commit`);
                         } else {
@@ -1052,6 +981,16 @@ export class VideoRTC extends HTMLElement {
             this._firstFrameTID = 0;
             this._revertToWarmMSE(`connected but decoded no sustained video within ${this.FIRSTFRAME_TIMEOUT}ms`);
         }, this.FIRSTFRAME_TIMEOUT);
+    }
+
+    /**
+     * [REVERSIBLE RTC] Single transition point for the RTC phase machine. Logs every edge
+     * (warm/negotiating/promoted/committed) so the whole handoff is traceable from one line.
+     */
+    _setPhase(next) {
+        if (this._rtcPhase === next) return;
+        console.info(`[VideoRTC:${this.clientId}] RTC phase ${this._rtcPhase} -> ${next}`);
+        this._rtcPhase = next;
     }
 
     /** [REVERSIBLE HANDOFF] Clear the promotion/liveness/commit timers. */
@@ -1083,8 +1022,7 @@ export class VideoRTC extends HTMLElement {
         this._dropRtcOverlay();
         this.video.muted = this._mseWanted;
         if (this.pc) { this.pc.close(); this.pc = null; }
-        this._promoted = false;
-        this._committed = false;
+        this._setPhase('warm');
         if (this.onmessage && typeof this.onmessage['ui_sync'] === 'function') {
             this.onmessage['ui_sync']({ type: 'signal', value: 'rtc_failed' });
         }
@@ -1099,7 +1037,7 @@ export class VideoRTC extends HTMLElement {
      */
     applyAudio(muted) {
         this._mseWanted = muted;
-        if (this._rtcVideo && this._promoted) {
+        if (this._rtcVideo && this._rtcPhase === 'promoted') {
             this._rtcVideo.muted = muted;
             this.video.muted = true;
         } else {
@@ -1131,62 +1069,12 @@ export class VideoRTC extends HTMLElement {
     }
 
     /**
-     * Decides whether to switch from MSE to WebRTC.
-     * Prioritizes Codec quality (H265 > H264) and audio presence.
+     * RTC-video hook. The reveal + priority decision + socket handoff all live in
+     * _startReversibleRTC / commit() now, so this base method is intentionally a no-op:
+     * the reversible flow calls it (via promote()) ONLY so the card's onpcvideo wrapper
+     * runs its UI update. It must never touch the socket or srcObject.
      */
-    onpcvideo(video2) {
-        // [REVERSIBLE HANDOFF] In the reversible flow the reveal + priority decision are
-        // handled by _startReversibleRTC, and the ws must stay open until commit(). This
-        // method is still invoked (so the card's onpcvideo wrapper runs its UI update) but
-        // must NOT touch the socket or srcObject here.
-        if (this.reversible) return;
-
-        if (this.pc) {
-            let rtcPriority = 0, msePriority = 0;
-
-            const stream = video2.srcObject;
-            // Calculate priorities based on Tracks and Codecs
-            if (stream.getVideoTracks().length > 0) {
-                const isH265Supported = this.pc.remoteDescription.sdp.includes('H265/90000');
-                rtcPriority += isH265Supported ? 0x240 : 0x220;
-            }
-            if (stream.getAudioTracks().length > 0) rtcPriority += 0x102;
-
-            if (this.mseCodecs.includes('hvc1.')) msePriority += 0x230;
-            if (this.mseCodecs.includes('avc1.')) msePriority += 0x210;
-            if (this.mseCodecs.includes('mp4a.')) msePriority += 0x101;
-
-            if (rtcPriority >= msePriority) {
-                // SWITCH TO WEBRTC
-                console.info(`[VideoRTC:${this.clientId}] Mode: RTC (Socket Closing)`);
-                this.video.srcObject = stream;
-                this.play();
-
-                if (this.ws) {
-                    // SET HANDOFF FLAG: Close WS without triggering restart
-                    this.handoff = true; 
-                    this.ws.close();
-                    this.ws = null;
-                }
-            } else {
-                // REJECT WEBRTC
-                console.info(`[VideoRTC:${this.clientId}] Mode: RTC Rejected (Priority < MSE)`);
-                
-                // [OBSERVABILITY] Signal the rejection to the parent component.
-                // This informs the parent that WebRTC was negotiated but discarded due to lower quality,
-                // allowing it to cancel any pending upgrade timers or spinners.
-                if (this.onmessage && typeof this.onmessage['ui_sync'] === 'function') {
-                    this.onmessage['ui_sync']({ type: 'signal', value: 'rtc_rejected' });
-                }
-
-                if (this.pc) {
-                    this.pc.close();
-                    this.pc = null;
-                }
-            }
-        }
-        video2.srcObject = null;
-    }
+    onpcvideo(_video) { /* reversible flow owns the handoff; card wraps this for UI */ }
 
     /**
      * Logic for MJPEG (Motion JPEG) - Fallback mode

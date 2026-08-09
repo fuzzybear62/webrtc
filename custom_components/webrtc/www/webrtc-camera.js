@@ -20,6 +20,10 @@
  *
  * CHANGELOG
  * ---------
+ * v14.2.5 — Driver RTC refactor (driver v2.3.5), no card behaviour change. Consumes a driver
+ *   whose RTC handoff is now an explicit `_rtcPhase` state machine and whose dead legacy
+ *   (non-reversible) path was removed. The vestigial `newDriver.reversible = true` assignment
+ *   is dropped (the driver no longer reads it — the reversible flow is its only RTC path).
  * v14.2.4 — Tunable RTC knobs. New per-card YAML options `rtc_swap_prove_ms` (default 30000,
  *   raised from 20000) and `firstframe_timeout` (default 120000, lowered from 600000) are
  *   injected into the driver in startStream(). Defaults revised per the good-vs-badass-net
@@ -32,7 +36,7 @@
  *   _promoteShadowToMain().
  */
 
-import {VideoRTC} from './video-rtc.js?v=2.3.4';
+import {VideoRTC} from './video-rtc.js?v=2.3.5';
 import {DigitalPTZ} from './digital-ptz.js?v=3.3.0';
 // [SIDECAR INTEGRATION] Import the Interaction module.
 // This module handles legacy features (Shortcuts, PTZ, Styles) to keep the core driver clean.
@@ -122,7 +126,7 @@ class WebRTCCamera extends HTMLElement {
         this._io = null;           // IntersectionObserver instance
         this._visAbort = null;     // AbortController for the document visibilitychange listener
 
-        console.info('[WebRTC Camera] v14.2.4');
+        console.info('[WebRTC Camera] v14.2.5');
     }
 
     setConfig(config) {
@@ -663,17 +667,18 @@ class WebRTCCamera extends HTMLElement {
         // Create a fresh driver instance.
         // The driver owns all media/network state.
         const newDriver = document.createElement('video-rtc');
-        // [REVERSIBLE HANDOFF] Every driver — cold main AND background shadow — now negotiates
-        // the full webrtc+mse set and promotes WebRTC REVERSIBLY (keeps its own MSE warm on a
-        // 2nd <video>, snaps back on an RTC stall). This makes the shadow a self-protecting
-        // driver: when it promotes we swap it in and, if its RTC later stalls, it reverts to
-        // ITS OWN warm MSE instead of freezing black. The old webrtc-only shadow, once swapped
-        // in, had no MSE fallback and no connection-closed listener, so a stall on a flaky
-        // network left it frozen. The extra background MSE stream is acceptable (LAN-side; the
-        // constrained camera->go2rtc path carries one feed regardless).
+        // [REVERSIBLE HANDOFF] Every driver — cold main AND background shadow — negotiates the
+        // full webrtc+mse set and promotes WebRTC REVERSIBLY (keeps its own MSE warm on a 2nd
+        // <video>, snaps back on an RTC stall). This makes the shadow a self-protecting driver:
+        // when it promotes we swap it in and, if its RTC later stalls, it reverts to ITS OWN
+        // warm MSE instead of freezing black. The old webrtc-only shadow, once swapped in, had
+        // no MSE fallback and no connection-closed listener, so a stall on a flaky network left
+        // it frozen. The extra background MSE stream is acceptable (LAN-side; the constrained
+        // camera->go2rtc path carries one feed regardless). The reversible handoff is now the
+        // driver's ONLY RTC path (the legacy irreversible branch was removed in driver v2.3.5),
+        // so there is no per-driver flag to set here any more.
         newDriver.mode = effectiveConfig.mode;
         newDriver.media = effectiveConfig.media;
-        newDriver.reversible = true;
 
         // [TUNABLES] Optional per-card overrides for the reversible-RTC timing knobs; defaults
         // live in the driver constructor. Accept only sane positive numbers, else keep default.
