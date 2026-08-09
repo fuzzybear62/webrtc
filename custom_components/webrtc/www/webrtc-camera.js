@@ -77,12 +77,15 @@ class WebRTCCamera extends HTMLElement {
         // [SEAMLESS HANDOVER] Watchdog timer to kill stuck shadow connections
         this._shadowTimeout = null;
         
-        // [PHANTOM FIX] Timer for delayed upgrade trigger.
-        // Must be cancelable if WebRTC connects spontaneously.
+        // [DEPRECATED - removed in v14.1.10] Held the 2s fast shadow-upgrade timer.
+        // That initial shadow raced the main driver's own parallel WebRTC and opened
+        // a redundant second go2rtc consumer; the fast path is now the main's parallel
+        // negotiation. Field kept null-only so residual clearTimeout guards stay no-ops;
+        // to be swept together with the shadow machinery in the #2b re-probe rewrite.
         this._upgradeTimer = null;
 
         // [RTC RE-PROBE] Periodic background WebRTC re-probe while settled on MSE.
-        // The initial _upgradeTimer is a single fast attempt right after MSE lands;
+        // The main driver's parallel negotiation is the immediate first attempt;
         // this loop is the long-term safety net. Since a failed WebRTC no longer
         // tears down MSE (driver v2.2.14 #6), a stream that started on MSE because
         // WebRTC was momentarily unavailable (UDP briefly blocked, TURN down, ICE
@@ -109,7 +112,7 @@ class WebRTCCamera extends HTMLElement {
         this._io = null;           // IntersectionObserver instance
         this._visAbort = null;     // AbortController for the document visibilitychange listener
 
-        console.info('[WebRTC Camera] v14.1.9');
+        console.info('[WebRTC Camera] v14.1.10');
     }
 
     setConfig(config) {
@@ -672,29 +675,20 @@ class WebRTCCamera extends HTMLElement {
                         console.info('[WebRTC Camera] Main Driver negotiated: MSE');
                         this.setStatus(msg.type.toUpperCase(), this.config.title || '', 'Stream via MSE (TCP)');
 
-                        // [RTC RE-PROBE] Settled on MSE. Arm the periodic upgrade loop as a
-                        // long-term safety net (the fast _upgradeTimer below is the first,
-                        // immediate attempt; _scheduleReprobe is idempotent so the two never
-                        // stack). This also covers the case where the initial attempt is
-                        // skipped because _shadowAttempts is already exhausted.
+                        // [RTC RE-PROBE] Settled on MSE. The MSE->WebRTC upgrade is driven by
+                        // two mechanisms, and the fast 2s shadow is deliberately NOT one of them:
+                        //   1. the main driver's OWN parallel WebRTC negotiation (onopen runs
+                        //      onmse() + onwebrtc() together) is the immediate first attempt - it
+                        //      upgrades IN PLACE, on the same WS, with no second connection;
+                        //   2. _scheduleReprobe() is the long-term retry loop for a settled MSE
+                        //      stream - the core resilience of this fork.
+                        // The old fast _upgradeTimer launched a webrtc-only SHADOW ~2s after MSE
+                        // landed, which merely RACED the main's own parallel WebRTC and opened a
+                        // redundant second go2rtc consumer (the phantom +1 seen in the field). It
+                        // is removed: the main's parallel attempt already covers the fast path, so
+                        // no shadow is needed for the initial upgrade.
                         this._activeMode = 'mse';
                         this._scheduleReprobe();
-
-                        // [PHANTOM FIX] Clear any pending upgrade timer before setting a new one
-                        if (this._upgradeTimer) clearTimeout(this._upgradeTimer);
-
-                        // [SEAMLESS HANDOVER] Trigger Auto-Upgrade
-                        // If we land on MSE, and we haven't exhausted shadow attempts, try to upgrade to RTC in background.
-                        if (effectiveConfig.mode.indexOf('webrtc') >= 0 && this._shadowAttempts < 2) {
-                            console.info('[WebRTC Camera] MSE detected. Scheduling Shadow Upgrade...');
-                            this._shadowAttempts++;
-                            
-                            // [PHANTOM FIX] Save timer reference to allow cancellation
-                            this._upgradeTimer = setTimeout(() => {
-                                this._upgradeTimer = null;
-                                this.startStream();
-                            }, 2000); // 2s delay to let MSE settle
-                        }
                     // falls through: MSE shares the tail below (reset _retryCount).
                     // The shared block is guarded by `msg.type !== 'mse'` so the "negotiated"
                     // log is skipped for MSE. Do NOT add a `break` here.
