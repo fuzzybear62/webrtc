@@ -1,5 +1,16 @@
 /**
- * VideoRTC v2.2.18 - Resilience & cleanup
+ * VideoRTC v2.2.19 - Resilience & cleanup
+ * * Changelog v2.2.19:
+ * - FIX: reconnect loop / driver churn on congested paths. v2.2.18 promoted (and
+ * closed MSE) after ~1s of decode; repeater paths deliver WebRTC in bursts, so a
+ * stream would pass that gate, stall, get caught by the post-handoff liveness
+ * watchdog, and force a full reconnect that tore down the working MSE too — every
+ * ~15s, forever, and via connection-closed so no reprobe/shadow ever armed. NEW
+ * model "prove before commit": the visible element stays on MSE while the offscreen
+ * probe accumulates ACTUALLY-flowing decode time; onpcvideo (switch + close MSE)
+ * fires only after RTC_PROVE_MS (15s) of real flow. Burst-then-stall paths never
+ * reach it -> MSE never interrupted, and the 600s watchdog gives up with rtc_failed
+ * -> reprobe/shadow. The post-handoff liveness watchdog stays as a backstop.
  * * Changelog v2.2.18:
  * - FIX: promoted RTC streams could freeze BLACK forever. framesDecoded > 0 is a
  * single keyframe; on congested paths RTP then stalled, so we handed off (closing
@@ -94,6 +105,12 @@ export class VideoRTC extends HTMLElement {
         // Long enough to ride out a brief congestion pause, short enough that a dead
         // handoff self-heals in seconds instead of staying black forever. Tunable.
         this.RTC_LIVENESS_TIMEOUT = 15000;
+        // How much ACTUALLY-flowing decode WebRTC must show before we commit the
+        // handoff (switch the visible element + close MSE). The MSE picture is never
+        // interrupted during this window, so a generous value costs nothing but keeps
+        // burst-then-stall paths (which can't sustain UDP/SRTP) on the reliable MSE
+        // stream instead of thrashing a reconnect loop. Tunable.
+        this.RTC_PROVE_MS = 15000;
         this._promoted = false;    // true once onpcvideo() handed off to WebRTC
         this._lastLiveness = 0;    // Date.now() of the last framesDecoded advance
 
@@ -635,18 +652,23 @@ export class VideoRTC extends HTMLElement {
                 video2.play().catch(() => {});
 
                 this._promoted = false;
-                let lastDecoded = -1;   // framesDecoded seen on the previous poll (-1 = none)
+                let lastDecoded = -1;   // framesDecoded on the previous poll (-1 = none yet)
+                let flowingMs = 0;      // accumulated wall-time of ACTUALLY-advancing decode
 
-                // [SUSTAINED FRAME] Promote only when video is DECODING CONTINUOUSLY.
-                // framesDecoded > 0 (a single keyframe) is not enough: on slow repeater
-                // paths the first keyframe decodes and then RTP stalls for minutes —
-                // promoting there swaps the visible element to a stream that delivers no
-                // more frames (black/frozen) while tearing down the working MSE. Require
-                // framesDecoded to ADVANCE across consecutive 500ms polls (proof of a live
-                // flowing picture, not a stale first frame) before handing off.
-                const promoteOnRealFrame = () => {
+                // [PROVE BEFORE COMMIT] Keep the visible element on MSE until WebRTC has
+                // proven it can deliver video CONTINUOUSLY. The handoff closes the MSE ws
+                // and is irreversible without a full reconnect, so on congested repeater
+                // paths a stream that decodes a short burst then stalls must NOT trigger it:
+                // doing so froze the picture black, or thrashed a reconnect loop that tore
+                // down the working MSE every ~15s (and, going through connection-closed
+                // rather than rtc_failed, never armed the reprobe/shadow). We accumulate
+                // only polls where framesDecoded actually advanced; a burst-then-stall path
+                // never reaches RTC_PROVE_MS, so MSE is never interrupted and the 600s
+                // watchdog eventually gives up with rtc_failed (-> reprobe/shadow). The
+                // offscreen probe (video2) keeps the decoder pulling frames meanwhile.
+                const commitHandoff = () => {
                     if (this._firstFrameTID) { clearTimeout(this._firstFrameTID); this._firstFrameTID = 0; }
-                    console.info(`[VideoRTC:${this.clientId}] sustained video decoded @${Date.now() - pcStart}ms`);
+                    console.info(`[VideoRTC:${this.clientId}] RTC proven (${flowingMs}ms flowing) @${Date.now() - pcStart}ms — handing off`);
                     this._promoted = true;
                     this._lastLiveness = Date.now();
                     this.onpcvideo(video2);
@@ -661,22 +683,26 @@ export class VideoRTC extends HTMLElement {
                             if (r.type === 'inbound-rtp' && r.kind === 'video') { fd = r.framesDecoded || 0; break; }
                         }
                         if (fd < 0) return;   // no inbound video report yet
+                        const advanced = lastDecoded >= 0 && fd > lastDecoded;
+                        lastDecoded = fd;
 
                         if (!this._promoted) {
-                            // PRE-HANDOFF: wait for sustained growth, then hand off.
-                            if (fd > 0 && lastDecoded >= 0 && fd > lastDecoded) promoteOnRealFrame();
-                            lastDecoded = fd;
-                        } else if (fd > lastDecoded) {
+                            // PROVING (visible element still on MSE): only real progress
+                            // counts, so a burst-then-stall never crosses the threshold.
+                            if (advanced) {
+                                flowingMs += 500;
+                                if (flowingMs >= this.RTC_PROVE_MS) commitHandoff();
+                            }
+                        } else if (advanced) {
                             // POST-HANDOFF: frames still advancing -> stream is alive.
-                            lastDecoded = fd;
                             this._lastLiveness = Date.now();
                         } else if (Date.now() - this._lastLiveness > this.RTC_LIVENESS_TIMEOUT) {
-                            // POST-HANDOFF STALL: the promoted RTC stream froze. The pc is
-                            // still 'connected' (ICE/DTLS fine) so no state change fires and
-                            // nothing else can catch this — the picture would stay black
-                            // forever with MSE already gone. Recover via failWebRTC's no-MSE
-                            // branch: handoff=false -> onclose() -> 'connection-closed' ->
-                            // the card reconnects (MSE back) and re-probes WebRTC afresh.
+                            // POST-HANDOFF STALL: a proven stream later died. The pc is still
+                            // 'connected' (ICE/DTLS fine) so no state change fires and nothing
+                            // else catches it — the picture would stay black forever with MSE
+                            // already gone. Recover via failWebRTC's no-MSE branch:
+                            // handoff=false -> onclose() -> 'connection-closed' -> the card
+                            // reconnects (MSE back) and re-probes WebRTC afresh.
                             failWebRTC(`RTC media stalled ${this.RTC_LIVENESS_TIMEOUT}ms after handoff`);
                         }
                     }).catch(() => {});
