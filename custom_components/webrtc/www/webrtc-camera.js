@@ -19,7 +19,7 @@
  * Any attempt to "optimize" by reusing the driver will almost certainly reintroduce leaks.
  */
 
-import {VideoRTC} from './video-rtc.js?v=2.2.16';
+import {VideoRTC} from './video-rtc.js?v=2.2.17';
 import {DigitalPTZ} from './digital-ptz.js?v=3.3.0';
 // [SIDECAR INTEGRATION] Import the Interaction module.
 // This module handles legacy features (Shortcuts, PTZ, Styles) to keep the core driver clean.
@@ -109,7 +109,7 @@ class WebRTCCamera extends HTMLElement {
         this._io = null;           // IntersectionObserver instance
         this._visAbort = null;     // AbortController for the document visibilitychange listener
 
-        console.info('[WebRTC Camera] v14.1.14');
+        console.info('[WebRTC Camera] v14.1.15');
     }
 
     setConfig(config) {
@@ -842,13 +842,21 @@ class WebRTCCamera extends HTMLElement {
 
             this.shadowDriver = newDriver;
 
-            // [SEAMLESS HANDOVER] Watchdog: kill any shadow that has not been PROMOTED
-            // within 15s. A successful promotion nulls this.shadowDriver well before the
-            // timer fires, so a shadow still referenced here is stuck — whether its pc is
-            // 'checking' (UDP blocked by firewall) OR 'connected' but never swapped (video
-            // never produced 'loadeddata', so onpcvideo/handover never ran). The old guard
-            // spared a 'connected' shadow on the assumption the swap was imminent; when it
-            // wasn't, that left a permanent zombie holding a second go2rtc connection.
+            // [SEAMLESS HANDOVER] Backstop watchdog: kill any shadow that has not been
+            // PROMOTED within the driver's first-frame window. A successful promotion nulls
+            // this.shadowDriver well before the timer fires, so a shadow still referenced
+            // here is stuck.
+            //
+            // The DRIVER owns first-frame timing (FIRSTFRAME_TIMEOUT): a 'connected' shadow
+            // must get the SAME window as the main to decode a slow-but-real first frame and
+            // swap (observed to take minutes on repeater paths). A hardcoded short cap here
+            // reaped the shadow long before that frame could arrive — the shadow never got
+            // the window we agreed on. So track the driver's cap and add a small margin, so
+            // the driver's own watchdog is the primary reaper for a 'connected'-but-medialess
+            // shadow; this card timer stays a backstop that ALSO covers the case the driver
+            // can't (pc stuck in ICE 'checking' forever, no 'connected'/'failed' transition,
+            // so the driver's state handler never arms) and drives the reprobe on failure.
+            const shadowCap = (newDriver.FIRSTFRAME_TIMEOUT || 600000) + 5000;
             this._shadowTimeout = setTimeout(() => {
                 if (this.shadowDriver) {
                     console.info('[WebRTC Camera] Shadow timeout – killing unpromoted probe');
@@ -867,7 +875,7 @@ class WebRTCCamera extends HTMLElement {
                     // [RTC RE-PROBE] Probe timed out; schedule the next attempt on backoff.
                     this._scheduleReprobe();
                 }
-            }, 15000);
+            }, shadowCap);
         }
 
         // Apply global mute synchronously.
