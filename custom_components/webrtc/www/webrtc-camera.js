@@ -20,6 +20,12 @@
  *
  * CHANGELOG
  * ---------
+ * v14.2.6 — [SMELL #2/#3] Message-handler role split + _activeMode setter. The driver's
+ *   overloaded rtc_* signals are now hard-dispatched on the receiver's role
+ *   (_onPreSwapShadowMessage vs _onMainMessage) instead of branch-order + a "never fall
+ *   through" convention; also corrects post-swap 'error' routing. All _activeMode writes go
+ *   through _setActiveMode() (single audit point + transition log). No streaming behaviour
+ *   change on either reference net beyond the post-swap error fix. Driver unchanged (v2.3.5).
  * v14.2.5 — Driver RTC refactor (driver v2.3.5), no card behaviour change. Consumes a driver
  *   whose RTC handoff is now an explicit `_rtcPhase` state machine and whose dead legacy
  *   (non-reversible) path was removed. The vestigial `newDriver.reversible = true` assignment
@@ -126,7 +132,7 @@ class WebRTCCamera extends HTMLElement {
         this._io = null;           // IntersectionObserver instance
         this._visAbort = null;     // AbortController for the document visibilitychange listener
 
-        console.info('[WebRTC Camera] v14.2.5');
+        console.info('[WebRTC Camera] v14.2.6');
     }
 
     setConfig(config) {
@@ -282,7 +288,7 @@ class WebRTCCamera extends HTMLElement {
 
         this._cleanupDriver();
         this._streamHealthy = false;
-        this._activeMode = null;
+        this._setActiveMode(null);
         this.setStatus(null, null, 'Paused (off-screen)');
     }
 
@@ -433,7 +439,7 @@ class WebRTCCamera extends HTMLElement {
 
         this.setStatus('RTC', this.config.title || '', 'Seamless connection active via WebRTC (Handover Success)');
         this._streamHealthy = true;
-        this._activeMode = 'rtc';
+        this._setActiveMode('rtc');
         this._stopReprobe();
         this._applyPoster();
 
@@ -444,6 +450,139 @@ class WebRTCCamera extends HTMLElement {
         this.dispatchEvent(new CustomEvent('handover-complete', {
             detail: { mode: 'webrtc', from: 'mse' }
         }));
+    }
+
+    /**
+     * [SMELL #2] Messages from a driver that is CURRENTLY the pre-swap background shadow probe
+     * (`this.shadowDriver === newDriver`). Its rtc_* signals concern its OWN probe WebRTC and
+     * must never touch the live main's state. Once _promoteShadowToMain clears shadowDriver,
+     * this same driver is routed through _onMainMessage instead (it is then the live main).
+     */
+    _onPreSwapShadowMessage(newDriver, msg) {
+        if (msg.type === 'signal') {
+            // [SHADOW-SWAP GATE] The shadow's RTC has now held gaplessly for RTC_SWAP_PROVE_MS —
+            // PROVEN durable. THIS is where we swap it in to replace the MSE main (never at the
+            // 2s promote in onpcvideo). On a throttled path the shadow stalls before this fires,
+            // so we simply never swap and the working MSE main is left untouched.
+            if (msg.value === 'rtc_sustained') {
+                this._promoteShadowToMain(newDriver);
+                return;
+            }
+            // The probe's RTC gave up before proving durable. Don't leave it lingering until the
+            // backstop watchdog (~600s) — reap it now and let the backed-off reprobe loop
+            // schedule the next attempt. rtc_rejected (a quality decision) is stable for this
+            // connection, so stop reprobing; rtc_failed is a transient failure worth retrying.
+            if (msg.value === 'rtc_failed' || msg.value === 'rtc_rejected') {
+                this._nukeDriver(newDriver, 'Unproven Shadow');
+                this.shadowDriver = null;
+                if (this._shadowTimeout) {
+                    clearTimeout(this._shadowTimeout);
+                    this._shadowTimeout = null;
+                }
+                if (msg.value === 'rtc_failed') {
+                    this._scheduleReprobe();
+                } else {
+                    this._stopReprobe();
+                }
+            }
+            return;
+        }
+
+        // A hard driver error on the probe: kill it and retry later on backoff.
+        if (msg.type === 'error') {
+            console.info(`[WebRTC Camera] Shadow Driver Failed: ${msg.value}. Aborting upgrade.`);
+            this._nukeDriver(newDriver, 'Failed Shadow');
+            this.shadowDriver = null;
+            this.setStatus(null, null, `WebRTC Upgrade Failed: ${msg.value}`);
+            this.dispatchEvent(new CustomEvent('shadow-failed', { detail: { error: msg.value } }));
+            this._scheduleReprobe();
+        }
+        // The shadow ignores every other message — it never updates the UI.
+    }
+
+    /**
+     * [SMELL #2] Messages from the LIVE MAIN driver — either a genuine cold-start main or a
+     * shadow that has already swapped in. Owns the visible UI and the main's own reversible RTC
+     * signals. (`newDriver` is accepted for symmetry; the main path is global to the card.)
+     */
+    _onMainMessage(newDriver, msg) {
+        if (msg.type === 'signal') {
+            if (msg.value === 'rtc_sustained') return; // main already committed via its own flow
+            if (msg.value === 'rtc_rejected' || msg.value === 'rtc_failed') {
+                // rtc_rejected: WebRTC negotiated but discarded (quality < MSE).
+                // rtc_failed:   WebRTC could not deliver — ICE failed, the offer was rejected, or
+                //               ICE "connected" but no first frame ever arrived. The driver kept
+                //               the MSE stream alive in all cases.
+                if (this._upgradeTimer) {
+                    clearTimeout(this._upgradeTimer);
+                    this._upgradeTimer = null;
+                }
+
+                const reason = msg.value === 'rtc_failed'
+                    ? 'WebRTC unavailable on this network — staying on MSE'
+                    : 'WebRTC upgrade discarded by driver (Quality < MSE)';
+                console.info(`[WebRTC Camera] ${reason}. Cancelling upgrade.`);
+                this.setStatus(null, null, reason);
+
+                // [RTC RE-PROBE / OPTION 3] rtc_failed means the main's own WebRTC attempt has
+                // actually given up: arm the backed-off loop here. rtc_rejected is a deliberate
+                // quality decision, stable for this connection — re-probing would only be
+                // rejected again, so stop instead.
+                if (msg.value === 'rtc_failed') {
+                    this._setActiveMode('mse');
+                    this._scheduleReprobe();
+                } else {
+                    this._stopReprobe();
+                }
+            }
+            return;
+        }
+
+        // Normal UI logic.
+        switch (msg.type) {
+            case 'error':
+                console.error(`[WebRTC Camera] Main Driver Error: ${msg.value}`);
+                this.setStatus('Error', msg.value);
+                // [RESILIENCE] An unreachable source (e.g. "no route to host") is reported as an
+                // error frame while the socket stays open, so no 'connection-closed' fires. Retry
+                // only if the stream never came up: on an already-healthy stream this is a
+                // non-fatal per-mode error (e.g. a failed webrtc/offer while MSE plays) and must
+                // NOT tear it down — a genuine mid-stream freeze is caught by the no-data watchdog.
+                if (!this._streamHealthy) this._scheduleRetry();
+                break;
+            case 'mse':
+                console.info('[WebRTC Camera] Main Driver negotiated: MSE');
+                this.setStatus(msg.type.toUpperCase(), this.config.title || '', 'Stream via MSE (TCP)');
+                // [OPTION 3] Settle on MSE and do nothing else. The parallel WebRTC attempt from
+                // onopen is still running on this same connection, bounded by the driver's
+                // first-frame watchdog, and will either promote itself (onpcvideo) or emit
+                // rtc_failed. A WebRTC retry is meaningful only once the main's attempt has
+                // failed, so the re-probe loop is armed from rtc_failed, never from an MSE land.
+                this._setActiveMode('mse');
+                if (this._upgradeTimer) { clearTimeout(this._upgradeTimer); this._upgradeTimer = null; }
+            // falls through: MSE shares the tail below (reset _retryCount). The shared block is
+            // guarded by `msg.type !== 'mse'` so the "negotiated" log is skipped for MSE. Do NOT
+            // add a `break` here.
+            case 'hls':
+            case 'mp4':
+            case 'mjpeg':
+            case 'webrtc':
+                if (msg.type !== 'mse') {
+                    console.info(`[WebRTC Camera] Main Driver negotiated: ${msg.type.toUpperCase()}`);
+                    // [PHANTOM FIX] If we upgraded to WebRTC (or anything better than MSE), cancel
+                    // the pending shadow upgrade immediately.
+                    if (this._upgradeTimer) {
+                        console.debug('[WebRTC Camera] Spontaneous upgrade detected. Canceling shadow schedule.');
+                        clearTimeout(this._upgradeTimer);
+                        this._upgradeTimer = null;
+                    }
+                    this.setStatus(msg.type.toUpperCase(), this.config.title || '',
+                        msg.type === 'webrtc' ? 'Connected via WebRTC (Low Latency)' : '');
+                }
+                this._retryCount = 0;
+                this._streamHealthy = true;
+                break;
+        }
     }
 
     _nukeDriver(driverRef, label) {
@@ -530,7 +669,7 @@ class WebRTCCamera extends HTMLElement {
         // [RTC RE-PROBE] The driver is being torn down and cold-restarted; a fresh
         // negotiation re-arms the loop from scratch, so drop the stale backoff now.
         this._stopReprobe();
-        this._activeMode = null;
+        this._setActiveMode(null);
 
         const delay = Math.min(
             1000 * Math.pow(2, this._retryCount),
@@ -595,6 +734,30 @@ class WebRTCCamera extends HTMLElement {
         this._reprobeDelay = 0;
     }
 
+    /**
+     * [SMELL #3] Single write-point for `_activeMode` — the card's advisory cache of the MAIN
+     * driver's negotiated transport ('mse' | 'rtc' | null). Mirrors the driver's _setPhase():
+     * one auditable place, free observability (logs on change).
+     *
+     * WHY a cache and NOT derived from the driver's `_rtcPhase` (deliberate — do not "simplify"):
+     *   - It is read in exactly ONE place that matters — the re-probe gate in _attemptReprobe()
+     *     (`_activeMode !== 'mse'` stops the loop). It answers the CARD's question "should I keep
+     *     probing for an upgrade?", which is NOT the driver's phase:
+     *       • 'mse' deliberately covers BOTH driver phases 'warm' AND 'negotiating' — while the
+     *         main is still attempting its own parallel RTC we keep the loop armed.
+     *       • 'rtc' means the card ACCEPTED an RTC transport (quality gate passed at promote, or a
+     *         proven shadow swapped in) — a card-level decision distinct from `_rtcPhase`.
+     *     Collapsing it into `_rtcPhase` would lose information and change re-probe behaviour.
+     *   See memory `webrtc-fsm-maintainability` (smell #3) and `webrtc-v1425-field-validation`.
+     *
+     * Intentionally a plain cache: no invariant enforcement, just a transition log.
+     */
+    _setActiveMode(mode) {
+        if (this._activeMode === mode) return;
+        console.debug(`[WebRTC Camera] activeMode ${this._activeMode} -> ${mode}`);
+        this._activeMode = mode;
+    }
+
     // [HARD RESET] Manually triggered by refresh button.
     // Cleans everything and restarts from scratch (Cold Start).
     hardReset() {
@@ -605,7 +768,7 @@ class WebRTCCamera extends HTMLElement {
         if (this._upgradeTimer) clearTimeout(this._upgradeTimer);
         if (this._shadowTimeout) clearTimeout(this._shadowTimeout);
         this._stopReprobe(); // [RTC RE-PROBE] reset the loop on manual refresh
-        this._activeMode = null;
+        this._setActiveMode(null);
 
         // 2. Kill drivers
         this._cleanupDriver();
@@ -647,7 +810,7 @@ class WebRTCCamera extends HTMLElement {
             // [RTC RE-PROBE] Fresh connection: drop any stale re-probe loop/backoff so
             // this negotiation starts clean. The loop re-arms once we settle on MSE.
             this._stopReprobe();
-            this._activeMode = null;
+            this._setActiveMode(null);
             this.setStatus('Loading..');
             // UX Spinner: Show immediately to cover Auth/WS handshake latency.
             const spinner = this.shadowRoot.querySelector('.spinner');
@@ -703,163 +866,26 @@ class WebRTCCamera extends HTMLElement {
             newDriver.addEventListener('connection-closed', this._handleConnectionClosed);
         }
 
-        // Driver-to-UI messaging is intentionally minimal.
-        // The driver never touches UI directly.
+        // Driver → UI messaging is intentionally minimal; the driver never touches the UI.
+        //
+        // [SMELL #2 FIX, v14.2.6] The three driver signals (rtc_sustained / rtc_failed /
+        // rtc_rejected) are OVERLOADED — the same name means opposite things for a background
+        // shadow probe vs the live main. This used to be disambiguated inside one handler purely
+        // by branch order plus a fragile "never fall through" convention. We now hard-dispatch on
+        // the receiver's role, so a shadow's message can NEVER be processed as a main's.
+        //
+        // Discriminator = the RUNTIME predicate `this.shadowDriver === newDriver`, NOT the
+        // construction-time `isShadowMode`: a shadow that swaps in keeps its shadow-built closure
+        // but is thereafter the live main (shadowDriver is cleared in _promoteShadowToMain), so
+        // from that point its messages must be handled as a main's. Using the runtime predicate
+        // also corrects a latent case — a post-swap driver emitting an 'error' now takes the main
+        // error path (keep a healthy stream) instead of the shadow path (self-nuke as "Failed
+        // Shadow" without a proper retry).
         newDriver.onmessage = {
-            ui_sync: (msg) => {
-                
-                // [OBSERVABILITY] Handle explicit driver signals (v2.2.11+)
-                // Prevents the card from chasing a WebRTC upgrade that the driver has
-                // already ruled out on this connection.
-                if (msg.type === 'signal') {
-                    // [SEAMLESS HANDOVER] A background shadow (not yet swapped in) is a
-                    // reversible driver too, so it emits rtc_sustained/rtc_failed/rtc_rejected
-                    // for its OWN WebRTC. Those are internal to the probe and must NOT be handled
-                    // as if they were the live main's — so we branch on the pre-swap shadow first
-                    // and never fall through to the main-driver logic below. Once swapped in
-                    // (shadowDriver cleared) its signals are handled normally, like any main.
-                    if (isShadowMode && this.shadowDriver === newDriver) {
-                        // [SHADOW-SWAP GATE] The shadow's RTC has now held gaplessly for
-                        // RTC_SWAP_PROVE_MS — it is PROVEN durable. THIS is where we swap it in
-                        // to replace the MSE main (never at the 2s promote in onpcvideo). On a
-                        // throttled path the shadow stalls before this fires, so we simply never
-                        // swap and the working MSE main is left untouched.
-                        if (msg.value === 'rtc_sustained') {
-                            this._promoteShadowToMain(newDriver);
-                            return;
-                        }
-                        // The probe's RTC gave up before proving durable. Don't leave it lingering
-                        // until the backstop watchdog (~600s) — reap it now and let the backed-off
-                        // reprobe loop schedule the next attempt. rtc_rejected (quality decision)
-                        // is stable for this connection, so stop reprobing; rtc_failed is a
-                        // transient network failure worth retrying later.
-                        if (msg.value === 'rtc_failed' || msg.value === 'rtc_rejected') {
-                            this._nukeDriver(newDriver, 'Unproven Shadow');
-                            this.shadowDriver = null;
-                            if (this._shadowTimeout) {
-                                clearTimeout(this._shadowTimeout);
-                                this._shadowTimeout = null;
-                            }
-                            if (msg.value === 'rtc_failed') {
-                                this._scheduleReprobe();
-                            } else {
-                                this._stopReprobe();
-                            }
-                        }
-                        return;
-                    }
-                    if (msg.value === 'rtc_sustained') return; // main already committed via its own flow
-                    if (msg.value === 'rtc_rejected' || msg.value === 'rtc_failed') {
-                        // rtc_rejected: WebRTC negotiated but discarded (quality < MSE).
-                        // rtc_failed:   WebRTC could not deliver — ICE failed, the offer was
-                        //               rejected, or ICE "connected" but no first frame ever
-                        //               arrived (first-frame watchdog, v2.2.15+). The driver
-                        //               kept the MSE stream alive in all cases.
-                        // Defensively clear any pending shadow-upgrade timer (unused under
-                        // Option 3, kept for safety across config paths).
-                        if (this._upgradeTimer) {
-                            clearTimeout(this._upgradeTimer);
-                            this._upgradeTimer = null;
-                        }
-
-                        const reason = msg.value === 'rtc_failed'
-                            ? 'WebRTC unavailable on this network — staying on MSE'
-                            : 'WebRTC upgrade discarded by driver (Quality < MSE)';
-                        console.info(`[WebRTC Camera] ${reason}. Cancelling upgrade.`);
-                        this.setStatus(null, null, reason);
-
-                        // [RTC RE-PROBE / OPTION 3] rtc_failed means the main's own WebRTC
-                        // attempt has actually given up: this is the ONLY point at which a
-                        // background retry is warranted, so arm the backed-off loop here.
-                        // rtc_rejected is a deliberate *quality* decision, stable for this
-                        // connection — re-probing would only be rejected again, so stop instead.
-                        if (msg.value === 'rtc_failed') {
-                            this._activeMode = 'mse';
-                            this._scheduleReprobe();
-                        } else {
-                            this._stopReprobe();
-                        }
-                    }
-                    return;
-                }
-
-                // [SEAMLESS HANDOVER] Shadow Driver logic
-                if (isShadowMode) {
-                    if (msg.type === 'error') {
-                        console.info(`[WebRTC Camera] Shadow Driver Failed: ${msg.value}. Aborting upgrade.`);
-                        this._nukeDriver(newDriver, 'Failed Shadow'); // Kill shadow
-                        this.shadowDriver = null;
-                        
-                        // [DIAGNOSTICS] Update tooltip to reflect failure
-                        this.setStatus(null, null, `WebRTC Upgrade Failed: ${msg.value}`);
-                        
-                        // [SEAMLESS HANDOVER] Notify failure for telemetry/debug
-                        this.dispatchEvent(new CustomEvent('shadow-failed', {
-                            detail: { error: msg.value }
-                        }));
-
-                        // [RTC RE-PROBE] This probe failed; try again later on backoff.
-                        this._scheduleReprobe();
-                    }
-                    // Shadow driver ignores all other messages (it doesn't update UI)
-                    return;
-                }
-                
-                // Normal UI Logic (Main Driver)
-                switch (msg.type) {
-                    case 'error':
-                        console.error(`[WebRTC Camera] Main Driver Error: ${msg.value}`);
-                        this.setStatus('Error', msg.value);
-                        // [RESILIENCE] When the source is unreachable (e.g. "no route to
-                        // host", "context deadline exceeded") go2rtc reports it as an error
-                        // frame while the socket stays open, so no 'connection-closed' ever
-                        // fires. Retry only if the stream never came up: on an already-healthy
-                        // stream this is a non-fatal per-mode error (e.g. a failed webrtc/offer
-                        // while MSE plays) and must NOT tear it down — a genuine mid-stream
-                        // freeze is caught by the driver's no-data watchdog instead.
-                        if (!this._streamHealthy) this._scheduleRetry();
-                        break;
-                    case 'mse':
-                        console.info('[WebRTC Camera] Main Driver negotiated: MSE');
-                        this.setStatus(msg.type.toUpperCase(), this.config.title || '', 'Stream via MSE (TCP)');
-
-                        // [OPTION 3] Settle on MSE and do nothing else. The parallel WebRTC
-                        // attempt started at onopen is still running on this same connection —
-                        // uncapped, but now bounded by the driver's first-frame watchdog — and
-                        // will either promote itself (onpcvideo) or emit rtc_failed. Firing a
-                        // shadow now would only race a still-trying main and lose (proven: every
-                        // such shadow connected ICE in <500ms yet 0/12 ever got a frame before
-                        // being reaped). A WebRTC retry is meaningful ONLY once the main's attempt
-                        // has actually failed, so the re-probe loop is armed from the rtc_failed
-                        // signal (see the 'signal' handler above), never from a plain MSE landing.
-                        this._activeMode = 'mse';
-                        if (this._upgradeTimer) { clearTimeout(this._upgradeTimer); this._upgradeTimer = null; }
-                    // falls through: MSE shares the tail below (reset _retryCount).
-                    // The shared block is guarded by `msg.type !== 'mse'` so the "negotiated"
-                    // log is skipped for MSE. Do NOT add a `break` here.
-                    case 'hls':
-                    case 'mp4':
-                    case 'mjpeg':
-                    case 'webrtc':
-                        if (msg.type !== 'mse') {
-                            console.info(`[WebRTC Camera] Main Driver negotiated: ${msg.type.toUpperCase()}`);
-                            
-                            // [PHANTOM FIX] If we upgraded to WebRTC (or anything better than MSE), 
-                            // CANCEL the pending shadow upgrade immediately.
-                            if (this._upgradeTimer) {
-                                console.debug('[WebRTC Camera] Spontaneous upgrade detected. Canceling shadow schedule.');
-                                clearTimeout(this._upgradeTimer);
-                                this._upgradeTimer = null;
-                            }
-                            
-                            this.setStatus(msg.type.toUpperCase(), this.config.title || '',
-                                msg.type === 'webrtc' ? 'Connected via WebRTC (Low Latency)' : '');
-                        }
-                        this._retryCount = 0;
-                        this._streamHealthy = true;
-                        break;
-                }
-            }
+            ui_sync: (msg) =>
+                this.shadowDriver === newDriver
+                    ? this._onPreSwapShadowMessage(newDriver, msg)
+                    : this._onMainMessage(newDriver, msg),
         };
 
         // WebRTC success resets retry logic and updates UI.
@@ -908,7 +934,7 @@ class WebRTCCamera extends HTMLElement {
                     this.shadowDriver = null;
                 }
                 // [RTC RE-PROBE] Already on WebRTC — no periodic upgrade needed.
-                this._activeMode = 'rtc';
+                this._setActiveMode('rtc');
                 this._stopReprobe();
                 this._applyPoster();
             }

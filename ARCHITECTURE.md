@@ -3,7 +3,7 @@
 > Fork of AlexxIT/WebRTC. go2rtc streaming engine. HA custom integration.
 > This file is the **authoritative map** of what the code actually does. Consult it
 > instead of re-reading the large JS files; **keep it in sync** on every change.
-> Anchors (`file:line`) current as of **card v14.2.5 / driver v2.3.5**.
+> Anchors (`file:line`) current as of **card v14.2.6 / driver v2.3.5**.
 
 ## 1. File map
 
@@ -15,7 +15,7 @@
 | `media_player.py` | 99 | Chromecast/media_player entity (dash_cast target). Peripheral. |
 | `config_flow.py` | 106 | Config entry UI. Peripheral. |
 | `www/video-rtc.js` | 1243 | **The driver** (`<video-rtc>`). Dumb, disposable. Owns ONE WebSocket + ONE PeerConnection. MSE/WebRTC/HLS/MJPEG. Runs the **reversible** RTC handoff. |
-| `www/webrtc-camera.js` | 1433 | **The card** (`<webrtc-camera>`). Owns driver lifecycle, main+shadow orchestration, retry/upgrade state machine, UI. |
+| `www/webrtc-camera.js` | 1475 | **The card** (`<webrtc-camera>`). Owns driver lifecycle, main+shadow orchestration, retry/upgrade state machine, UI. |
 | `www/ui-interaction.js` | 426 | Sidecar: shortcuts, PTZ buttons, style templates. |
 | `www/digital-ptz.js` | 493 | Pinch/pan digital PTZ. |
 
@@ -130,7 +130,13 @@ priority gate, and socket handoff all live in `_startReversibleRTC`/`commit()`.
   (the driver's only RTC path since v2.3.5 — there is no per-driver flag).
 
 ### Key state fields
-- `_activeMode` : `'mse' | 'rtc' | null` — last negotiated MAIN transport.
+- `_activeMode` : `'mse' | 'rtc' | null` — last **accepted** MAIN transport (advisory cache).
+  Written ONLY via `_setActiveMode()` (`:755`, v14.2.6, mirrors the driver's `_setPhase` — logs
+  every change). Read in ONE place that matters: the re-probe gate `_attemptReprobe` (`:715`,
+  `_activeMode !== 'mse'` stops the loop). Deliberately NOT derived from the driver's `_rtcPhase`:
+  `'mse'` covers driver phases `warm` AND `negotiating` (keep probing while the main tries RTC),
+  and `'rtc'` is a card-level "quality gate passed / proven shadow swapped in" decision. See the
+  `_setActiveMode` docblock + memory `webrtc-fsm-maintainability` smell #3.
 - `_isReconnecting`, `_retryCount`, `_retryTimer` — cold-restart backoff.
 - `_streamHealthy` — a media mode came up (distinguishes fatal vs per-mode error).
 - `_shadowAttempts` (`:85`) — fast-upgrade counter.
@@ -149,24 +155,38 @@ priority gate, and socket handoff all live in `_startReversibleRTC`/`commit()`.
   `this.shadowDriver = newDriver` (`:926`), backstop `_shadowTimeout = FIRSTFRAME_TIMEOUT+5000`
   (~605s) (`:942/961`).
 
-### `onmessage.ui_sync` handler (`:695`)
-Signal frames (`msg.type === 'signal'`):
-- **Pre-swap shadow** (`isShadowMode && shadowDriver === newDriver`, `:705`):
-  - `rtc_sustained` → **`_promoteShadowToMain(newDriver)`** (`:711`) — THE swap point.
-  - `rtc_failed`/`rtc_rejected` → **nuke shadow + reschedule/stop reprobe** (`:718`) (no lingering
-    to the backstop). Everything else swallowed.
-- Non-shadow `rtc_sustained` → no-op (`:730`) (main already committed via its own flow).
-- Main `rtc_failed` → `_activeMode='mse'` + `_scheduleReprobe()`; `rtc_rejected` → `_stopReprobe()`.
+### `onmessage.ui_sync` handler — role-dispatched (`:885`, v14.2.6)
+The driver's three signals (`rtc_sustained`/`rtc_failed`/`rtc_rejected`) are **overloaded** — the
+same name means opposite things for a background shadow vs the live main. Instead of one handler
+disambiguating by branch order + a "never fall through" convention (smell #2), the card now
+**hard-dispatches up front** on the RUNTIME predicate `this.shadowDriver === newDriver` (NOT the
+frozen `isShadowMode`, so a swapped-in shadow is correctly handled as a main):
+```
+ui_sync(msg) = (this.shadowDriver === newDriver)
+                 ? _onPreSwapShadowMessage(newDriver, msg)   // :461
+                 : _onMainMessage(newDriver, msg)            // :508
+```
+- **`_onPreSwapShadowMessage` (`:461`)** — probe-local signals + errors:
+  - `rtc_sustained` → **`_promoteShadowToMain(newDriver)`** (`:468`) — THE swap point.
+  - `rtc_failed`/`rtc_rejected` → nuke shadow + reschedule/stop reprobe (no lingering to backstop).
+  - `error` → nuke `Failed Shadow` + `shadow-failed` event + reprobe. Everything else swallowed.
+- **`_onMainMessage` (`:508`)** — the live main (genuine or swapped-in shadow):
+  - `rtc_sustained` → no-op (main already committed via its own flow).
+  - `rtc_failed` → `_setActiveMode('mse')` + `_scheduleReprobe()`; `rtc_rejected` → `_stopReprobe()`.
+  - non-signal `switch(msg.type)`: `error` (retry only if `!_streamHealthy`), `mse`
+    (`_setActiveMode('mse')`), `hls/mp4/mjpeg/webrtc` (mark healthy, reset retry).
+  - **Behaviour delta vs ≤v14.2.5**: a post-swap driver emitting `error` now takes THIS main path
+    (keep a healthy stream) instead of the old shadow-error path (self-nuke without proper retry).
 
-### `onpcvideo` wrapper
-- **Pre-swap shadow PROMOTE is a no-op `return`** (`:873`) — the 2s promote no longer swaps.
-- Direct main RTC (main negotiated on its own) → `_activeMode='rtc'` (`:895`), etc.
+### `onpcvideo` wrapper (`:906`)
+- **Pre-swap shadow PROMOTE is a no-op `return`** (`:911`) — the 2s promote no longer swaps.
+- Direct main RTC (main negotiated on its own) → `_setActiveMode('rtc')` (`:937`), etc.
 
-### `_promoteShadowToMain(newDriver)` (`:368`) — the PROVEN swap
+### `_promoteShadowToMain(newDriver)` (`:382`) — the PROVEN swap
 Fired only on `rtc_sustained` (RTC held gaplessly ≥ `RTC_SWAP_PROVE_MS`): stop `_shadowTimeout`,
-`_nukeDriver(this.driver,'Old Main (MSE)')` (`:382`), promote shadow, re-attach `connection-closed`
-(`:397`), `applyAudio` (`:404`), reveal (clear inline styles + `appendChild` `:419`),
-`_streamHealthy=true` / `_activeMode='rtc'` (`:427-428`), `_stopReprobe()` (`:429`), `setupTools()`,
+`_nukeDriver(this.driver,'Old Main (MSE)')` (`:390`), promote shadow, re-attach `connection-closed`
+(`:405`), `applyAudio` (`:411`), reveal (clear inline styles + `appendChild` `:427`),
+`_streamHealthy=true` / `_setActiveMode('rtc')` (`:435-442`), `_stopReprobe()` (`:437`), `setupTools()`,
 dispatch `handover-complete` (`:436`).
 
 ### Three MSE→WebRTC upgrade mechanisms (coexist)
