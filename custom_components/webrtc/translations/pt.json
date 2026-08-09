@@ -31,6 +31,9 @@
     "sensor": {
       "proxied_connections": {
         "name": "Ligações Proxy"
+      },
+      "shadow_probes": {
+        "name": "Sondas Shadow"
       }
     }
   },

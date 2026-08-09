@@ -27,6 +27,16 @@
       }
     }
   },
+  "entity": {
+    "sensor": {
+      "proxied_connections": {
+        "name": "Proxied Connections"
+      },
+      "shadow_probes": {
+        "name": "Shadow Probes"
+      }
+    }
+  },
   "services": {
     "create_link": {
       "name": "Create Link",

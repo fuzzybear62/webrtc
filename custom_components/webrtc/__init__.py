@@ -49,8 +49,12 @@ DASH_CAST_SCHEMA = vol.Schema(
 )
 
 LINKS = {}
-# Tracks details of every active connection (exposed via the sensor platform)
-SESSIONS = {}
+# Active proxy connections, split by role (both exposed via the sensor platform):
+#   CLIENT_SESSIONS = real viewer streams (main drivers) — media proxied over the ws.
+#   SHADOW_SESSIONS = background WebRTC upgrade probes (shadow drivers) — signalling only.
+# A camera on WebRTC contributes 0 to either (its ws is handed off; media is P2P).
+CLIENT_SESSIONS = {}
+SHADOW_SESSIONS = {}
 
 HLS_COOKIE = "webrtc-hls-session"
 HLS_SESSION = str(uuid.uuid4())
@@ -214,6 +218,10 @@ class WebSocketView(HomeAssistantView):
         params = request.query
         # [TRACE] Capture client_id from JS for logging correlation
         client_id = params.get("client_id", "unknown")
+        # Role marks upgrade probes ("shadow") vs real viewer streams (everything else).
+        # Signalling-only shadow drivers must be counted separately from real clients.
+        is_shadow = request.query.get("role") == "shadow"
+        registry = SHADOW_SESSIONS if is_shadow else CLIENT_SESSIONS
         _LOGGER.debug(f"[{client_id}] New client connection request: {dict(params)}")
 
         if request.query.get("embed"):
@@ -269,8 +277,8 @@ class WebSocketView(HomeAssistantView):
 
             handshake_ms = (time.perf_counter() - t_start) * 1000
             
-            # Register Session
-            SESSIONS[session_id] = {
+            # Register Session in the role-appropriate registry
+            registry[session_id] = {
                 "client_id": client_id, # Store for sensor inspection
                 "entity_id": params.get("entity") or params.get("url"),
                 "client_ip": remote_ip,
@@ -282,7 +290,9 @@ class WebSocketView(HomeAssistantView):
             async_dispatcher_send(hass, "webrtc_sessions_updated")
 
             _LOGGER.info(
-                f"[{client_id}] Client: {remote_ip} | Handshake: {handshake_ms:.2f}ms | Active Streams: {len(SESSIONS)}"
+                f"[{client_id}] {'Shadow' if is_shadow else 'Client'}: {remote_ip} | "
+                f"Handshake: {handshake_ms:.2f}ms | "
+                f"Clients: {len(CLIENT_SESSIONS)} Shadows: {len(SHADOW_SESSIONS)}"
             )
 
             async with async_get_clientsession(hass).ws_connect(
@@ -324,13 +334,14 @@ class WebSocketView(HomeAssistantView):
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
 
-            if session_id in SESSIONS:
-                SESSIONS.pop(session_id)
+            if session_id in registry:
+                registry.pop(session_id)
                 # Notify sensor to update
                 async_dispatcher_send(hass, "webrtc_sessions_updated")
 
             _LOGGER.info(
-                f"[{client_id}] Stream ended. Active Streams remaining: {len(SESSIONS)}"
+                f"[{client_id}] {'Shadow' if is_shadow else 'Stream'} ended. "
+                f"Remaining — Clients: {len(CLIENT_SESSIONS)} Shadows: {len(SHADOW_SESSIONS)}"
             )
 
         return ws_server
