@@ -3,7 +3,7 @@
 > Fork of AlexxIT/WebRTC. go2rtc streaming engine. HA custom integration.
 > This file is the **authoritative map** of what the code actually does. Consult it
 > instead of re-reading the large JS files; **keep it in sync** on every change.
-> Anchors (`file:line`) current as of **card v14.2.3 / driver v2.3.3**.
+> Anchors (`file:line`) current as of **card v14.2.5 / driver v2.3.5**.
 
 ## 1. File map
 
@@ -64,40 +64,57 @@ under `shadow_probes` (not `proxied_connections`) until that ws commits/closes. 
 RTC-active sensor** — that feature was analysed (client-reported state vs dedicated idle ws)
 and **deferred** on 2026-08-09.
 
-## 3. Driver (`video-rtc.js`) — one ws, one pc, REVERSIBLE handoff
+## 3. Driver (`video-rtc.js`) — one ws, one pc, REVERSIBLE handoff (explicit phase machine, v2.3.5)
 
-Default `this.mode = 'webrtc,mse,hls,mjpeg'` (`:217`); `this.reversible = false` by default
-(`:170`) — the **card sets `reversible = true` on EVERY driver** (`webrtc-camera.js:672`).
+Default `this.mode = 'webrtc,mse,hls,mjpeg'`. The RTC handoff is the driver's **only** RTC path
+(the legacy non-reversible branch and the `reversible` flag were removed in v2.3.5). It is an
+**explicit 4-state machine** on `this._rtcPhase`, every edge routed through `_setPhase()` (`:979`,
+logs the transition):
 
-- `set src` → `onconnect()` (`:362`) opens the ws (bails if `this.ws || this.pc`).
-- `onopen()` (`:475`): parses `this.mode`. **MSE and WebRTC start in PARALLEL** — `onmse()`
-  (`:506`) and `onwebrtc()` (`:517`) on the same ws.
-- `onmse()` (`:581`): binary chunks → SourceBuffer. Keeps last 5s, catch-up playbackRate,
+| `_rtcPhase` | meaning | set at |
+|---|---|---|
+| `'warm'` | no RTC overlay, MSE only (initial + after revert) | ctor + `_revertToWarmMSE` (`:1014`) |
+| `'negotiating'` | overlay decoding, hidden (opacity 0), MSE warm — REVERSIBLE | `_startReversibleRTC` (`:841`) |
+| `'promoted'` | overlay revealed, MSE still warm — REVERSIBLE | `promote()` (`:873`) |
+| `'committed'` | overlay collapsed onto `this.video`, MSE released, ws closed — IRREVERSIBLE | `commit()` (`:895`) |
+
+Legal edges: `warm→negotiating→promoted→committed`, plus `negotiating/promoted→warm` (revert).
+`onpcvideo()` is now a **no-op stub** (`:1058`) the card wraps for its UI update — the reveal,
+priority gate, and socket handoff all live in `_startReversibleRTC`/`commit()`.
+
+- `set src` → `onconnect()` (`:382`) opens the ws (bails if `this.ws || this.pc`).
+- `onopen()` (`:495`): parses `this.mode`. **MSE and WebRTC start in PARALLEL** — `onmse()`
+  and `onwebrtc()` on the same ws.
+- `onmse()` (`:601`): binary chunks → SourceBuffer. Keeps last 5s, catch-up playbackRate,
   2MB staging buffer with overflow guard.
-- `onwebrtc()` (`:679`): builds `pc`, sends offer over the ws. On `connectionstatechange`
-  `failed`/`disconnected`: **if `reversible && _rtcVideo && !_committed` → `_revertToWarmMSE()`**
-  (`:702`); else `failWebRTC` (`:727`) drops only the pc, keeps MSE, emits `rtc_failed`.
-- `onpcvideo(video2)` (`:789`, quality gate): `rtcPriority` (H265/H264 + audio) vs `msePriority`.
-  - accept + **`reversible` → `_startReversibleRTC(pc, …)`** (`:754`) and return.
-  - accept + non-reversible (legacy/shadow path) → irreversible switch (`:759`+).
-  - reject → emit `rtc_rejected`, close pc, keep MSE.
-- **`_startReversibleRTC(pc, pcStart, failWebRTC)` (`:882`)** — the core of the reversible flow:
-  - RTC decodes on an **overlaid `_rtcVideo`** (rendered, opacity 0), MSE stays warm on `this.video`.
-  - **PROMOTE** at `RTC_PROMOTE_MS = 2000` (`:178`): reveal overlay (opacity→1); reversible.
-    Calls `this.onpcvideo(rtcVideo)` (`:955`).
-  - **`rtc_sustained`** at `RTC_SWAP_PROVE_MS = 20000` (`:200`): once RTC has decoded
-    **gaplessly** for this window, emit a **one-shot** `ui_sync {signal:'rtc_sustained'}`
-    (guarded by `_sustainedSignaled`). This is the **shadow-swap gate** (see §4).
-  - **`rtc_sustained` / swap gate** `RTC_SWAP_PROVE_MS = 30000` (`:200`, v2.3.4, was 20000).
-  - **first-frame backstop** `FIRSTFRAME_TIMEOUT = 120000` (`:141`, v2.3.4, was 600000): a pc
+- `onwebrtc()` (`:699`): builds `pc`, sends offer over the ws. On `connectionstatechange`
+  `connected` → `_startReversibleRTC()` (no legacy branch any more). `failWebRTC` (the shared
+  reaper): **if `_rtcVideo && _rtcPhase !== 'committed'` → `_revertToWarmMSE()`** (`:711`); else
+  drops only the pc, keeps MSE, emits `rtc_failed`.
+- `onpcvideo()` (`:1077`): **no-op stub** — the quality gate + reveal + handoff moved into the
+  phase machine below; the card wraps this only for its UI update.
+- **`_startReversibleRTC(pc, pcStart, failWebRTC)` (`:824`)** — the whole reversible flow; a poll
+  (`_firstFramePoll`, 500ms) drives the phase transitions:
+  - enters **`negotiating`** (`:841`): RTC decodes on an **overlaid `_rtcVideo`** (rendered,
+    opacity 0), MSE stays warm on `this.video`.
+  - **`promote()` (`:858`)** → phase **`promoted`** (`:873`) at `RTC_PROMOTE_MS = 2000` (`:196`):
+    the **quality gate** lives here (`rtcPriority` H265/H264+audio vs `msePriority`); if RTC <
+    MSE it emits `rtc_rejected` and stays on MSE, else reveal overlay (opacity→1) and call
+    `this.onpcvideo(rtcVideo)` for the card's UI.
+  - **`rtc_sustained`** at `RTC_SWAP_PROVE_MS = 30000` (`:221`, v2.3.4, was 20000): once RTC has
+    decoded **gaplessly** for this window, emit a **one-shot** `ui_sync {signal:'rtc_sustained'}`
+    (`:948`, guarded by `_sustainedSignaled`). This is the **shadow-swap gate** (see §4).
+  - **first-frame backstop** `FIRSTFRAME_TIMEOUT = 120000` (`:161`, v2.3.4, was 600000): a pc
     `connected` but decoding no frame is reaped after this and reverts to warm MSE.
   - Both knobs overridable per-card via YAML `rtc_swap_prove_ms` / `firstframe_timeout` (ms),
-    injected in the card's `startStream()` (`webrtc-camera.js:674`).
-  - **COMMIT** at `RTC_COMMIT_MS = 180000` (`:188`): path proven; collapse overlay onto
-    `this.video`, release MSE, close ws. **Only irreversible step.** Any decode gap >
-    `RTC_STALL_RESET` pushes `_stableSince` forward, so bursty cams never commit.
-- `_revertToWarmMSE(why)`: drop the overlay (MSE already on screen), emit
-  `ui_sync {signal:'rtc_failed'}`. No black frame.
+    injected in the card's `startStream()` (`webrtc-camera.js:680-683`).
+  - **`commit()` (`:902`)** → phase **`committed`** (`:895`) at `RTC_COMMIT_MS = 180000` (`:206`):
+    path proven; collapse overlay onto `this.video`, release MSE, close ws. **Only irreversible
+    edge.** Any decode gap > `RTC_STALL_RESET` pushes `_stableSince` forward, so bursty cams
+    never commit.
+- `_revertToWarmMSE(why)` (`:1018`): drop the overlay (MSE already on screen), phase → **`warm`**,
+  emit `ui_sync {signal:'rtc_failed'}`. No black frame.
+- `_setPhase(next)` (`:979`): the single phase-transition point; logs every edge.
 - `applyAudio(muted)`: routes mute to the on-screen element (RTC overlay while promoted, else
   `this.video`). Called by the card after a swap.
 - `onclose()` (`:541`): re-entrancy-guarded; closes ws; dispatches `connection-closed`.
@@ -109,7 +126,8 @@ Default `this.mode = 'webrtc,mse,hls,mjpeg'` (`:217`); `this.reversible = false`
 
 ### Drivers
 - `this.driver` = main (visible). `this.shadowDriver` = ephemeral upgrade probe.
-- **Each driver = its own ws = its own session.** Both drivers are `reversible = true`.
+- **Each driver = its own ws = its own session.** Both run the reversible RTC phase machine
+  (the driver's only RTC path since v2.3.5 — there is no per-driver flag).
 
 ### Key state fields
 - `_activeMode` : `'mse' | 'rtc' | null` — last negotiated MAIN transport.
@@ -123,8 +141,8 @@ Default `this.mode = 'webrtc,mse,hls,mjpeg'` (`:217`); `this.reversible = false`
 
 ### `startStream()` (`:621`)
 - `isShadowMode = !!this.driver && !this._isReconnecting` (`:634`).
-- `effectiveConfig = {...config, ...currentStream}` (`:629`); `newDriver.mode = effectiveConfig.mode`
-  (`:670`); **`newDriver.reversible = true` (`:672`)**.
+- `effectiveConfig = {...config, ...currentStream}`; `newDriver.mode = effectiveConfig.mode`
+  (`:674`). (No `reversible` flag any more — the driver's only RTC path is reversible.)
 - Main path: append visible, wire `connection-closed` → retry.
 - Shadow path: append **hidden** (`position:absolute; width:1px; opacity:0` `:918-921` — never
   `display:none`, which suspends decode), ws gets `&role=shadow` (`:1098`),
