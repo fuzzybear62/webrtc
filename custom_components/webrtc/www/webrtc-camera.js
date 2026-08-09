@@ -19,7 +19,7 @@
  * Any attempt to "optimize" by reusing the driver will almost certainly reintroduce leaks.
  */
 
-import {VideoRTC} from './video-rtc.js?v=2.3.1';
+import {VideoRTC} from './video-rtc.js?v=2.3.2';
 import {DigitalPTZ} from './digital-ptz.js?v=3.3.0';
 // [SIDECAR INTEGRATION] Import the Interaction module.
 // This module handles legacy features (Shortcuts, PTZ, Styles) to keep the core driver clean.
@@ -109,7 +109,7 @@ class WebRTCCamera extends HTMLElement {
         this._io = null;           // IntersectionObserver instance
         this._visAbort = null;     // AbortController for the document visibilitychange listener
 
-        console.info('[WebRTC Camera] v14.2.1');
+        console.info('[WebRTC Camera] v14.2.2');
     }
 
     setConfig(config) {
@@ -567,17 +567,17 @@ class WebRTCCamera extends HTMLElement {
         // Create a fresh driver instance.
         // The driver owns all media/network state.
         const newDriver = document.createElement('video-rtc');
-        // [SEAMLESS HANDOVER] The shadow probe negotiates WebRTC only: it must stay a
-        // lightweight upgrade probe, not a second full stream. Running the full mode set
-        // would open a redundant parallel MSE stream (doubling bandwidth) and would make
-        // the shadow re-arm the MSE auto-upgrade scheduler, killing its own in-flight probe.
-        newDriver.mode = isShadowMode ? 'webrtc' : effectiveConfig.mode;
+        // [REVERSIBLE HANDOFF] Every driver — cold main AND background shadow — now negotiates
+        // the full webrtc+mse set and promotes WebRTC REVERSIBLY (keeps its own MSE warm on a
+        // 2nd <video>, snaps back on an RTC stall). This makes the shadow a self-protecting
+        // driver: when it promotes we swap it in and, if its RTC later stalls, it reverts to
+        // ITS OWN warm MSE instead of freezing black. The old webrtc-only shadow, once swapped
+        // in, had no MSE fallback and no connection-closed listener, so a stall on a flaky
+        // network left it frozen. The extra background MSE stream is acceptable (LAN-side; the
+        // constrained camera->go2rtc path carries one feed regardless).
+        newDriver.mode = effectiveConfig.mode;
         newDriver.media = effectiveConfig.media;
-
-        // [REVERSIBLE HANDOFF] Only the main parallel driver keeps MSE warm and promotes
-        // WebRTC reversibly. Shadow probes stay on the legacy prove-before-commit path: the
-        // card swaps whole drivers on shadow success, so warm-MSE-in-driver does not apply.
-        newDriver.reversible = !isShadowMode;
+        newDriver.reversible = true;
 
         // Network strict mode propagates directly to the driver.
         newDriver.strictMode =
@@ -604,6 +604,14 @@ class WebRTCCamera extends HTMLElement {
                 // Prevents the card from chasing a WebRTC upgrade that the driver has
                 // already ruled out on this connection.
                 if (msg.type === 'signal') {
+                    // [SEAMLESS HANDOVER] A background shadow (not yet swapped in) is a
+                    // reversible driver too, so it emits rtc_failed/rtc_rejected when its own
+                    // WebRTC reverts to its warm MSE. Those are internal to the probe and must
+                    // NOT disturb the live main's UI/state — its PROMOTE drives the swap via
+                    // onpcvideo, and a probe that never promotes is reaped by the backstop
+                    // watchdog. Once swapped in (shadowDriver cleared) its signals are handled
+                    // normally below, exactly like any main driver.
+                    if (isShadowMode && this.shadowDriver === newDriver) return;
                     if (msg.value === 'rtc_rejected' || msg.value === 'rtc_failed') {
                         // rtc_rejected: WebRTC negotiated but discarded (quality < MSE).
                         // rtc_failed:   WebRTC could not deliver — ICE failed, the offer was
@@ -733,28 +741,47 @@ class WebRTCCamera extends HTMLElement {
                     this._upgradeTimer = null;
                 }
 
-                // [SEAMLESS HANDOVER] The Swap!
-                if (isShadowMode) {
+                // [SEAMLESS HANDOVER] The Swap! Guarded on identity so a stray second
+                // onpcvideo (post-swap) can never re-enter and nuke the new main as if it
+                // were the old one.
+                if (isShadowMode && this.shadowDriver === newDriver) {
                     console.info('[WebRTC Camera] Shadow Driver negotiated WebRTC! SWAPPING DRIVERS NOW.');
-                    
+
                     // [CRITICAL] Stop the watchdog timer immediately.
                     if (this._shadowTimeout) {
                         clearTimeout(this._shadowTimeout);
                         this._shadowTimeout = null;
                     }
 
-                    // 1. Kill old MSE driver
+                    // 1. Kill old MSE driver. Safe even though the shadow only PROMOTED (RTC
+                    // reversible, not yet committed): the shadow carries its OWN warm MSE, so if
+                    // its RTC stalls it reverts to that, never to a black screen.
                     if (this.driver) this._nukeDriver(this.driver, 'Old Main (MSE)');
-                    
+
                     // 2. Promote Shadow to Main
                     this.driver = newDriver;
                     this.shadowDriver = null;
                     this._shadowAttempts = 0; // Reset counter on success
 
-                    // [AUDIO] The shadow was force-muted for background negotiation.
-                    // Restore the user's configured audio state now that it is the main driver,
-                    // otherwise streams with sound would stay silent after every handover.
-                    if (newDriver.video && !this.config.muted) {
+                    // [RESILIENCE] Now that the shadow is the live main, wire its connection-
+                    // closed to the global retry. Pre-swap shadows deliberately have no such
+                    // listener (they must fail silently); without re-attaching it here a genuine
+                    // ws death after the swap would go unhandled (the old webrtc-only shadow
+                    // froze black in exactly this gap).
+                    this._handleConnectionClosed = () => {
+                        console.warn('[WebRTC Camera] Main Driver Connection Closed');
+                        this._scheduleRetry();
+                    };
+                    newDriver.addEventListener('connection-closed', this._handleConnectionClosed);
+
+                    // [AUDIO] The shadow was force-muted for background negotiation. Restore the
+                    // configured audio state via the driver, which routes it to the correct
+                    // element (the RTC overlay while promoted, the MSE element once committed) —
+                    // unmuting newDriver.video directly would play the hidden warm MSE's audio
+                    // under the RTC video and desync it.
+                    if (typeof newDriver.applyAudio === 'function') {
+                        newDriver.applyAudio(!!this.config.muted);
+                    } else if (newDriver.video && !this.config.muted) {
                         newDriver.video.muted = false;
                     }
                     
