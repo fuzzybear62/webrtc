@@ -1,5 +1,12 @@
 /**
- * VideoRTC v2.3.2 - Resilience & cleanup
+ * VideoRTC v2.3.3 - Resilience & cleanup
+ * * Changelog v2.3.3:
+ * - ADD: RTC_SWAP_PROVE_MS (~20s) + one-shot `rtc_sustained` signal. After PROMOTE, once RTC
+ * has decoded gaplessly for RTC_SWAP_PROVE_MS the driver emits ui_sync {signal:'rtc_sustained'}
+ * exactly once. This is the SHADOW-SWAP gate: the card swaps a background shadow in to replace
+ * the MSE main ONLY on this proven-durable signal, never on the 2s PROMOTE. A shadow that
+ * stalls before proving (throttled path) never fires it, so the working MSE main is never
+ * torn down for an unproven replacement (kills the black-tile + swap-churn failure mode).
  * * Changelog v2.3.2:
  * - FIX: the shadow-swap upgrade path was still the legacy IRREVERSIBLE mechanism and the
  * remaining crash vector. The card now makes EVERY driver reversible (webrtc+mse), so a
@@ -182,10 +189,20 @@ export class VideoRTC extends HTMLElement {
         // A decode gap longer than this (but shorter than RTC_LIVENESS_TIMEOUT) counts as
         // instability and restarts the commit stability clock without reverting. Tunable.
         this.RTC_STALL_RESET = 2000;
+        // GAPLESS liveness after promotion before we emit a one-shot `rtc_sustained` signal.
+        // This is the SHADOW-SWAP gate: the card keeps the old (proven) main visible and only
+        // swaps a background shadow in AFTER the shadow's RTC has held gaplessly this long — so
+        // a shadow that promotes at 2s but stalls (bursty/throttled path) NEVER triggers a swap,
+        // and the working MSE main is never destroyed for an unproven replacement. Deliberately
+        // set a few seconds beyond RTC_LIVENESS_TIMEOUT (15s) so surviving it is real evidence
+        // the path is better than the reverted main, while staying far below the full 180s
+        // commit so a genuinely good upgrade still lands quickly. Tunable.
+        this.RTC_SWAP_PROVE_MS = 20000;
 
         this._promoted = false;    // true once the RTC overlay is revealed (reversible flow)
         this._lastLiveness = 0;    // Date.now() of the last framesDecoded advance
         this._stableSince = 0;     // start of the current gapless run (drives the commit clock)
+        this._sustainedSignaled = false; // guards the one-shot rtc_sustained (shadow-swap) signal
 
         // List of supported codecs to announce to the server
         this.CODECS = [
@@ -892,6 +909,7 @@ export class VideoRTC extends HTMLElement {
 
         this._promoted = false;
         this._committed = false;
+        this._sustainedSignaled = false;
         let lastDecoded = -1;
         let flowingMs = 0;
 
@@ -978,11 +996,22 @@ export class VideoRTC extends HTMLElement {
                     }
                 } else if (advanced) {
                     this._lastLiveness = Date.now();
+                    const gapless = Date.now() - this._stableSince;
+                    // [SHADOW-SWAP GATE] Once RTC has held gaplessly for RTC_SWAP_PROVE_MS, emit
+                    // a one-shot rtc_sustained. For a background shadow the card swaps it in here
+                    // (never at the 2s promote) so the working MSE main is only replaced by a
+                    // genuinely durable RTC path; for the live main this is a harmless no-op.
+                    if (!this._sustainedSignaled && gapless >= this.RTC_SWAP_PROVE_MS) {
+                        this._sustainedSignaled = true;
+                        if (this.onmessage && typeof this.onmessage['ui_sync'] === 'function') {
+                            this.onmessage['ui_sync']({ type: 'signal', value: 'rtc_sustained' });
+                        }
+                    }
                     // Commit (release MSE) only after a fully GAPLESS run of RTC_COMMIT_MS.
                     // Any stall > RTC_STALL_RESET below pushes _stableSince forward, so a bursty
                     // camera never gets here and just keeps MSE warm. Reserving commit for
                     // rock-solid paths is what stops the post-commit stall -> reconnect crash loop.
-                    if (!this._committed && Date.now() - this._stableSince >= this.RTC_COMMIT_MS) {
+                    if (!this._committed && gapless >= this.RTC_COMMIT_MS) {
                         commit();
                     }
                 } else {
