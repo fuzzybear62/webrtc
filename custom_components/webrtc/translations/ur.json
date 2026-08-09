@@ -31,6 +31,9 @@
     "sensor": {
       "proxied_connections": {
         "name": "پراکسیڈ کنکشنز"
+      },
+      "shadow_probes": {
+        "name": "شیڈو پروبز"
       }
     }
   },

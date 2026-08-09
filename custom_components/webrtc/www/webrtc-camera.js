@@ -109,7 +109,7 @@ class WebRTCCamera extends HTMLElement {
         this._io = null;           // IntersectionObserver instance
         this._visAbort = null;     // AbortController for the document visibilitychange listener
 
-        console.info('[WebRTC Camera] v14.1.11');
+        console.info('[WebRTC Camera] v14.1.12');
     }
 
     setConfig(config) {
@@ -1008,6 +1008,14 @@ class WebRTCCamera extends HTMLElement {
 
         if (this.config.server) {
             wsUrl += '&server=' + encodeURIComponent(this.config.server);
+        }
+
+        // [SESSION ACCOUNTING] Mark shadow probes so the backend counts them in a
+        // separate registry (shadow_probes sensor) and keeps the real-client counter
+        // clean. targetDriver is non-null only in shadow mode (see caller). Signature
+        // is unaffected: auth/sign_path signs the base path, not the query string.
+        if (targetDriver) {
+            wsUrl += '&role=shadow';
         }
 
         return wsUrl;
