@@ -121,6 +121,13 @@ priority gate, and socket handoff all live in `_startReversibleRTC`/`commit()`.
 - `ondisconnect()` (`:419`): destructor — closes ws + pc, stops tracks, clears video. Called
   by the card's `_nukeDriver`.
 - No-data watchdog (`_feedWatchdog`, 5s): forces `onclose()` if the ws is open but no bytes arrive.
+- `strictMode` (`:235`, default `false`) — gates **exactly one** path: the ws `'error'` handler in
+  `onconnect()` (`:397`). `true` = fail-fast (call `onclose()` on any ws error); `false` = relaxed
+  (log + ignore, keep the socket). Recovery does **not** depend on it: the WHATWG spec guarantees a
+  `'close'` after every `'error'` (→ `onclose()` fires ~ms later anyway), and the silent/frozen
+  paths this fork targets emit no `'error'` at all (the 5s no-data watchdog reaps them). The
+  `onclose()` re-entrancy guard (`_notifiedClosed`) stops the strict early-close + the browser's
+  following `'close'` from double-firing `connection-closed`. Set from the card's `network_strict`.
 
 ## 4. Card (`webrtc-camera.js`) — the state machine
 
@@ -149,6 +156,11 @@ priority gate, and socket handoff all live in `_startReversibleRTC`/`commit()`.
 - `isShadowMode = !!this.driver && !this._isReconnecting` (`:634`).
 - `effectiveConfig = {...config, ...currentStream}`; `newDriver.mode = effectiveConfig.mode`
   (`:674`). (No `reversible` flag any more — the driver's only RTC path is reversible.)
+- Knob propagation (`:848-857`): `rtc_swap_prove_ms`→`RTC_SWAP_PROVE_MS`, `firstframe_timeout`→
+  `FIRSTFRAME_TIMEOUT`, `network_strict`→`strictMode`. All set **before** the `isShadowMode` branch,
+  so **both main and shadow** inherit them (per-stream override via `effectiveConfig`). Note: on the
+  shadow `strictMode` is largely inert — a shadow has no `connection-closed` listener and is reaped
+  via firstframe-timeout/reprobe, so it can never touch the live MSE (HARD CONSTRAINT holds).
 - Main path: append visible, wire `connection-closed` → retry.
 - Shadow path: append **hidden** (`position:absolute; width:1px; opacity:0` `:918-921` — never
   `display:none`, which suspends decode), ws gets `&role=shadow` (`:1098`),
