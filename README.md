@@ -283,6 +283,7 @@ degraded networks and are safe to leave alone.
 | `rtc_reprobe`       | boolean | `true`               | The long-term background re-probe loop that keeps trying to upgrade an MSE-only camera to WebRTC. Set `false` to opt out entirely (camera stays on whatever it first negotiated). |
 | `rtc_reprobe_base`  | number  | `30000` (ms)         | Initial backoff delay for the re-probe loop. |
 | `rtc_reprobe_max`   | number  | `600000` (ms, 10 min)| Maximum backoff delay for the re-probe loop. |
+| `pause_delay`       | number  | `5000` (ms)          | Debounce before the auto-pause teardown fires when the tile goes off-screen or the tab is hidden. Only relevant with `background: false`; a quick scroll/flick within this window does not tear the stream down. |
 
 ```yaml
 type: 'custom:webrtc-camera'
