@@ -360,6 +360,63 @@ Only relevant if you set `background: false` (which stops a camera when it scrol
 is hidden). This is the grace period before that teardown actually fires, so flicking past a camera
 doesn't needlessly kill and restart its stream.
 
+### Tuning by network path (wired vs. weak Wi-Fi)
+
+The defaults are a good all-round compromise. If you want to squeeze the best behaviour out of a
+*specific* camera, the guiding idea is that **each knob should lean in opposite directions depending on
+how good the path is**:
+
+- **Wired / strong LAN** — the path is reliable, so you can afford to be **fast and confident**: switch
+  to the low-latency WebRTC picture sooner, and give up on genuinely dead sources sooner.
+- **Distant camera behind several Wi-Fi repeater hops** — the path is jittery and lossy, so you must be
+  **patient and conservative**: only switch to WebRTC once it has proven rock-solid, never kill a
+  slow-starting attempt prematurely, and above all never tear down the working MSE picture over a blip.
+
+| Option | Wired / strong LAN | Weak path (e.g. 3× Wi-Fi repeater hops) | Why |
+|---|---|---|---|
+| `rtc_swap_prove_ms` (def. 30000) | **15000** (down to 10000) | **60000** (up to 90000) | The anti-flicker filter. On a good path WebRTC that starts will hold, so a shorter proof gets you to low latency sooner. On a weak path WebRTC can run 20–30 s and then stall — a long proof window lets **only** a genuinely stable feed take over, killing the swap→stall→revert churn. |
+| `firstframe_timeout` (def. 120000) | **60000** | **120000** (default — do **not** lower) | On a good path the first frame arrives fast, so you can drop a dead source quicker. On a lossy path the first keyframe can genuinely take a while; lowering this would reap attempts that would have succeeded. |
+| `network_strict` (def. false) | **false** | **false** | On a flaky link, transient socket errors are expected and self-heal, so `true` would needlessly tear down a healthy picture. On wired, `true` only saves a few milliseconds. Leave it `false` either way — it is a diagnostics toggle, not a reliability one. |
+| `rtc_reprobe` / `_base` / `_max` | defaults | `rtc_reprobe_base: 60000` | A good path usually reaches WebRTC and the loop stops on its own. On a known-marginal path, probing a little less often trims wasted background work. |
+
+**Ready-to-paste starting points** (add to the rest of your card config):
+
+```yaml
+# Wired / strong LAN — bias toward speed & low latency
+rtc_swap_prove_ms: 15000    # a stable wired WebRTC: switch over sooner
+firstframe_timeout: 60000   # first frame is fast here: drop dead sources sooner
+network_strict: false
+```
+
+```yaml
+# Distant camera, ~3 Wi-Fi repeater hops — bias toward stability & zero churn
+rtc_swap_prove_ms: 60000    # only adopt WebRTC after 60s of flawless play
+firstframe_timeout: 120000  # lossy link: give the first keyframe time (don't lower)
+network_strict: false       # a transient socket error must NOT drop the working MSE
+rtc_reprobe_base: 60000     # optional: probe a marginal path a little less often
+```
+
+**A note on committing (releasing MSE).** There is a third, deliberately **non-exposed** timer,
+`RTC_COMMIT_MS` (180 s of flawless WebRTC), after which the card *commits*: it releases the background
+MSE stream and closes its connection. This is intentional and self-protecting:
+- On a **wired** camera it will be reached — after ~3 stable minutes the card commits to WebRTC and frees
+  the resources. Correct.
+- On a **weak path** it will almost never be reached (staying 180 s without a single gap is unlikely), so
+  the camera stays **reversible indefinitely** — if WebRTC stalls it snaps back to the warm MSE with no
+  black frame. Exactly what you want there.
+
+**Verifying it in operation.** These are reasoned starting points, not per-camera measurements — set
+them, then watch two signals:
+
+1. **The `shadow_probes` sensor.** On the weak camera it should tick `0↔1` while the picture stays on MSE
+   *without visible flicker*. If you see the tile flick to black and back (a swap that immediately
+   reverts), raise `rtc_swap_prove_ms` further.
+2. **The browser console** (with the card loaded, look for `[VideoRTC:…] RTC phase …` lines). The time it
+   takes to reach the `promoted` phase is a **path-quality canary**: fast (~2–4 s) means WebRTC will adopt
+   cleanly; slow (>10 s) means the long proof window is correctly doing its job filtering a marginal path.
+   On a wired camera you should also see the phase reach `committed` after ~3 minutes, and that camera's
+   `proxied_connections` contribution drop as the MSE connection closes.
+
 ## Diagnostic sensors
 
 This fork registers two number sensors under a **WebRTC Camera** device (upstream creates none). Every
