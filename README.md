@@ -39,30 +39,48 @@ the [go2rtc](https://github.com/AlexxIT/go2rtc) streaming server.
 
 ## What this fork adds
 
-Upstream plays whichever technology negotiates first and, historically, a failed WebRTC attempt could
-disturb an already-working MSE picture. On clean LANs that is invisible. On degraded paths (repeaters,
-TURN relays, remote tunnels, briefly-blocked UDP) it causes black tiles and churn.
+**First, a bit of background (no code required).** A browser can show a camera in two main ways:
 
-This fork reworks that handoff into an explicit, reversible state machine:
+- **MSE** (Media Source Extensions) — video streamed over a normal WebSocket. It is **robust**: it
+  works through firewalls, reverse proxies and remote tunnels, and it degrades gracefully. Its downside
+  is **higher latency** (typically 1–3 s behind live).
+- **WebRTC** — the same peer-to-peer tech used by video calls. It is **low-latency** (sub-second) but
+  **fragile**: it needs UDP and a successful "handshake" that flaky Wi-Fi, TURN relays or restrictive
+  networks often break.
 
-- **MSE comes up first and stays visible.** The card shows the reliable MSE stream immediately and never
-  tears it down to try something else.
-- **WebRTC is probed in the background** by a disposable *shadow* driver on a second signalling socket.
-  The live MSE picture is untouched while this happens.
-- **The switch is prove-gated.** The shadow only replaces the visible stream after its WebRTC feed has
-  played **gaplessly for `rtc_swap_prove_ms`** (default 30 s). A shadow that stalls before proving is
-  silently reaped — no black frame, no swap, no revert. On good paths the swap is seamless.
-- **Permanent safety net.** If a camera came up on MSE only because WebRTC was momentarily unavailable,
-  a background re-probe loop keeps retrying with backoff (30 s → … → 10 min) and upgrades later, without
-  ever disturbing the live MSE picture. Opt out with `rtc_reprobe: false`.
-- **Two upgrade knobs** (`rtc_swap_prove_ms`, `firstframe_timeout`) and a **fail-fast toggle**
-  (`network_strict`) are exposed per-card — see [Fork card options](#fork-card-options).
+So the ideal is: *always show something reliable, but quietly upgrade to the fast path whenever the
+network actually allows it — and never make the picture worse in the attempt.*
 
-Everything above is automatic. A plain upstream card config (`type: custom:webrtc-camera`, `url: …`)
-gets all of it with no extra options.
+Upstream picks whichever technology connects first, and historically a failed WebRTC attempt could
+disturb an already-working MSE picture. On a clean LAN you never notice. On **degraded paths**
+(Wi-Fi repeaters, TURN relays, remote tunnels, briefly-blocked UDP) it causes black tiles and flicker.
 
-Unlike upstream, this fork also **creates two diagnostic sensor entities** so you can watch live
-viewer and background-probe counts — see [Diagnostic sensors](#diagnostic-sensors).
+This fork reworks that upgrade into an explicit, **reversible** process. In plain terms:
+
+- **MSE comes up first and stays on screen.** You get a reliable picture immediately, and the card
+  never tears it down just to experiment with something faster.
+- **WebRTC is tried invisibly, in the background.** A throwaway second connection (internally called a
+  *shadow*) attempts WebRTC off-screen. Your visible MSE picture is never touched while this happens.
+- **The switch only happens once WebRTC has proven itself.** The background WebRTC feed must play
+  **without a single gap for `rtc_swap_prove_ms`** (default 30 s) before it is allowed to replace the
+  visible stream. If it stutters before then, it is silently thrown away — no black frame, no flicker,
+  you stay on MSE. On a good network the switch is seamless and you simply get lower latency.
+- **It keeps trying, forever, safely.** If a camera only landed on MSE because WebRTC happened to be
+  unavailable at that moment (UDP briefly blocked, TURN down, a momentary ICE timeout), a background
+  **re-probe loop** retries later with increasing spacing (30 s → 1 min → … → 10 min) and upgrades the
+  moment the network recovers — again without ever disturbing the live picture. Turn it off with
+  `rtc_reprobe: false`.
+
+**The one rule behind all of it:** never permanently harm a working stream in order to chase a better
+one. A camera that can only reach MSE stays on MSE, cleanly, indefinitely.
+
+Everything above is **automatic** — a plain config (`type: custom:webrtc-camera`, `url: …`) gets it all
+with no extra options. The knobs in [Fork card options](#fork-card-options) only let you *tune* the
+behaviour; you never need them to benefit from it.
+
+Unlike upstream, this fork also **creates two diagnostic sensors** so you can watch, at a glance, how
+many cameras are streaming and whether the background upgrade path is working — see
+[Diagnostic sensors](#diagnostic-sensors).
 
 ## go2rtc
 
@@ -271,48 +289,99 @@ style: '.header {top: unset; bottom: 6px}'
 
 ## Fork card options
 
-These options are **specific to this fork** and control the reversible MSE→WebRTC upgrade path
-described in [What this fork adds](#what-this-fork-adds). All are optional; the defaults are tuned for
-degraded networks and are safe to leave alone.
+These options are **specific to this fork** and tune the reversible MSE→WebRTC upgrade described in
+[What this fork adds](#what-this-fork-adds). **You do not need any of them** — the defaults are chosen to
+behave well on bad networks. They exist only for fine-tuning or diagnostics.
 
-| Option              | Type    | Default              | Description |
+| Option              | Type    | Default              | In one line |
 |---------------------|---------|----------------------|-------------|
-| `rtc_swap_prove_ms` | number  | `30000` (ms)         | How long the background WebRTC shadow must play **gaplessly** before it is allowed to replace the visible MSE stream. Higher = more conservative (fewer swaps on flaky paths); lower = quicker switch on good paths. |
-| `firstframe_timeout`| number  | `120000` (ms)        | How long a driver waits for its first decoded frame before it is considered failed. Applies to both the main and shadow drivers. Lower to give up faster on dead sources. |
-| `network_strict`    | boolean | `false`              | Fail-fast vs. recovery behaviour. `false` keeps the working stream and retries in the background; `true` surfaces failures immediately instead of masking them. Leave `false` for normal viewing; useful `true` for diagnostics. |
-| `rtc_reprobe`       | boolean | `true`               | The long-term background re-probe loop that keeps trying to upgrade an MSE-only camera to WebRTC. Set `false` to opt out entirely (camera stays on whatever it first negotiated). |
-| `rtc_reprobe_base`  | number  | `30000` (ms)         | Initial backoff delay for the re-probe loop. |
-| `rtc_reprobe_max`   | number  | `600000` (ms, 10 min)| Maximum backoff delay for the re-probe loop. |
-| `pause_delay`       | number  | `5000` (ms)          | Debounce before the auto-pause teardown fires when the tile goes off-screen or the tab is hidden. Only relevant with `background: false`; a quick scroll/flick within this window does not tear the stream down. |
+| `rtc_swap_prove_ms` | number  | `30000` (ms)         | How long the background WebRTC feed must run flawlessly before it replaces the visible stream. |
+| `firstframe_timeout`| number  | `120000` (ms)        | How long to wait for the very first video frame before declaring an attempt dead. |
+| `network_strict`    | boolean | `false`              | How aggressively to drop a connection on a low-level socket error. |
+| `rtc_reprobe`       | boolean | `true`               | Whether to keep retrying WebRTC in the background after a camera settled on MSE. |
+| `rtc_reprobe_base`  | number  | `30000` (ms)         | First wait between those background retries. |
+| `rtc_reprobe_max`   | number  | `600000` (ms, 10 min)| Longest wait between those background retries. |
+| `pause_delay`       | number  | `5000` (ms)          | Grace period before pausing a scrolled-away camera (only with `background: false`). |
 
 ```yaml
 type: 'custom:webrtc-camera'
 url: 'rtsp://rtsp:12345678@192.168.1.123:554/av_stream/ch0'
 
-# Fork tuning (all optional)
-rtc_swap_prove_ms: 30000    # prove WebRTC for 30s before swapping in
-firstframe_timeout: 120000  # 2 min to first frame
-network_strict: false       # keep the working stream, recover in background
-rtc_reprobe: true           # keep trying to upgrade MSE-only cameras
+# Fork tuning — every line is optional
+rtc_swap_prove_ms: 30000    # prove WebRTC for 30s before switching to it
+firstframe_timeout: 120000  # give an attempt 2 min to produce a first frame
+network_strict: false       # keep the working stream, recover in the background
+rtc_reprobe: true           # keep trying to upgrade an MSE-only camera
 ```
 
-Per-stream overrides are honoured: `rtc_swap_prove_ms`, `firstframe_timeout` and `network_strict` set
-inside a `streams:` entry take precedence over the card-level value for that stream.
+**Per-stream overrides:** `rtc_swap_prove_ms`, `firstframe_timeout` and `network_strict` can also be set
+inside an individual `streams:` entry, where they override the card-level value for that one stream.
+
+### What each option really does
+
+**`rtc_swap_prove_ms` — the "prove it first" timer.**
+When WebRTC is being tried in the background, this is how long it must play *without a single glitch*
+before the card trusts it enough to put it on screen in place of MSE. It is your safety-vs-speed dial:
+- **Raise it** (e.g. `60000`) if you have flaky cameras that connect via WebRTC but then stutter — a
+  longer proof window means the card only switches to WebRTC that is genuinely stable.
+- **Lower it** (e.g. `10000`) on a fast, reliable LAN where you want the low-latency picture sooner.
+
+**`firstframe_timeout` — the "is anything coming?" timer.**
+Any connection attempt (the visible one *or* a background WebRTC probe) is given this long to produce
+its first decoded video frame. If nothing arrives, the attempt is considered dead and cleaned up. Note
+that a connection can look "connected" at the network level while never actually delivering video — this
+timer is what catches that case. **Lower it** to give up on dead or misconfigured sources faster; the
+default (2 min) is deliberately generous so slow-to-start cameras are not killed prematurely.
+
+**`network_strict` — how twitchy to be about socket errors.**
+This controls one narrow thing: what to do when the underlying WebSocket reports a low-level error.
+- `false` (default, recommended): **relaxed.** A transient socket error is logged and ignored; if the
+  connection has really died the browser will report it a moment later through the normal channel, and
+  the fork's own **5-second no-data watchdog** catches any silent freeze regardless. This is the safer
+  choice because it won't tear down an otherwise-healthy picture over a momentary blip.
+- `true`: **fail-fast.** The connection is dropped the instant any socket error is seen. This does *not*
+  make recovery more reliable — the mechanisms above already recover on their own — it just reacts a few
+  milliseconds sooner. Its real use is **diagnostics**: it surfaces flaky links immediately instead of
+  letting the watchdog absorb them. For everyday viewing, leave it `false`.
+
+  On a background WebRTC probe this setting has practically no effect: a probe is disposable and is
+  reaped by `firstframe_timeout`/the re-probe loop anyway, and — by design — it can never disturb the
+  live picture.
+
+**`rtc_reprobe` (+ `rtc_reprobe_base` / `rtc_reprobe_max`) — the background retry loop.**
+When a camera ends up on MSE because WebRTC wasn't available at that moment, this loop keeps quietly
+retrying WebRTC so the camera can be upgraded later when the network improves. Retries start spaced by
+`rtc_reprobe_base` and back off up to `rtc_reprobe_max`, so a permanently WebRTC-incapable network
+settles into one cheap probe every 10 minutes rather than hammering. Set `rtc_reprobe: false` to switch
+the loop off entirely (the camera then keeps whatever it first connected with).
+
+**`pause_delay` — don't tear down on a quick scroll.**
+Only relevant if you set `background: false` (which stops a camera when it scrolls off-screen or the tab
+is hidden). This is the grace period before that teardown actually fires, so flicking past a camera
+doesn't needlessly kill and restart its stream.
 
 ## Diagnostic sensors
 
-This fork registers two sensors under a **WebRTC Camera** device (upstream creates none). They count
-live signalling websockets on the go2rtc proxy and are handy for spotting leaks or verifying that the
-background upgrade path is actually running:
+This fork registers two number sensors under a **WebRTC Camera** device (upstream creates none). Every
+camera tile talks to Home Assistant through a small connection on the go2rtc proxy; these two sensors
+simply **count those connections**, split by purpose. They are useful for confirming the background
+upgrade path is actually running, and for spotting leaks (a count that never returns to zero when all
+cameras are closed).
 
-| Sensor                            | Counts |
-|-----------------------------------|--------|
-| `sensor.proxied_connections` — *Proxied Connections* | Real viewer streams (main drivers) — media proxied over the websocket. |
-| `sensor.shadow_probes` — *Shadow Probes* | Background WebRTC upgrade probes (shadow drivers) — signalling only, no media. |
+| Sensor                            | What it counts | Think of it as |
+|-----------------------------------|----------------|----------------|
+| `sensor.proxied_connections` — *Proxied Connections* | Visible camera streams currently open (the "main" connections that carry MSE video). | **How many camera tiles are streaming right now.** |
+| `sensor.shadow_probes` — *Shadow Probes* | Background WebRTC attempts in flight (the throwaway "shadow" connections — signalling only, no picture). | **How many cameras are quietly trying to upgrade to WebRTC.** |
 
-A card that has settled on MSE and is probing for WebRTC in the background will briefly show
-`shadow_probes` incrementing during each probe; a card that swapped up to WebRTC shows it drop back.
-`proxied_connections` tracks the number of tiles currently streaming.
+**How to read them:**
+- A camera showing MSE and trying to upgrade will make `shadow_probes` tick **up to 1 while it probes,
+  then back to 0** — repeatedly, spaced further apart over time (the re-probe backoff). Seeing it
+  oscillate is *normal and healthy*, not a bug: it means the fork is doing its job.
+- When a camera successfully upgrades to WebRTC, its probe finishes and `shadow_probes` drops back.
+- `proxied_connections` roughly tracks the number of tiles on screen. Note that a camera which fully
+  commits to WebRTC eventually closes its proxy connection (the video then flows peer-to-peer, off the
+  proxy), so a committed-WebRTC tile can read as **0** here even though you can see it — that is
+  expected.
 
 ## Templates
 
@@ -400,9 +469,12 @@ media_player:
 A. [Read more](https://github.com/AlexxIT/WebRTC/issues/378). On this fork, external/tunnel paths that
 cannot complete a WebRTC handshake will simply stay on MSE — this is by design and not a bug.
 
-**Q. My camera never switches to WebRTC / `shadow_probes` keeps incrementing**
-A. The path can't sustain WebRTC for `rtc_swap_prove_ms`, so the shadow is reaped and MSE is kept. This is
-the safety behaviour working as intended. If you want it to give up probing, set `rtc_reprobe: false`.
+**Q. My camera never switches to WebRTC / `shadow_probes` keeps ticking up and down**
+A. That oscillation is normal — it's the background re-probe loop keeping an MSE-only camera under
+observation (see [Diagnostic sensors](#diagnostic-sensors)). The camera isn't switching because the path
+can't hold WebRTC gaplessly for `rtc_swap_prove_ms`, so each probe is discarded and the reliable MSE
+picture is kept — the safety behaviour working as intended. If you'd rather it stop probing entirely,
+set `rtc_reprobe: false`.
 
 **Q. Audio doesn't work**
 A. Check what audio codec your camera outputs and what technology you use to watch. Different technologies
