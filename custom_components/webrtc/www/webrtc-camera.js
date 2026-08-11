@@ -20,6 +20,14 @@
  *
  * CHANGELOG
  * ---------
+ * v14.2.14 — Fix a retry-latch deadlock: a recovered camera never reconnected. `_scheduleRetry`
+ *   cleared `_retryTimer` BEFORE the `_isReconnecting` guard, so a burst of errors from the same
+ *   dying driver (mse-fail → webrtc/offer-fail → ws-close, all within ms) landing inside the backoff
+ *   window cancelled the armed retry and then early-returned without rescheduling — stranding the
+ *   camera forever (`_isReconnecting` only clears in the timer callback that now never runs). Most
+ *   visible at the longer 4000ms+ backoff, where the burst reliably beats the timer. Fix: guard on
+ *   `_isReconnecting` FIRST so the pending retry survives the burst; the backoff loop resumes and
+ *   the camera recovers when it comes back online. No behaviour change to a healthy stream.
  * v14.2.13 — Fix `_logHA` throttle for the `mode` event. The dedup-throttle keyed only by event
  *   name, so the two startup transitions (`none -> mse`, `mse -> rtc`) collapsed into one 10s
  *   bucket: the MSE→RTC upgrade — the very line v14.2.12 added for app visibility — was delayed up
@@ -196,7 +204,7 @@ class WebRTCCamera extends HTMLElement {
         // (correlates stream loss with the mobile app backgrounding / 5G handoff).
         this._logVisAbort = null;
 
-        console.info('[WebRTC Camera] v14.2.13');
+        console.info('[WebRTC Camera] v14.2.14');
     }
 
     setConfig(config) {
@@ -873,8 +881,16 @@ class WebRTCCamera extends HTMLElement {
          * - avoid spawning multiple drivers
          * - give the browser time to release resources
          */
-        if (this._retryTimer) clearTimeout(this._retryTimer);
+        // [RETRY LATCH FIX] Guard BEFORE touching the timer. A retry is already armed and counting
+        // down; a burst of further errors from the same dying driver (mse-fail → webrtc/offer-fail →
+        // ws-close all fire within a few ms) must NOT disturb it. The old order cleared _retryTimer
+        // FIRST and then bailed on _isReconnecting — cancelling the armed retry without rescheduling,
+        // so the reconnect latched dead forever (_isReconnecting only clears inside the timer
+        // callback, which then never runs). When _isReconnecting is false no timer is pending anyway
+        // (it already fired and cleared the flag), so the top-level clear only ever hit the case we
+        // must preserve. Guard first; the pending retry survives the burst.
         if (this._isReconnecting) return;
+        if (this._retryTimer) clearTimeout(this._retryTimer);
 
         // [LAYOUT] Freeze the current card height BEFORE the driver is torn down, so the video
         // area does not collapse during the retry gap and trigger a section-wide re-pack. The
