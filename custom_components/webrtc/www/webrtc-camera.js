@@ -20,6 +20,9 @@
  *
  * CHANGELOG
  * ---------
+ * v14.2.9 — Debug events now log under a dedicated sub-logger `custom_components.webrtc.card`
+ *   (was `custom_components.webrtc`). Lets you raise ONLY the card events to info without also
+ *   un-muting the backend proxy's own chatty info logging (handshake/benchmark/counters).
  * v14.2.8 — Warn once on the console when `debug` points to a non-existent HA entity_id, so a
  *   typo'd / not-yet-created helper doesn't look like broken logging. Debug still stays off.
  * v14.2.7 — Field-debug pack (no streaming-behaviour change on the happy path). Three additions
@@ -163,7 +166,7 @@ class WebRTCCamera extends HTMLElement {
         // (correlates stream loss with the mobile app backgrounding / 5G handoff).
         this._logVisAbort = null;
 
-        console.info('[WebRTC Camera] v14.2.8');
+        console.info('[WebRTC Camera] v14.2.9');
     }
 
     setConfig(config) {
@@ -439,7 +442,10 @@ class WebRTCCamera extends HTMLElement {
         try {
             this._hass.callService('system_log', 'write', {
                 level,
-                logger: 'custom_components.webrtc',
+                // Dedicated sub-logger so the card's opt-in debug events can be raised to `info`
+                // ALONE (logger: logs: custom_components.webrtc.card: info) without un-muting the
+                // chatty backend proxy logging (handshake/benchmark) on `custom_components.webrtc`.
+                logger: 'custom_components.webrtc.card',
                 message,
             });
         } catch (e) {
