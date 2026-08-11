@@ -580,7 +580,7 @@ Form **B** is the recommended way to debug a fleet: add `debug: input_boolean.de
 once, then flip the helper on only while you reproduce the problem. Default is `false` — nothing is
 written to the HA log unless you opt in.
 
-**What it logs** (logger `custom_components.webrtc`, one line per event, prefixed with the camera `url`):
+**What it logs** (logger `custom_components.webrtc.card`, one line per event, prefixed with the camera `url`):
 
 | Event | Level | Meaning |
 |---|---|---|
@@ -594,24 +594,28 @@ written to the HA log unless you opt in.
 Repeated identical events are **throttled**: the first logs immediately, further ones in a 10-second
 window are counted and flushed once as `(repeated N× in 10s)`, so a flapping camera can't flood the log.
 
-**You must raise the log level to `info` to see the `info` events.** The two `warning` events
-(`connection-closed`, `driver-error`) show up in **Settings → System → Logs** out of the box, but the
-`info` events (`retry`, `stream-up`, `page-hidden` / `page-visible`, `auto-pause` / `auto-resume`) are
-filtered out at the default level. Add this to `configuration.yaml` and restart:
+The card's debug events log under their **own** sub-logger, `custom_components.webrtc.card` (separate from
+the integration's backend logger `custom_components.webrtc`, which is chatty at info — handshake /
+benchmark / stream counters). The two `warning` events (`connection-closed`, `driver-error`) show up in
+**Settings → System → Logs** out of the box, but the `info` events (`retry`, `stream-up`, `page-hidden` /
+`page-visible`, `auto-pause` / `auto-resume`) are filtered out at the default level. To see them, add this
+to `configuration.yaml` and restart:
 
 ```yaml
 logger:
   logs:
-    custom_components.webrtc: info
+    custom_components.webrtc.card: info    # ONLY the card events — backend stays quiet
 ```
 
 > **Note:** modern Home Assistant no longer keeps a persistent `home-assistant.log` file on disk (it was
 > dropped to cut SD-card write wear) — read the log live in the app under **Settings → System → Logs**,
-> not from a file over SSH. The `info` events exist only in that live stream; scope the `logger:` override
-> to `custom_components.webrtc` so you don't turn every other integration verbose and thrash the log.
+> not from a file over SSH. Scope the override to `custom_components.webrtc.card`: raising the parent
+> `custom_components.webrtc` to info instead un-mutes the backend proxy's own per-stream handshake and
+> benchmark lines, which flood the log on a multi-camera fleet.
 
 **Recipe for the 5G stream-loss case:** set `debug: input_boolean.debug` on the affected cameras, add the
-`logger:` block above, turn the helper on, reproduce the loss on the phone, then watch **Settings → System
+`custom_components.webrtc.card: info` logger block above, turn the helper on, reproduce the loss on the
+phone, then watch **Settings → System
 → Logs**. A run of `connection-closed: no-data-watchdog` → `retry` → `stream-up` is the network dropping
 and the card recovering; the same run *immediately after* a `page-hidden` points at the app backgrounding
 instead.

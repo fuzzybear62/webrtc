@@ -3,7 +3,7 @@
 > Fork of AlexxIT/WebRTC. go2rtc streaming engine. HA custom integration.
 > This file is the **authoritative map** of what the code actually does. Consult it
 > instead of re-reading the large JS files; **keep it in sync** on every change.
-> Anchors (`file:line`) current as of **card v14.2.8 / driver v2.3.6**.
+> Anchors (`file:line`) current as of **card v14.2.9 / driver v2.3.6**.
 
 ## 1. File map
 
@@ -238,14 +238,16 @@ console. All off/inert by default — existing cards are byte-for-byte unaffecte
   `input_boolean.debug` (gated LIVE on that entity `== 'on'`, so one switch toggles the whole fleet)
   | unset/false (off). `_logHA(level,event,detail)` mirrors lifecycle events to the HA log (Settings →
   System → Logs; no on-disk file in modern HA) via `system_log.write` (logger
-  `custom_components.webrtc`, message `[url] event: detail`),
+  `custom_components.webrtc.card` — a DEDICATED sub-logger, so it can be raised to info alone without
+  un-muting the backend proxy's chatty handshake/benchmark info logging on `custom_components.webrtc`;
+  message `[url] event: detail`),
   **dedup-throttled** (`_logThrottle` Map, 10s window: first emits, repeats counted + flushed once as
   `(repeated N× in 10s)`) so a flapping stream can't flood the log. Events: `driver-error` (W),
   `connection-closed`+reason (W), `retry` (I), `stream-up` (I), `auto-pause`/`auto-resume` (I),
   `page-hidden`/`page-visible` (I — the 5G/backgrounding correlation, from an always-attached,
   emit-self-gated `visibilitychange` listener `_setupDebugVisibilityLog`, torn down + throttle
   cleared in `disconnectedCallback`). The two W events surface in the Logs panel by default; the I
-  events need `logger: { logs: { custom_components.webrtc: info } }` in `configuration.yaml` to appear.
+  events need `logger: { logs: { custom_components.webrtc.card: info } }` in `configuration.yaml`.
 
 ## 5. Counter behaviour, fully explained
 
