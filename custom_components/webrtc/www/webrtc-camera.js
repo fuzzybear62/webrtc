@@ -20,6 +20,13 @@
  *
  * CHANGELOG
  * ---------
+ * v14.2.12 — Field visibility: mirror every mode transition to the HA log. `_setActiveMode()` is
+ *   the single choke-point for all mode changes (initial land, shadow swap, direct-RTC, RTC→MSE
+ *   revert), but `stream-up` only fired on the initial ui_sync land — so on the HA Companion apps
+ *   (no browser console) the fork's defining MSE→RTC upgrade and its reverts were invisible. Added
+ *   a `_logHA('debug','mode', 'a -> b')` in `_setActiveMode`; the app log can now answer "did this
+ *   camera reach RTC / fall back?". Rare event (once per upgrade/revert) → negligible SD cost. No
+ *   behaviour change.
  * v14.2.11 — Removed the card's custom debug GATE for coherence: the server-side lifecycle
  *   mirror (_logHA → custom_components.webrtc.card) is now ALWAYS emitted, at rationalized levels,
  *   and the native HA logger level is the only filter — same model as the JS console and the
@@ -182,7 +189,7 @@ class WebRTCCamera extends HTMLElement {
         // (correlates stream loss with the mobile app backgrounding / 5G handoff).
         this._logVisAbort = null;
 
-        console.info('[WebRTC Camera] v14.2.11');
+        console.info('[WebRTC Camera] v14.2.12');
     }
 
     setConfig(config) {
@@ -952,6 +959,13 @@ class WebRTCCamera extends HTMLElement {
     _setActiveMode(mode) {
         if (this._activeMode === mode) return;
         console.debug(`[WebRTC Camera] activeMode ${this._activeMode} -> ${mode}`);
+        // [FIELD VISIBILITY] This is the SINGLE choke-point for every mode transition —
+        // initial land, shadow swap (_promoteShadowToMain), direct-RTC (onpcvideo), and any
+        // RTC→MSE revert. `stream-up` (:774) only fires on the initial ui_sync land, so on the
+        // HA Companion apps (no console) the fork's defining MSE→RTC upgrade and its reverts were
+        // otherwise invisible. Mirror the transition here so the app log can answer "did this
+        // camera reach RTC / fall back?". Rare (once per upgrade/revert) → negligible SD cost.
+        this._logHA('debug', 'mode', `${this._activeMode ?? 'none'} -> ${mode ?? 'none'}`);
         this._activeMode = mode;
     }
 
