@@ -3,7 +3,7 @@
 > Fork of AlexxIT/WebRTC. go2rtc streaming engine. HA custom integration.
 > This file is the **authoritative map** of what the code actually does. Consult it
 > instead of re-reading the large JS files; **keep it in sync** on every change.
-> Anchors (`file:line`) current as of **card v14.2.13 / driver v2.3.7**.
+> Anchors (`file:line`) current as of **card v14.2.14 / driver v2.3.7**.
 >
 > **Logging levels (rationalized, v14.2.10 / v2.3.7; card gate removed v14.2.11).** Both the JS
 > console and the Python backend use the *native* level filter as the gate — no custom gating
@@ -160,7 +160,12 @@ priority gate, and socket handoff all live in `_startReversibleRTC`/`commit()`.
   `'mse'` covers driver phases `warm` AND `negotiating` (keep probing while the main tries RTC),
   and `'rtc'` is a card-level "quality gate passed / proven shadow swapped in" decision. See the
   `_setActiveMode` docblock + memory `webrtc-fsm-maintainability` smell #3.
-- `_isReconnecting`, `_retryCount`, `_retryTimer` — cold-restart backoff.
+- `_isReconnecting`, `_retryCount`, `_retryTimer` — cold-restart backoff (1s→…→30s cap, no
+  give-up). `_scheduleRetry` (`:869`) MUST guard on `_isReconnecting` BEFORE clearing `_retryTimer`
+  (v14.2.14): a dying driver fires a burst (mse-fail → webrtc/offer-fail → ws-close) and the old
+  clear-then-bail order cancelled the armed retry without rescheduling, latching the reconnect dead
+  forever (`_isReconnecting` only clears in the timer callback). When `_isReconnecting` is false no
+  timer is pending anyway, so the guard-first order is strictly correct.
 - `_streamHealthy` — a media mode came up (distinguishes fatal vs per-mode error).
 - `_shadowAttempts` (`:85`) — fast-upgrade counter.
 - `_upgradeTimer` (`:91`) — the fast 2s shadow after MSE lands (defensively kept).
