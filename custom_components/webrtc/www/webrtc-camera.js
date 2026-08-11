@@ -20,6 +20,13 @@
  *
  * CHANGELOG
  * ---------
+ * v14.2.13 — Fix `_logHA` throttle for the `mode` event. The dedup-throttle keyed only by event
+ *   name, so the two startup transitions (`none -> mse`, `mse -> rtc`) collapsed into one 10s
+ *   bucket: the MSE→RTC upgrade — the very line v14.2.12 added for app visibility — was delayed up
+ *   to 10s and mislabelled `(repeated 1× in 10s)`, and a revert in the same window lost its detail.
+ *   `mode` now keys by event+detail so distinct transitions each emit live, while a same-direction
+ *   flap still collapses (flood-safe). retry/driver-error keep the event-only key (their detail is
+ *   high-cardinality — keying by it would defeat the throttle).
  * v14.2.12 — Field visibility: mirror every mode transition to the HA log. `_setActiveMode()` is
  *   the single choke-point for all mode changes (initial land, shadow swap, direct-RTC, RTC→MSE
  *   revert), but `stream-up` only fired on the initial ui_sync land — so on the HA Companion apps
@@ -189,7 +196,7 @@ class WebRTCCamera extends HTMLElement {
         // (correlates stream loss with the mobile app backgrounding / 5G handoff).
         this._logVisAbort = null;
 
-        console.info('[WebRTC Camera] v14.2.12');
+        console.info('[WebRTC Camera] v14.2.13');
     }
 
     setConfig(config) {
@@ -413,7 +420,14 @@ class WebRTCCamera extends HTMLElement {
 
         const WINDOW = 10000;
         const now = Date.now();
-        const rec = this._logThrottle.get(event);
+        // Throttle key: normally the event name, so identical repeats (retry / driver-error spam)
+        // collapse into one summary. `mode` is the exception — each occurrence carries a DISTINCT,
+        // meaningful transition in `detail`, so key it by event+detail: different transitions
+        // (none->mse, mse->rtc, rtc->mse) each emit LIVE, while a real same-direction flap still
+        // collapses (flood-safe). Do NOT extend this to events whose detail is high-cardinality
+        // (retry: "attempt #N in Xms") — the key would never match and the throttle would be lost.
+        const key = event === 'mode' ? `${event}|${detail}` : event;
+        const rec = this._logThrottle.get(key);
 
         if (rec && (now - rec.last) < WINDOW) {
             rec.count++;
@@ -421,22 +435,22 @@ class WebRTCCamera extends HTMLElement {
             rec.level = level;
             rec.detail = detail;
             if (rec.timer) clearTimeout(rec.timer);
-            rec.timer = setTimeout(() => this._flushLog(event), WINDOW);
+            rec.timer = setTimeout(() => this._flushLog(key), WINDOW);
             return;
         }
 
         this._emitLog(level, event, detail);
-        this._logThrottle.set(event, { last: now, count: 0, level, detail, timer: null });
+        this._logThrottle.set(key, { last: now, count: 0, level, event, detail, timer: null });
     }
 
-    _flushLog(event) {
-        const rec = this._logThrottle && this._logThrottle.get(event);
+    _flushLog(key) {
+        const rec = this._logThrottle && this._logThrottle.get(key);
         if (!rec) return;
         if (rec.count > 0) {
-            this._emitLog(rec.level, event,
+            this._emitLog(rec.level, rec.event,
                 `${rec.detail != null ? rec.detail + ' ' : ''}(repeated ${rec.count}× in 10s)`);
         }
-        this._logThrottle.delete(event);
+        this._logThrottle.delete(key);
     }
 
     _emitLog(level, event, detail) {
