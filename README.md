@@ -574,6 +574,7 @@ console follows (`console.warn`/`console.error` show by default; `console.debug`
 | `driver-error` | warning | go2rtc reported an error (e.g. `no route to host`, `i/o timeout`). Recoverable — the retry loop handles it. |
 | `retry` | debug | A reconnect was scheduled, with the attempt number and back-off delay. |
 | `stream-up` | debug | The stream (re)connected, with the transport (`mse` / `webrtc` / …). |
+| `mode` | debug | A mode transition, e.g. `mse -> rtc` (the background WebRTC upgrade succeeded) or `rtc -> mse` (RTC stalled and reverted). This is the **only** app-visible signal that a camera reached — or fell back from — WebRTC: `stream-up` only reports the *initial* transport, while the shadow swap and direct-RTC upgrades happen later. |
 | `page-hidden` / `page-visible` | debug | The tab/app went to the background or came back. **Key for mobile:** if losses line up with `page-hidden`, the app is being backgrounded (or handing off 5G↔Wi-Fi), not a camera fault. |
 | `auto-pause` / `auto-resume` | debug | Only with `background: false` — the card tore down / restarted a scrolled-away camera. |
 
