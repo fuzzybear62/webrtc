@@ -20,6 +20,17 @@
  *
  * CHANGELOG
  * ---------
+ * v14.2.7 — Field-debug pack (no streaming-behaviour change on the happy path). Three additions
+ *   aimed at diagnosing stream loss on the HA mobile app, where no browser console exists:
+ *   (1) LAYOUT: on a retry the card now LOCKS its rendered height (_lockHeight) until the new
+ *   stream is healthy, then releases it. Previously a retry removed the <video>, the card
+ *   collapsed to ~0, and in a Sections/Masonry view HA re-packed the whole section — reflowing
+ *   (and disturbing) every sibling camera. (2) STATUS: a connection error now shows a localized
+ *   generic ("Reconnecting…") instead of the raw driver string; the raw reason is kept in the
+ *   console and the tooltip. (3) LOGGING: opt-in `debug` (true | an entity_id) mirrors the
+ *   stream lifecycle (errors, closes+reason, retries, recovery, visibility) to home-assistant.log
+ *   via system_log.write, dedup-throttled to avoid flooding. Consumes driver v2.3.6 (adds
+ *   connection-closed `detail.reason`). Off by default → existing cards are byte-for-byte unaffected.
  * v14.2.6 — [SMELL #2/#3] Message-handler role split + _activeMode setter. The driver's
  *   overloaded rtc_* signals are now hard-dispatched on the receiver's role
  *   (_onPreSwapShadowMessage vs _onMainMessage) instead of branch-order + a "never fall
@@ -42,7 +53,7 @@
  *   _promoteShadowToMain().
  */
 
-import {VideoRTC} from './video-rtc.js?v=2.3.5';
+import {VideoRTC} from './video-rtc.js?v=2.3.6';
 import {DigitalPTZ} from './digital-ptz.js?v=3.3.0';
 // [SIDECAR INTEGRATION] Import the Interaction module.
 // This module handles legacy features (Shortcuts, PTZ, Styles) to keep the core driver clean.
@@ -53,6 +64,17 @@ import {UIInteraction} from './ui-interaction.js?v=1.1.1';
 if (!customElements.get('video-rtc')) {
     customElements.define('video-rtc', VideoRTC);
 }
+
+// [I18N] On-screen status strings. Kept as a tiny local map (a custom card cannot use HA's
+// core `hass.localize`, whose keys live in the frontend translation bundles). Picked by the
+// user's HA language with an English fallback. Add a language by adding its two-letter key.
+const STRINGS = {
+    en: { error: 'Error', reconnecting: 'Reconnecting…' },
+    it: { error: 'Errore', reconnecting: 'Riconnessione…' },
+    de: { error: 'Fehler', reconnecting: 'Neu verbinden…' },
+    fr: { error: 'Erreur', reconnecting: 'Reconnexion…' },
+    es: { error: 'Error', reconnecting: 'Reconectando…' },
+};
 
 class WebRTCCamera extends HTMLElement {
     constructor() {
@@ -132,7 +154,14 @@ class WebRTCCamera extends HTMLElement {
         this._io = null;           // IntersectionObserver instance
         this._visAbort = null;     // AbortController for the document visibilitychange listener
 
-        console.info('[WebRTC Camera] v14.2.6');
+        // [DEBUG LOGGING] Dedup state for the opt-in Home Assistant server-side log. null until
+        // the first _logHA() call. Keyed by event name → {last, count, level, detail, timer}.
+        this._logThrottle = null;
+        // [DEBUG LOGGING] AbortController for the debug-gated document visibilitychange listener
+        // (correlates stream loss with the mobile app backgrounding / 5G handoff).
+        this._logVisAbort = null;
+
+        console.info('[WebRTC Camera] v14.2.7');
     }
 
     setConfig(config) {
@@ -189,12 +218,18 @@ class WebRTCCamera extends HTMLElement {
         // [AUTO-PAUSE] (Re)wire off-screen / tab-hidden watching from the current
         // config. Idempotent: tears down any previous observer/listener first.
         this._setupVisibility();
+
+        // [DEBUG LOGGING] Ensure the debug visibility logger is wired (idempotent). setConfig can
+        // run before connectedCallback when HA builds the card, so wire it here too.
+        this._setupDebugVisibilityLog();
     }
 
     connectedCallback() {
         // Re-arm visibility watching if the card was detached and re-attached
         // (HA can move cards around the masonry). No-op until setConfig ran.
         if (this.config) this._setupVisibility();
+        // [DEBUG LOGGING] Attach the debug-gated visibility logger (emit self-gates on `debug`).
+        this._setupDebugVisibilityLog();
     }
 
     // [AUTO-PAUSE] Wire (or re-wire) the off-screen + tab-hidden observers.
@@ -277,6 +312,7 @@ class WebRTCCamera extends HTMLElement {
     _pauseStream() {
         if (this._paused) return;
         console.info('[WebRTC Camera] Auto-pause: off-screen/hidden, tearing down stream');
+        this._logHA('info', 'auto-pause', 'off-screen/hidden');
         this._paused = true;
 
         // Kill every pending timer so nothing revives the stream while paused.
@@ -296,10 +332,134 @@ class WebRTCCamera extends HTMLElement {
     _resumeStream() {
         if (!this._paused) return;
         console.info('[WebRTC Camera] Auto-resume: back on-screen, restarting stream');
+        this._logHA('info', 'auto-resume', 'back on-screen');
         this._paused = false;
         this._retryCount = 0;
         if (this._hass && this.config && this.shadowRoot && !this.driver) {
             this.startStream();
+        }
+    }
+
+    // [I18N] Resolve a status string in the user's HA language, falling back to English.
+    _t(key) {
+        const lang = (this._hass && (this._hass.language ||
+            (this._hass.locale && this._hass.locale.language))) || 'en';
+        const table = STRINGS[String(lang).slice(0, 2)] || STRINGS.en;
+        return table[key] || STRINGS.en[key] || key;
+    }
+
+    // [LAYOUT] Freeze the card's rendered height across a retry teardown.
+    //
+    // WHY: the card has no fixed aspect-ratio — its height comes from the <video>. A retry
+    // removes the driver, so between teardown and the next healthy frame the card would
+    // collapse to ~0. In a Sections/Masonry view HA measures each card (ResizeObserver →
+    // grid-row span) and re-packs the whole section on that height change, reflowing — and
+    // disturbing the live streams of — every sibling camera. Locking a min-height on .player
+    // (the video area; the header is position:absolute and never contributes) keeps the box
+    // stable, so the section never re-packs. Released by _unlockHeight() once a real media
+    // mode comes up (the new stream may have a different aspect ratio: one clean adjustment at
+    // the end beats a collapse-then-grow flash).
+    _lockHeight() {
+        const player = this.shadowRoot && this.shadowRoot.querySelector('.player');
+        if (!player) return;
+        const h = player.offsetHeight;
+        if (h > 0) player.style.minHeight = h + 'px';
+    }
+
+    _unlockHeight() {
+        const player = this.shadowRoot && this.shadowRoot.querySelector('.player');
+        if (player) player.style.minHeight = '';
+    }
+
+    // [DEBUG LOGGING] Is server-side logging enabled for this card?
+    // `debug: true` → always; `debug: <entity_id>` (e.g. input_boolean.debug) → gated LIVE on
+    // that entity being 'on' (lets one global switch toggle logging for the whole fleet without
+    // editing every card); anything else / unset → off (default). Never logs to HA otherwise.
+    _debugEnabled() {
+        const d = this.config && this.config.debug;
+        if (d === true) return true;
+        if (typeof d === 'string' && d.indexOf('.') > 0) {
+            return !!(this._hass && this._hass.states[d] &&
+                this._hass.states[d].state === 'on');
+        }
+        return false;
+    }
+
+    // [DEBUG LOGGING] Mirror one stream-lifecycle event to home-assistant.log via
+    // system_log.write. Dedup-throttled: the first occurrence of an event emits immediately;
+    // repeats within the window are counted and flushed once as a summary, so a continuously
+    // failing stream cannot flood the log. `level` ∈ debug|info|warning|error|critical.
+    _logHA(level, event, detail) {
+        if (!this._debugEnabled() || !this._hass) return;
+        if (!this._logThrottle) this._logThrottle = new Map();
+
+        const WINDOW = 10000;
+        const now = Date.now();
+        const rec = this._logThrottle.get(event);
+
+        if (rec && (now - rec.last) < WINDOW) {
+            rec.count++;
+            rec.last = now;
+            rec.level = level;
+            rec.detail = detail;
+            if (rec.timer) clearTimeout(rec.timer);
+            rec.timer = setTimeout(() => this._flushLog(event), WINDOW);
+            return;
+        }
+
+        this._emitLog(level, event, detail);
+        this._logThrottle.set(event, { last: now, count: 0, level, detail, timer: null });
+    }
+
+    _flushLog(event) {
+        const rec = this._logThrottle && this._logThrottle.get(event);
+        if (!rec) return;
+        if (rec.count > 0) {
+            this._emitLog(rec.level, event,
+                `${rec.detail != null ? rec.detail + ' ' : ''}(repeated ${rec.count}× in 10s)`);
+        }
+        this._logThrottle.delete(event);
+    }
+
+    _emitLog(level, event, detail) {
+        const cam = (this.config && (this.config.url || this.config.entity)) || '?';
+        const message = `[${cam}] ${event}${detail != null ? ': ' + detail : ''}`;
+        try {
+            this._hass.callService('system_log', 'write', {
+                level,
+                logger: 'custom_components.webrtc',
+                message,
+            });
+        } catch (e) {
+            // Logging must never break the stream.
+            console.debug('[WebRTC Camera] system_log.write failed', e);
+        }
+    }
+
+    _clearLogThrottle() {
+        if (!this._logThrottle) return;
+        for (const rec of this._logThrottle.values()) {
+            if (rec.timer) clearTimeout(rec.timer);
+        }
+        this._logThrottle.clear();
+    }
+
+    // [DEBUG LOGGING] A lightweight, always-attached visibilitychange listener that only EMITS
+    // when debug is on (the emit self-gates). With `background: true` (default) the card does
+    // NOT tear down when the tab/app hides, so these lines are the only server-side signal that
+    // a stream loss coincided with the mobile app backgrounding or a 5G→Wi-Fi handoff.
+    _setupDebugVisibilityLog() {
+        if (this._logVisAbort) return; // already wired
+        this._logVisAbort = new AbortController();
+        document.addEventListener('visibilitychange', () => {
+            this._logHA('info', document.visibilityState === 'hidden' ? 'page-hidden' : 'page-visible');
+        }, { signal: this._logVisAbort.signal });
+    }
+
+    _teardownDebugVisibilityLog() {
+        if (this._logVisAbort) {
+            this._logVisAbort.abort();
+            this._logVisAbort = null;
         }
     }
 
@@ -359,8 +519,13 @@ class WebRTCCamera extends HTMLElement {
         // wired would leak the card (and fire on a dead element).
         this._teardownVisibility();
 
+        // [DEBUG LOGGING] Drop the visibility logger and any pending dedup flush timers so the
+        // detached card leaks nothing (the document outlives the card).
+        this._teardownDebugVisibilityLog();
+        this._clearLogThrottle();
+
         this._cleanupDriver();
-        
+
         // [MEMORY FIX] Ensure DigitalPTZ listeners are removed.
         this._cleanupPTZ();
 
@@ -404,8 +569,10 @@ class WebRTCCamera extends HTMLElement {
         // global retry. Pre-swap shadows deliberately have no such listener (they must fail
         // silently); without re-attaching it here a genuine ws death after the swap would go
         // unhandled (the old webrtc-only shadow froze black in exactly this gap).
-        this._handleConnectionClosed = () => {
-            console.warn('[WebRTC Camera] Main Driver Connection Closed');
+        this._handleConnectionClosed = (e) => {
+            const reason = (e && e.detail && e.detail.reason) || 'closed';
+            console.warn(`[WebRTC Camera] Main Driver Connection Closed (${reason})`);
+            this._logHA('warning', 'connection-closed', reason);
             this._scheduleRetry();
         };
         newDriver.addEventListener('connection-closed', this._handleConnectionClosed);
@@ -439,6 +606,7 @@ class WebRTCCamera extends HTMLElement {
 
         this.setStatus('RTC', this.config.title || '', 'Seamless connection active via WebRTC (Handover Success)');
         this._streamHealthy = true;
+        this._unlockHeight();
         this._setActiveMode('rtc');
         this._stopReprobe();
         this._applyPoster();
@@ -542,7 +710,11 @@ class WebRTCCamera extends HTMLElement {
         switch (msg.type) {
             case 'error':
                 console.error(`[WebRTC Camera] Main Driver Error: ${msg.value}`);
-                this.setStatus('Error', msg.value);
+                this._logHA('warning', 'driver-error', msg.value);
+                // Show a localized generic to the user; keep the raw reason in the console (above)
+                // and the tooltip. The raw strings ("no route to host", "i/o timeout") are noise
+                // on-screen and, arriving in bursts on a flaky path, made the status flicker.
+                this.setStatus(this._t('error'), this._t('reconnecting'), msg.value);
                 // [RESILIENCE] An unreachable source (e.g. "no route to host") is reported as an
                 // error frame while the socket stays open, so no 'connection-closed' fires. Retry
                 // only if the stream never came up: on an already-healthy stream this is a
@@ -581,6 +753,10 @@ class WebRTCCamera extends HTMLElement {
                 }
                 this._retryCount = 0;
                 this._streamHealthy = true;
+                // A real media mode is on screen: release any retry height-lock (the new stream
+                // now sizes the card) and log the recovery.
+                this._unlockHeight();
+                this._logHA('info', 'stream-up', msg.type);
                 break;
         }
     }
@@ -664,6 +840,11 @@ class WebRTCCamera extends HTMLElement {
         if (this._retryTimer) clearTimeout(this._retryTimer);
         if (this._isReconnecting) return;
 
+        // [LAYOUT] Freeze the current card height BEFORE the driver is torn down, so the video
+        // area does not collapse during the retry gap and trigger a section-wide re-pack. The
+        // <video> is still sized here (frozen last frame); released once a new mode comes up.
+        this._lockHeight();
+
         this._isReconnecting = true;
         this._streamHealthy = false;
         // [RTC RE-PROBE] The driver is being torn down and cold-restarted; a fresh
@@ -677,6 +858,7 @@ class WebRTCCamera extends HTMLElement {
         );
 
         console.debug(`[WebRTC Camera] Scheduling retry in ${delay}ms`);
+        this._logHA('info', 'retry', `attempt #${this._retryCount + 1} in ${delay}ms`);
 
         this._retryTimer = setTimeout(() => {
             this._retryCount++;
@@ -859,8 +1041,10 @@ class WebRTCCamera extends HTMLElement {
         // Any unexpected connection close triggers a controlled retry.
         // [SEAMLESS HANDOVER] Only main driver triggers global retry. Shadow driver just dies silently.
         if (!isShadowMode) {
-            this._handleConnectionClosed = () => {
-                console.warn('[WebRTC Camera] Main Driver Connection Closed');
+            this._handleConnectionClosed = (e) => {
+                const reason = (e && e.detail && e.detail.reason) || 'closed';
+                console.warn(`[WebRTC Camera] Main Driver Connection Closed (${reason})`);
+                this._logHA('warning', 'connection-closed', reason);
                 this._scheduleRetry();
             };
             newDriver.addEventListener('connection-closed', this._handleConnectionClosed);
@@ -920,6 +1104,7 @@ class WebRTCCamera extends HTMLElement {
                 this.setStatus('RTC', this.config.title || '', 'Connected via WebRTC (Direct)');
                 this._retryCount = 0;
                 this._streamHealthy = true;
+                this._unlockHeight();
                 this._shadowAttempts = 0;
                 // [ORPHAN FIX] The main upgraded to WebRTC on its own while a shadow
                 // probe was still in flight (launched by the 2s _upgradeTimer or by the

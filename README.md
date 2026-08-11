@@ -34,6 +34,7 @@ the [go2rtc](https://github.com/AlexxIT/go2rtc) streaming server.
 * [Stream to camera](#stream-to-camera)
 * [FAQ](#faq)
 * [Debug](#debug)
+* [Debug logging (troubleshooting stream loss)](#debug-logging-troubleshooting-stream-loss)
 * [Known work cameras](#known-work-cameras)
 <!-- TOC -->
 
@@ -302,6 +303,7 @@ behave well on bad networks. They exist only for fine-tuning or diagnostics.
 | `rtc_reprobe_base`  | number  | `30000` (ms)         | First wait between those background retries. |
 | `rtc_reprobe_max`   | number  | `600000` (ms, 10 min)| Longest wait between those background retries. |
 | `pause_delay`       | number  | `5000` (ms)          | Grace period before pausing a scrolled-away camera (only with `background: false`). |
+| `debug`             | boolean or entity_id | `false` | Mirror this camera's stream lifecycle to `home-assistant.log`. See [Debug logging](#debug-logging-troubleshooting-stream-loss). |
 
 ```yaml
 type: 'custom:webrtc-camera'
@@ -312,6 +314,7 @@ rtc_swap_prove_ms: 30000    # prove WebRTC for 30s before switching to it
 firstframe_timeout: 120000  # give an attempt 2 min to produce a first frame
 network_strict: false       # keep the working stream, recover in the background
 rtc_reprobe: true           # keep trying to upgrade an MSE-only camera
+debug: false                # server-side logging (see Debug logging section)
 ```
 
 **Per-stream overrides:** `rtc_swap_prove_ms`, `firstframe_timeout` and `network_strict` can also be set
@@ -551,6 +554,52 @@ logger:
 Client-side, open the browser console and confirm the card banner (`[WebRTC Camera] vXX.X.X`). After
 updating the card, do a **hard reload** (Cmd/Ctrl+Shift+R) so the browser/PWA service worker picks up the
 new resource version.
+
+## Debug logging (troubleshooting stream loss)
+
+The browser console is the natural place to watch a stream — but the **Home Assistant mobile app has no
+console**. If a camera keeps dropping only on a phone (e.g. on mobile data / 5G) you are blind. The
+`debug` card option fixes that by mirroring the stream's lifecycle to **`home-assistant.log`**, which you
+can read from the app (Settings → System → Logs) or over SSH — no console required.
+
+**Turn it on** in one of two ways:
+
+```yaml
+# A) per camera, always on
+type: 'custom:webrtc-camera'
+url: bedroomcam
+debug: true
+
+# B) gated on a helper, so ONE switch toggles logging for the whole fleet
+type: 'custom:webrtc-camera'
+url: bedroomcam
+debug: input_boolean.debug     # logs only while this input_boolean is 'on'
+```
+
+Form **B** is the recommended way to debug a fleet: add `debug: input_boolean.debug` to every camera
+once, then flip the helper on only while you reproduce the problem. Default is `false` — nothing is
+written to the HA log unless you opt in.
+
+**What it logs** (logger `custom_components.webrtc`, one line per event, prefixed with the camera `url`):
+
+| Event | Level | Meaning |
+|---|---|---|
+| `connection-closed` | warning | The stream dropped. The reason is included: `ws-close` (server/network closed the socket), `no-data-watchdog` (the picture froze — 5s of silence with the socket still open, the classic weak-link symptom), or `ws-error`. |
+| `driver-error` | warning | go2rtc reported an error (e.g. `no route to host`, `i/o timeout`). |
+| `retry` | info | A reconnect was scheduled, with the attempt number and back-off delay. |
+| `stream-up` | info | The stream (re)connected, with the transport (`mse` / `webrtc` / …). |
+| `page-hidden` / `page-visible` | info | The tab/app went to the background or came back. **Key for mobile:** if losses line up with `page-hidden`, the app is being backgrounded (or handing off 5G↔Wi-Fi), not a camera fault. |
+| `auto-pause` / `auto-resume` | info | Only with `background: false` — the card tore down / restarted a scrolled-away camera. |
+
+Repeated identical events are **throttled**: the first logs immediately, further ones in a 10-second
+window are counted and flushed once as `(repeated N× in 10s)`, so a flapping camera can't flood the log.
+All events are at info/warning, so they appear with the default log level — no `logger:` override needed
+(the [Debug](#debug) snippet above only adds the browser-side `debug` verbosity).
+
+**Recipe for the 5G stream-loss case:** set `debug: input_boolean.debug` on the affected cameras, turn
+the helper on, reproduce the loss on the phone, then read `home-assistant.log`. A run of
+`connection-closed: no-data-watchdog` → `retry` → `stream-up` is the network dropping and the card
+recovering; the same run *immediately after* a `page-hidden` points at the app backgrounding instead.
 
 ## Known work cameras
 

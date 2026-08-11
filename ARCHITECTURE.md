@@ -3,7 +3,7 @@
 > Fork of AlexxIT/WebRTC. go2rtc streaming engine. HA custom integration.
 > This file is the **authoritative map** of what the code actually does. Consult it
 > instead of re-reading the large JS files; **keep it in sync** on every change.
-> Anchors (`file:line`) current as of **card v14.2.6 / driver v2.3.5**.
+> Anchors (`file:line`) current as of **card v14.2.7 / driver v2.3.6**.
 
 ## 1. File map
 
@@ -117,7 +117,11 @@ priority gate, and socket handoff all live in `_startReversibleRTC`/`commit()`.
 - `_setPhase(next)` (`:979`): the single phase-transition point; logs every edge.
 - `applyAudio(muted)`: routes mute to the on-screen element (RTC overlay while promoted, else
   `this.video`). Called by the card after a swap.
-- `onclose()` (`:541`): re-entrancy-guarded; closes ws; dispatches `connection-closed`.
+- `onclose()` (`:541`): re-entrancy-guarded; closes ws; dispatches `connection-closed` with
+  `detail.reason` (v2.3.6) = `'ws-close'` (server/browser close) | `'no-data-watchdog'` (5s silent
+  freeze, socket still open) | `'ws-error'` (strict-mode error). `this._closeReason` is set by the
+  proactive closers (watchdog `:426`, strict handler `:400`), reset each `onconnect()` and after
+  dispatch. The card logs it (server-side debug).
 - `ondisconnect()` (`:419`): destructor — closes ws + pc, stops tracks, clears video. Called
   by the card's `_nukeDriver`.
 - No-data watchdog (`_feedWatchdog`, 5s): forces `onclose()` if the ws is open but no bytes arrive.
@@ -213,6 +217,33 @@ dispatch `handover-complete` (`:436`).
 
 ### Teardown paths (all funnel through `_nukeDriver` (`:441`) → `ondisconnect()` → `ws.close()`)
 `_cleanupDriver`, `_scheduleRetry`, `hardReset`, `_pauseStream`, `disconnectedCallback`, `nextStream`.
+
+### Field-debug pack (v14.2.7) — status i18n, height-lock, server-side logging
+Three additions for diagnosing stream loss on the HA **mobile app**, where there is no browser
+console. All off/inert by default — existing cards are byte-for-byte unaffected.
+
+- **Status i18n** — a driver `error` shows the localized generic `_t('reconnecting')` instead of the
+  raw string (`_onMainMessage` `error` case). Raw reason kept in `console.error` + the `.mode`
+  tooltip. `STRINGS` map (module-level, en/it/de/fr/es) picked by `hass.language`, English fallback;
+  `_t(key)`.
+- **Height-lock** — the card has no fixed aspect-ratio (height comes from the `<video>`). A retry
+  removes the driver → the card would collapse to ~0 → in a **Sections/Masonry** view HA re-packs the
+  whole section (ResizeObserver → `grid-row` span), reflowing and disturbing **every sibling
+  camera's** stream. `_lockHeight()` (called at the top of `_scheduleRetry`, while the frozen
+  `<video>` is still sized) pins `.player { min-height }`; `_unlockHeight()` releases it once a real
+  media mode lands (the three healthy points: shared negotiated block, direct-RTC `onpcvideo`,
+  `_promoteShadowToMain`). The header is `position:absolute` and never contributed to height — the
+  reflow was always the video teardown, never the status text.
+- **Server-side logging** — opt-in `debug` card option: `true` (always) | `<entity_id>` e.g.
+  `input_boolean.debug` (gated LIVE on that entity `== 'on'`, so one switch toggles the whole fleet)
+  | unset/false (off). `_logHA(level,event,detail)` mirrors lifecycle events to `home-assistant.log`
+  via `system_log.write` (logger `custom_components.webrtc`, message `[url] event: detail`),
+  **dedup-throttled** (`_logThrottle` Map, 10s window: first emits, repeats counted + flushed once as
+  `(repeated N× in 10s)`) so a flapping stream can't flood the log. Events: `driver-error` (W),
+  `connection-closed`+reason (W), `retry` (I), `stream-up` (I), `auto-pause`/`auto-resume` (I),
+  `page-hidden`/`page-visible` (I — the 5G/backgrounding correlation, from an always-attached,
+  emit-self-gated `visibilitychange` listener `_setupDebugVisibilityLog`, torn down + throttle
+  cleared in `disconnectedCallback`). All at info/warning so they show without a logger override.
 
 ## 5. Counter behaviour, fully explained
 
