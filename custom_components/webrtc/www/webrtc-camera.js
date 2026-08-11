@@ -20,6 +20,13 @@
  *
  * CHANGELOG
  * ---------
+ * v14.2.11 — Removed the card's custom debug GATE for coherence: the server-side lifecycle
+ *   mirror (_logHA → custom_components.webrtc.card) is now ALWAYS emitted, at rationalized levels,
+ *   and the native HA logger level is the only filter — same model as the JS console and the
+ *   Python backend. Dropped the `debug` card option, `_debugEnabled()`, and the missing-entity
+ *   warn. Levels: connection-closed / driver-error = warning (shown by default); retry, stream-up,
+ *   page-hidden/visible, auto-pause/resume = debug (need custom_components.webrtc.card: debug).
+ *   The 10s dedup-throttle still bounds the service-call rate during failure storms.
  * v14.2.10 — Console log-level rationalization (no behaviour change). All routine lifecycle,
  *   negotiation and shadow-upgrade traces moved from info to `console.debug` (hidden at the
  *   browser console's default level, shown with Verbose). `Main Driver Error` reclassified
@@ -175,7 +182,7 @@ class WebRTCCamera extends HTMLElement {
         // (correlates stream loss with the mobile app backgrounding / 5G handoff).
         this._logVisAbort = null;
 
-        console.info('[WebRTC Camera] v14.2.10');
+        console.info('[WebRTC Camera] v14.2.11');
     }
 
     setConfig(config) {
@@ -326,7 +333,7 @@ class WebRTCCamera extends HTMLElement {
     _pauseStream() {
         if (this._paused) return;
         console.debug('[WebRTC Camera] Auto-pause: off-screen/hidden, tearing down stream');
-        this._logHA('info', 'auto-pause', 'off-screen/hidden');
+        this._logHA('debug', 'auto-pause', 'off-screen/hidden');
         this._paused = true;
 
         // Kill every pending timer so nothing revives the stream while paused.
@@ -346,7 +353,7 @@ class WebRTCCamera extends HTMLElement {
     _resumeStream() {
         if (!this._paused) return;
         console.debug('[WebRTC Camera] Auto-resume: back on-screen, restarting stream');
-        this._logHA('info', 'auto-resume', 'back on-screen');
+        this._logHA('debug', 'auto-resume', 'back on-screen');
         this._paused = false;
         this._retryCount = 0;
         if (this._hass && this.config && this.shadowRoot && !this.driver) {
@@ -385,36 +392,16 @@ class WebRTCCamera extends HTMLElement {
         if (player) player.style.minHeight = '';
     }
 
-    // [DEBUG LOGGING] Is server-side logging enabled for this card?
-    // `debug: true` → always; `debug: <entity_id>` (e.g. input_boolean.debug) → gated LIVE on
-    // that entity being 'on' (lets one global switch toggle logging for the whole fleet without
-    // editing every card); anything else / unset → off (default). Never logs to HA otherwise.
-    _debugEnabled() {
-        const d = this.config && this.config.debug;
-        if (d === true) return true;
-        if (typeof d === 'string' && d.indexOf('.') > 0) {
-            if (this._hass && !this._hass.states[d]) {
-                // Typo / not-yet-created helper: warn ONCE so a silent misconfig
-                // doesn't look like a broken logging feature. Debug stays off.
-                if (this._debugEntityWarned !== d) {
-                    console.warn(`[WebRTC Camera] debug entity "${d}" does not exist ` +
-                        `on HA — logging stays off. Check the entity_id.`);
-                    this._debugEntityWarned = d;
-                }
-                return false;
-            }
-            return !!(this._hass && this._hass.states[d] &&
-                this._hass.states[d].state === 'on');
-        }
-        return false;
-    }
-
-    // [DEBUG LOGGING] Mirror one stream-lifecycle event to home-assistant.log via
-    // system_log.write. Dedup-throttled: the first occurrence of an event emits immediately;
-    // repeats within the window are counted and flushed once as a summary, so a continuously
-    // failing stream cannot flood the log. `level` ∈ debug|info|warning|error|critical.
+    // [LIFECYCLE LOGGING] Mirror one stream-lifecycle event to the HA log via system_log.write,
+    // under the dedicated sub-logger `custom_components.webrtc.card`. ALWAYS emitted — there is NO
+    // custom gate: the native HA logger level is the filter, exactly like the JS console and the
+    // Python backend. The `warning` events (connection-closed, driver-error) show in Settings →
+    // System → Logs by default; the `debug`-level lifecycle (retry, stream-up, page-hidden/visible,
+    // auto-pause/resume) needs `logger: logs: custom_components.webrtc.card: debug`. Dedup-throttled
+    // (10s window): the first occurrence emits immediately; repeats are counted and flushed once as
+    // a summary, so a continuously failing stream cannot flood the log even at warning level.
     _logHA(level, event, detail) {
-        if (!this._debugEnabled() || !this._hass) return;
+        if (!this._hass) return;
         if (!this._logThrottle) this._logThrottle = new Map();
 
         const WINDOW = 10000;
@@ -451,8 +438,8 @@ class WebRTCCamera extends HTMLElement {
         try {
             this._hass.callService('system_log', 'write', {
                 level,
-                // Dedicated sub-logger so the card's opt-in debug events can be raised to `info`
-                // ALONE (logger: logs: custom_components.webrtc.card: info) without un-muting the
+                // Dedicated sub-logger so the card's lifecycle events can be raised alone
+                // (logger: logs: custom_components.webrtc.card: debug) without un-muting the
                 // chatty backend proxy logging (handshake/benchmark) on `custom_components.webrtc`.
                 logger: 'custom_components.webrtc.card',
                 message,
@@ -471,15 +458,16 @@ class WebRTCCamera extends HTMLElement {
         this._logThrottle.clear();
     }
 
-    // [DEBUG LOGGING] A lightweight, always-attached visibilitychange listener that only EMITS
-    // when debug is on (the emit self-gates). With `background: true` (default) the card does
-    // NOT tear down when the tab/app hides, so these lines are the only server-side signal that
-    // a stream loss coincided with the mobile app backgrounding or a 5G→Wi-Fi handoff.
+    // [LIFECYCLE LOGGING] A lightweight visibilitychange listener that mirrors page-hidden/visible
+    // to the HA log (at debug level; the native logger level filters it). With `background: true`
+    // (default) the card does NOT tear down when the tab/app hides, so these lines are the only
+    // server-side signal that a stream loss coincided with the mobile app backgrounding or a
+    // 5G→Wi-Fi handoff.
     _setupDebugVisibilityLog() {
         if (this._logVisAbort) return; // already wired
         this._logVisAbort = new AbortController();
         document.addEventListener('visibilitychange', () => {
-            this._logHA('info', document.visibilityState === 'hidden' ? 'page-hidden' : 'page-visible');
+            this._logHA('debug', document.visibilityState === 'hidden' ? 'page-hidden' : 'page-visible');
         }, { signal: this._logVisAbort.signal });
     }
 
@@ -783,7 +771,7 @@ class WebRTCCamera extends HTMLElement {
                 // A real media mode is on screen: release any retry height-lock (the new stream
                 // now sizes the card) and log the recovery.
                 this._unlockHeight();
-                this._logHA('info', 'stream-up', msg.type);
+                this._logHA('debug', 'stream-up', msg.type);
                 break;
         }
     }
@@ -885,7 +873,7 @@ class WebRTCCamera extends HTMLElement {
         );
 
         console.debug(`[WebRTC Camera] Scheduling retry in ${delay}ms`);
-        this._logHA('info', 'retry', `attempt #${this._retryCount + 1} in ${delay}ms`);
+        this._logHA('debug', 'retry', `attempt #${this._retryCount + 1} in ${delay}ms`);
 
         this._retryTimer = setTimeout(() => {
             this._retryCount++;
