@@ -3,7 +3,17 @@
 > Fork of AlexxIT/WebRTC. go2rtc streaming engine. HA custom integration.
 > This file is the **authoritative map** of what the code actually does. Consult it
 > instead of re-reading the large JS files; **keep it in sync** on every change.
-> Anchors (`file:line`) current as of **card v14.2.9 / driver v2.3.6**.
+> Anchors (`file:line`) current as of **card v14.2.10 / driver v2.3.7**.
+>
+> **Logging levels (rationalized, v14.2.10 / v2.3.7).** Both the JS console and the Python backend
+> use the *native* level filter as the gate — no custom console gating. `debug` = routine
+> lifecycle / negotiation / shadow-upgrade traces (hidden by default: browser Verbose off, HA log
+> at default). `info` = rare user-meaningful milestones only (version banner, Hard Reset, Next
+> Stream). `warn` = recoverable, auto-handled anomalies (connection-closed, no-data watchdog, RTC
+> revert, ws/ICE/SDP/buffer/video/mic errors, and — reclassified from error — `Main Driver Error` /
+> backend `Stream error`, since a `no route to host` is a network transient the retry loop handles).
+> `error` = unrecoverable (auth failure, go2rtc crash, binary download failure). The card's opt-in
+> `debug`→`custom_components.webrtc.card` server-side mirror (v14.2.9) is unaffected.
 
 ## 1. File map
 
