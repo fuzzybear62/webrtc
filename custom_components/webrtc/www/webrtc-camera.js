@@ -20,6 +20,8 @@
  *
  * CHANGELOG
  * ---------
+ * v14.2.8 — Warn once on the console when `debug` points to a non-existent HA entity_id, so a
+ *   typo'd / not-yet-created helper doesn't look like broken logging. Debug still stays off.
  * v14.2.7 — Field-debug pack (no streaming-behaviour change on the happy path). Three additions
  *   aimed at diagnosing stream loss on the HA mobile app, where no browser console exists:
  *   (1) LAYOUT: on a retry the card now LOCKS its rendered height (_lockHeight) until the new
@@ -161,7 +163,7 @@ class WebRTCCamera extends HTMLElement {
         // (correlates stream loss with the mobile app backgrounding / 5G handoff).
         this._logVisAbort = null;
 
-        console.info('[WebRTC Camera] v14.2.7');
+        console.info('[WebRTC Camera] v14.2.8');
     }
 
     setConfig(config) {
@@ -379,6 +381,16 @@ class WebRTCCamera extends HTMLElement {
         const d = this.config && this.config.debug;
         if (d === true) return true;
         if (typeof d === 'string' && d.indexOf('.') > 0) {
+            if (this._hass && !this._hass.states[d]) {
+                // Typo / not-yet-created helper: warn ONCE so a silent misconfig
+                // doesn't look like a broken logging feature. Debug stays off.
+                if (this._debugEntityWarned !== d) {
+                    console.warn(`[WebRTC Camera] debug entity "${d}" does not exist ` +
+                        `on HA — logging stays off. Check the entity_id.`);
+                    this._debugEntityWarned = d;
+                }
+                return false;
+            }
             return !!(this._hass && this._hass.states[d] &&
                 this._hass.states[d].state === 'on');
         }

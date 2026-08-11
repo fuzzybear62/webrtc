@@ -3,7 +3,7 @@
 > Fork of AlexxIT/WebRTC. go2rtc streaming engine. HA custom integration.
 > This file is the **authoritative map** of what the code actually does. Consult it
 > instead of re-reading the large JS files; **keep it in sync** on every change.
-> Anchors (`file:line`) current as of **card v14.2.7 / driver v2.3.6**.
+> Anchors (`file:line`) current as of **card v14.2.8 / driver v2.3.6**.
 
 ## 1. File map
 
