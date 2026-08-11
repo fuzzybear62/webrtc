@@ -20,6 +20,15 @@
  *
  * CHANGELOG
  * ---------
+ * v14.2.10 — Console log-level rationalization (no behaviour change). All routine lifecycle,
+ *   negotiation and shadow-upgrade traces moved from info to `console.debug` (hidden at the
+ *   browser console's default level, shown with Verbose). `Main Driver Error` reclassified
+ *   error → warn (a `no route to host` / `i/o timeout` is a recoverable network transient the
+ *   retry loop handles, not a code fault). Kept: the version banner + the two user-action lines
+ *   (Hard Reset, Next Stream) at info; connection-closed / auth-failed at warn/error. The native
+ *   console level filter now acts as the gate — no custom console gating. Consumes driver v2.3.7.
+ *   Backend Python re-levelled in lockstep: per-stream Client/Stream-ended/BENCHMARK traces
+ *   info → debug, server `Stream error` error → warning.
  * v14.2.9 — Debug events now log under a dedicated sub-logger `custom_components.webrtc.card`
  *   (was `custom_components.webrtc`). Lets you raise ONLY the card events to info without also
  *   un-muting the backend proxy's own chatty info logging (handshake/benchmark/counters).
@@ -58,7 +67,7 @@
  *   _promoteShadowToMain().
  */
 
-import {VideoRTC} from './video-rtc.js?v=2.3.6';
+import {VideoRTC} from './video-rtc.js?v=2.3.7';
 import {DigitalPTZ} from './digital-ptz.js?v=3.3.0';
 // [SIDECAR INTEGRATION] Import the Interaction module.
 // This module handles legacy features (Shortcuts, PTZ, Styles) to keep the core driver clean.
@@ -166,7 +175,7 @@ class WebRTCCamera extends HTMLElement {
         // (correlates stream loss with the mobile app backgrounding / 5G handoff).
         this._logVisAbort = null;
 
-        console.info('[WebRTC Camera] v14.2.9');
+        console.info('[WebRTC Camera] v14.2.10');
     }
 
     setConfig(config) {
@@ -316,7 +325,7 @@ class WebRTCCamera extends HTMLElement {
     // burning bandwidth and hold the decoder.
     _pauseStream() {
         if (this._paused) return;
-        console.info('[WebRTC Camera] Auto-pause: off-screen/hidden, tearing down stream');
+        console.debug('[WebRTC Camera] Auto-pause: off-screen/hidden, tearing down stream');
         this._logHA('info', 'auto-pause', 'off-screen/hidden');
         this._paused = true;
 
@@ -336,7 +345,7 @@ class WebRTCCamera extends HTMLElement {
     // [AUTO-PAUSE] Resume with a clean cold start.
     _resumeStream() {
         if (!this._paused) return;
-        console.info('[WebRTC Camera] Auto-resume: back on-screen, restarting stream');
+        console.debug('[WebRTC Camera] Auto-resume: back on-screen, restarting stream');
         this._logHA('info', 'auto-resume', 'back on-screen');
         this._paused = false;
         this._retryCount = 0;
@@ -566,7 +575,7 @@ class WebRTCCamera extends HTMLElement {
         // Identity re-check: only the current pre-swap shadow may promote.
         if (this.shadowDriver !== newDriver) return;
 
-        console.info('[WebRTC Camera] Shadow RTC proven durable — SWAPPING DRIVERS NOW.');
+        console.debug('[WebRTC Camera] Shadow RTC proven durable — SWAPPING DRIVERS NOW.');
 
         // [CRITICAL] Stop the backstop watchdog immediately.
         if (this._shadowTimeout) {
@@ -676,7 +685,7 @@ class WebRTCCamera extends HTMLElement {
 
         // A hard driver error on the probe: kill it and retry later on backoff.
         if (msg.type === 'error') {
-            console.info(`[WebRTC Camera] Shadow Driver Failed: ${msg.value}. Aborting upgrade.`);
+            console.debug(`[WebRTC Camera] Shadow Driver Failed: ${msg.value}. Aborting upgrade.`);
             this._nukeDriver(newDriver, 'Failed Shadow');
             this.shadowDriver = null;
             this.setStatus(null, null, `WebRTC Upgrade Failed: ${msg.value}`);
@@ -707,7 +716,7 @@ class WebRTCCamera extends HTMLElement {
                 const reason = msg.value === 'rtc_failed'
                     ? 'WebRTC unavailable on this network — staying on MSE'
                     : 'WebRTC upgrade discarded by driver (Quality < MSE)';
-                console.info(`[WebRTC Camera] ${reason}. Cancelling upgrade.`);
+                console.debug(`[WebRTC Camera] ${reason}. Cancelling upgrade.`);
                 this.setStatus(null, null, reason);
 
                 // [RTC RE-PROBE / OPTION 3] rtc_failed means the main's own WebRTC attempt has
@@ -727,7 +736,7 @@ class WebRTCCamera extends HTMLElement {
         // Normal UI logic.
         switch (msg.type) {
             case 'error':
-                console.error(`[WebRTC Camera] Main Driver Error: ${msg.value}`);
+                console.warn(`[WebRTC Camera] Main Driver Error: ${msg.value}`);
                 this._logHA('warning', 'driver-error', msg.value);
                 // Show a localized generic to the user; keep the raw reason in the console (above)
                 // and the tooltip. The raw strings ("no route to host", "i/o timeout") are noise
@@ -741,7 +750,7 @@ class WebRTCCamera extends HTMLElement {
                 if (!this._streamHealthy) this._scheduleRetry();
                 break;
             case 'mse':
-                console.info('[WebRTC Camera] Main Driver negotiated: MSE');
+                console.debug('[WebRTC Camera] Main Driver negotiated: MSE');
                 this.setStatus(msg.type.toUpperCase(), this.config.title || '', 'Stream via MSE (TCP)');
                 // [OPTION 3] Settle on MSE and do nothing else. The parallel WebRTC attempt from
                 // onopen is still running on this same connection, bounded by the driver's
@@ -758,7 +767,7 @@ class WebRTCCamera extends HTMLElement {
             case 'mjpeg':
             case 'webrtc':
                 if (msg.type !== 'mse') {
-                    console.info(`[WebRTC Camera] Main Driver negotiated: ${msg.type.toUpperCase()}`);
+                    console.debug(`[WebRTC Camera] Main Driver negotiated: ${msg.type.toUpperCase()}`);
                     // [PHANTOM FIX] If we upgraded to WebRTC (or anything better than MSE), cancel
                     // the pending shadow upgrade immediately.
                     if (this._upgradeTimer) {
@@ -831,7 +840,7 @@ class WebRTCCamera extends HTMLElement {
         }
         
         if (this.shadowDriver) {
-            console.info('[WebRTC Camera] Cleaning up Shadow Driver');
+            console.debug('[WebRTC Camera] Cleaning up Shadow Driver');
             this._nukeDriver(this.shadowDriver, 'Shadow');
             this.shadowDriver = null;
         }
@@ -921,7 +930,7 @@ class WebRTCCamera extends HTMLElement {
         if (this._paused || this._isReconnecting) { this._scheduleReprobe(); return; }
         if (this.shadowDriver) { this._scheduleReprobe(); return; } // a probe is already running
 
-        console.info('[WebRTC Camera] Periodic RTC re-probe: launching background shadow upgrade');
+        console.debug('[WebRTC Camera] Periodic RTC re-probe: launching background shadow upgrade');
         // startStream() sees the live main driver and runs the shadow path. On success
         // the swap sets _activeMode='rtc' and stops the loop; every failure path
         // (shadow error / timeout / auth) re-arms _scheduleReprobe().
@@ -1005,7 +1014,7 @@ class WebRTCCamera extends HTMLElement {
         const isShadowMode = !!this.driver && !this._isReconnecting;
 
         if (!isShadowMode) {
-            console.info('[WebRTC Camera] Cold Start: Initializing Main Driver');
+            console.debug('[WebRTC Camera] Cold Start: Initializing Main Driver');
             this._streamHealthy = false;
             // [RTC RE-PROBE] Fresh connection: drop any stale re-probe loop/backoff so
             // this negotiation starts clean. The loop re-arms once we settle on MSE.
@@ -1019,7 +1028,7 @@ class WebRTCCamera extends HTMLElement {
             // Always destroy any previous driver before creating a new one.
             this._cleanupDriver();
         } else {
-            console.info(`[WebRTC Camera] Seamless Handover: Launching Shadow Driver (Attempt ${this._shadowAttempts + 1})`);
+            console.debug(`[WebRTC Camera] Seamless Handover: Launching Shadow Driver (Attempt ${this._shadowAttempts + 1})`);
             // [DIAGNOSTICS] Set tooltip to indicate optimization is running
             this.setStatus(null, null, 'Optimizing connection... (Attempting WebRTC Upgrade)');
             
@@ -1118,7 +1127,7 @@ class WebRTCCamera extends HTMLElement {
                     return;
                 }
 
-                console.info('[WebRTC Camera] Main Driver negotiated WebRTC directly.');
+                console.debug('[WebRTC Camera] Main Driver negotiated WebRTC directly.');
                 this.setStatus('RTC', this.config.title || '', 'Connected via WebRTC (Direct)');
                 this._retryCount = 0;
                 this._streamHealthy = true;
@@ -1187,7 +1196,7 @@ class WebRTCCamera extends HTMLElement {
             const shadowCap = (newDriver.FIRSTFRAME_TIMEOUT || 120000) + 5000;
             this._shadowTimeout = setTimeout(() => {
                 if (this.shadowDriver) {
-                    console.info('[WebRTC Camera] Shadow timeout – killing unpromoted probe');
+                    console.debug('[WebRTC Camera] Shadow timeout – killing unpromoted probe');
                     this._nukeDriver(this.shadowDriver, 'Timeout Shadow');
                     this.shadowDriver = null;
                     this._shadowAttempts = 0; // Reset to allow future attempts
@@ -1257,7 +1266,7 @@ class WebRTCCamera extends HTMLElement {
                     this._applyPoster();
                 }
             } else {
-                console.warn('[WebRTC Camera] Target driver vanished before connection');
+                console.debug('[WebRTC Camera] Target driver vanished before connection');
             }
         } catch (e) {
             if (!isShadowMode) {

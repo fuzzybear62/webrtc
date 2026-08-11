@@ -1,5 +1,12 @@
 /**
- * VideoRTC v2.3.6 - Close-reason on connection-closed (server-side debug logging)
+ * VideoRTC v2.3.7 - Console log-level rationalization (no behaviour change)
+ * * Changelog v2.3.7:
+ * - CHANGE: routine lifecycle/negotiation traces (Mode:*, pc state, RTC promote/commit/phase,
+ * RTC-rejected, autoplay-warn, "WebRTC …; keeping MSE", relaxed-ws-error "Ignored") moved from
+ * info/warn to `console.debug` — hidden at the browser console's default level, visible with
+ * Verbose on. Genuine recoverable anomalies stay at `console.warn` (video/ICE/SDP/buffer/mic
+ * errors, strict ws-error, no-data watchdog, RTC revert). Lets the native console level filter
+ * act as the gate; no custom debug flag on the driver.
  * * Changelog v2.3.6:
  * - ADD: the `connection-closed` CustomEvent now carries `detail.reason` so the card can log
  * WHY a stream dropped without a browser console — 'ws-close' (server/browser closed the
@@ -308,7 +315,7 @@ export class VideoRTC extends HTMLElement {
             // If play failed (likely due to Audio Policy), mute and try again.
             if (!this.video.muted) {
                 this.video.muted = true;
-                this.video.play().catch(e => console.warn(`[VideoRTC:${this.clientId}] Autoplay warn:`, e));
+                this.video.play().catch(e => console.debug(`[VideoRTC:${this.clientId}] Autoplay warn:`, e));
             }
         });
     }
@@ -408,7 +415,7 @@ export class VideoRTC extends HTMLElement {
                 this.onclose();
             } else {
                 // RELAXED: Log but keep trying (allows recovery from minor glitches)
-                console.warn(`[VideoRTC:${this.clientId}] WebSocket Error (Relaxed): Ignored`, e);
+                console.debug(`[VideoRTC:${this.clientId}] WebSocket Error (Relaxed): Ignored`, e);
             }
         });
 
@@ -612,7 +619,7 @@ export class VideoRTC extends HTMLElement {
      * Logic for Media Source Extensions (Low Latency Video over WS)
      */
     onmse() {
-        console.info(`[VideoRTC:${this.clientId}] Mode: MSE`);
+        console.debug(`[VideoRTC:${this.clientId}] Mode: MSE`);
         let ms;
         // Use ManagedMediaSource (new standard) or fallback to MediaSource
         if ('ManagedMediaSource' in window) {
@@ -753,7 +760,7 @@ export class VideoRTC extends HTMLElement {
                 // Drop ONLY WebRTC and let MSE keep playing; a real MSE stall is caught
                 // by the no-data watchdog. Signal the card so it can retry the upgrade
                 // later with a freshly gathered ICE path.
-                console.warn(`[VideoRTC:${this.clientId}] WebRTC ${why}; keeping active MSE stream.`);
+                console.debug(`[VideoRTC:${this.clientId}] WebRTC ${why}; keeping active MSE stream.`);
                 pc.close();
                 this.pc = null;
                 if (this.onmessage && typeof this.onmessage['ui_sync'] === 'function') {
@@ -774,7 +781,7 @@ export class VideoRTC extends HTMLElement {
         // Monitor Connection State
         pc.addEventListener('connectionstatechange', () => {
             // [DIAGNOSTIC] Log every transition with elapsed time + ICE state.
-            console.info(`[VideoRTC:${this.clientId}] pc ${pc.connectionState} (ice=${pc.iceConnectionState}) @${Date.now() - pcStart}ms`);
+            console.debug(`[VideoRTC:${this.clientId}] pc ${pc.connectionState} (ice=${pc.iceConnectionState}) @${Date.now() - pcStart}ms`);
 
             if (pc.connectionState === 'connected') {
                 // Arm the first-frame detection + watchdog exactly once per pc. (In
@@ -882,7 +889,7 @@ export class VideoRTC extends HTMLElement {
 
             if (rtcPriority < msePriority) {
                 // MSE is the better stream: drop RTC, keep MSE, stop chasing this path.
-                console.info(`[VideoRTC:${this.clientId}] RTC Rejected (Priority < MSE) — staying on MSE`);
+                console.debug(`[VideoRTC:${this.clientId}] RTC Rejected (Priority < MSE) — staying on MSE`);
                 this._clearRtcTimers();
                 this._dropRtcOverlay();
                 this.video.muted = this._mseWanted;
@@ -894,7 +901,7 @@ export class VideoRTC extends HTMLElement {
                 return;
             }
 
-            console.info(`[VideoRTC:${this.clientId}] RTC promoted (${flowingMs}ms flowing) @${Date.now() - pcStart}ms — MSE kept warm`);
+            console.debug(`[VideoRTC:${this.clientId}] RTC promoted (${flowingMs}ms flowing) @${Date.now() - pcStart}ms — MSE kept warm`);
             this._setPhase('promoted');
             this._lastLiveness = Date.now();
             this._stableSince = Date.now();   // commit only after RTC_COMMIT_MS of GAPLESS decode
@@ -916,7 +923,7 @@ export class VideoRTC extends HTMLElement {
         const commit = () => {
             this._commitTID = 0;
             if (!this.pc || this._rtcPhase !== 'promoted' || !this._rtcVideo) return;
-            console.info(`[VideoRTC:${this.clientId}] RTC stable ${this.RTC_COMMIT_MS}ms @${Date.now() - pcStart}ms — committing (releasing MSE)`);
+            console.debug(`[VideoRTC:${this.clientId}] RTC stable ${this.RTC_COMMIT_MS}ms @${Date.now() - pcStart}ms — committing (releasing MSE)`);
             this._setPhase('committed');
             // Collapse onto the primary element (keeps the card's tools/PTZ bound to
             // this.video). Both show the same MediaStream during the swap -> no flash.
@@ -1003,7 +1010,7 @@ export class VideoRTC extends HTMLElement {
      */
     _setPhase(next) {
         if (this._rtcPhase === next) return;
-        console.info(`[VideoRTC:${this.clientId}] RTC phase ${this._rtcPhase} -> ${next}`);
+        console.debug(`[VideoRTC:${this.clientId}] RTC phase ${this._rtcPhase} -> ${next}`);
         this._rtcPhase = next;
     }
 
@@ -1094,7 +1101,7 @@ export class VideoRTC extends HTMLElement {
      * Logic for MJPEG (Motion JPEG) - Fallback mode
      */
     onmjpeg() {
-        console.info(`[VideoRTC:${this.clientId}] Mode: MJPEG`);
+        console.debug(`[VideoRTC:${this.clientId}] Mode: MJPEG`);
         this.ondata = data => {
             this.video.controls = false;
             this.video.poster = 'data:image/jpeg;base64,' + VideoRTC.btoa(data);
@@ -1106,7 +1113,7 @@ export class VideoRTC extends HTMLElement {
      * Logic for HLS (HTTP Live Streaming)
      */
     onhls() {
-        console.info(`[VideoRTC:${this.clientId}] Mode: HLS`);
+        console.debug(`[VideoRTC:${this.clientId}] Mode: HLS`);
         this.onmessage['hls'] = msg => {
             if (msg.type !== 'hls') return;
             const url = 'http' + this.wsURL.substring(2, this.wsURL.indexOf('/ws')) + '/hls/';
@@ -1121,7 +1128,7 @@ export class VideoRTC extends HTMLElement {
      * Logic for MP4 over WebSocket
      */
     onmp4() {
-        console.info(`[VideoRTC:${this.clientId}] Mode: MP4`);
+        console.debug(`[VideoRTC:${this.clientId}] Mode: MP4`);
         const canvas = document.createElement('canvas');
         let context;
         const video2 = document.createElement('video');

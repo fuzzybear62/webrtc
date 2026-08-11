@@ -241,7 +241,7 @@ async def websocket_forward(ws_from, ws_to) -> None:
     finally:
         duration = time.perf_counter() - t_start
         rate = (bytes_count / duration / 1024) if duration > 0 else 0
-        _LOGGER.info(
+        _LOGGER.debug(
             f"[BENCHMARK] Channel Closed | Duration: {duration:.2f}s | Bytes: {bytes_count} | Rate: {rate:.2f} KB/s"
         )
 

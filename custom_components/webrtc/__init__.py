@@ -289,7 +289,7 @@ class WebSocketView(HomeAssistantView):
             # Notify sensor to update
             async_dispatcher_send(hass, "webrtc_sessions_updated")
 
-            _LOGGER.info(
+            _LOGGER.debug(
                 f"[{client_id}] {'Shadow' if is_shadow else 'Client'}: {remote_ip} | "
                 f"Handshake: {handshake_ms:.2f}ms | "
                 f"Clients: {len(CLIENT_SESSIONS)} Shadows: {len(SHADOW_SESSIONS)}"
@@ -320,7 +320,7 @@ class WebSocketView(HomeAssistantView):
                 )
 
         except Exception as e:
-            _LOGGER.error(f"[{client_id}] Stream error: {e}")
+            _LOGGER.warning(f"[{client_id}] Stream error: {e}")
             await ws_server.send_json({"type": "error", "value": str(e)})
 
         finally:
@@ -339,7 +339,7 @@ class WebSocketView(HomeAssistantView):
                 # Notify sensor to update
                 async_dispatcher_send(hass, "webrtc_sessions_updated")
 
-            _LOGGER.info(
+            _LOGGER.debug(
                 f"[{client_id}] {'Shadow' if is_shadow else 'Stream'} ended. "
                 f"Remaining — Clients: {len(CLIENT_SESSIONS)} Shadows: {len(SHADOW_SESSIONS)}"
             )
