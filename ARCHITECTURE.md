@@ -3,7 +3,7 @@
 > Fork of AlexxIT/WebRTC. go2rtc streaming engine. HA custom integration.
 > This file is the **authoritative map** of what the code actually does. Consult it
 > instead of re-reading the large JS files; **keep it in sync** on every change.
-> Anchors (`file:line`) current as of **card v14.2.12 / driver v2.3.7**.
+> Anchors (`file:line`) current as of **card v14.2.13 / driver v2.3.7**.
 >
 > **Logging levels (rationalized, v14.2.10 / v2.3.7; card gate removed v14.2.11).** Both the JS
 > console and the Python backend use the *native* level filter as the gate — no custom gating
@@ -264,7 +264,11 @@ console. All off/inert by default — existing cards are byte-for-byte unaffecte
     every mode transition (initial land, shadow swap `_promoteShadowToMain`, direct-RTC `onpcvideo`,
     RTC→MSE revert). `stream-up` only fires on the *initial* ui_sync land (`:774`), so before this
     the fork's defining MSE→RTC upgrade and its reverts were invisible on the Companion apps (no
-    console). Detail is `a -> b` (e.g. `mse -> rtc`). Rare → negligible SD cost.
+    console). Detail is `a -> b` (e.g. `mse -> rtc`). Rare → negligible SD cost. **v14.2.13:** the
+    `_logHA` dedup-throttle is keyed by event name for every event EXCEPT `mode`, which keys by
+    `event+detail` — otherwise the two startup transitions (`none -> mse`, `mse -> rtc`) collapse
+    into one 10s bucket and the upgrade line is delayed + mislabelled `(repeated)`. High-cardinality
+    details (retry `attempt #N in Xms`) must stay event-keyed or the throttle is defeated.
 
 ## 5. Counter behaviour, fully explained
 
