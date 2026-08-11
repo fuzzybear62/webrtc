@@ -1,5 +1,11 @@
 /**
- * VideoRTC v2.3.5 - Explicit RTC phase machine + dead-path removal
+ * VideoRTC v2.3.6 - Close-reason on connection-closed (server-side debug logging)
+ * * Changelog v2.3.6:
+ * - ADD: the `connection-closed` CustomEvent now carries `detail.reason` so the card can log
+ * WHY a stream dropped without a browser console — 'ws-close' (server/browser closed the
+ * socket), 'no-data-watchdog' (5s silent freeze, socket still open), or 'ws-error' (strict
+ * mode). Purely additive: the field is optional and existing consumers ignore it. Feeds the
+ * card's new `debug`-gated Home Assistant logging (card v14.2.7).
  * * Changelog v2.3.5:
  * - REFACTOR (smell #1): the RTC handoff is now an explicit 4-state machine on `_rtcPhase`
  * ('warm' | 'negotiating' | 'promoted' | 'committed') driven through a single `_setPhase()`
@@ -385,6 +391,7 @@ export class VideoRTC extends HTMLElement {
         this.connectTS = Date.now();
         this.handoff = false; // Reset handoff state
         this._notifiedClosed = false; // Fresh connection: allow one close notification
+        this._closeReason = null; // Fresh connection: reset the diagnostic close reason
 
         this.ws = new WebSocket(this.wsURL);
         this.ws.binaryType = 'arraybuffer';
@@ -397,7 +404,8 @@ export class VideoRTC extends HTMLElement {
             if (this.strictMode) {
                 // STRICT: Fail fast on any error
                 console.warn(`[VideoRTC:${this.clientId}] WebSocket Error (Strict): Force Closing`, e);
-                this.onclose(); 
+                this._closeReason = 'ws-error';
+                this.onclose();
             } else {
                 // RELAXED: Log but keep trying (allows recovery from minor glitches)
                 console.warn(`[VideoRTC:${this.clientId}] WebSocket Error (Relaxed): Ignored`, e);
@@ -422,6 +430,7 @@ export class VideoRTC extends HTMLElement {
             this.reconnectTID = 0;
             console.warn(`[VideoRTC:${this.clientId}] No-data watchdog fired (${this.DISCONNECT_TIMEOUT}ms silent). Forcing close.`);
             this.handoff = false; // a stall is a failure, not an intentional handover
+            this._closeReason = 'no-data-watchdog';
             this.onclose();
         }, this.DISCONNECT_TIMEOUT);
     }
@@ -588,9 +597,13 @@ export class VideoRTC extends HTMLElement {
         if (this.ws) { this.ws.close(); this.ws = null; }
 
         this._notifiedClosed = true;
-        // Notify parent that connection died (triggers restart)
+        // Notify parent that connection died (triggers restart). `reason` lets the card log
+        // WHY without a browser console: 'no-data-watchdog' / 'ws-error' set by the proactive
+        // closers above, else a plain server/browser 'ws-close'.
+        const reason = this._closeReason || 'ws-close';
+        this._closeReason = null;
         this.dispatchEvent(new CustomEvent('connection-closed', {
-            detail: { url: this.wsURL }
+            detail: { url: this.wsURL, reason }
         }));
         return true;
     }
