@@ -303,7 +303,7 @@ behave well on bad networks. They exist only for fine-tuning or diagnostics.
 | `rtc_reprobe_base`  | number  | `30000` (ms)         | First wait between those background retries. |
 | `rtc_reprobe_max`   | number  | `600000` (ms, 10 min)| Longest wait between those background retries. |
 | `pause_delay`       | number  | `5000` (ms)          | Grace period before pausing a scrolled-away camera (only with `background: false`). |
-| `debug`             | boolean or entity_id | `false` | Mirror this camera's stream lifecycle to `home-assistant.log`. See [Debug logging](#debug-logging-troubleshooting-stream-loss). |
+| `debug`             | boolean or entity_id | `false` | Mirror this camera's stream lifecycle to the HA log (Settings → System → Logs). See [Debug logging](#debug-logging-troubleshooting-stream-loss). |
 
 ```yaml
 type: 'custom:webrtc-camera'
@@ -559,8 +559,8 @@ new resource version.
 
 The browser console is the natural place to watch a stream — but the **Home Assistant mobile app has no
 console**. If a camera keeps dropping only on a phone (e.g. on mobile data / 5G) you are blind. The
-`debug` card option fixes that by mirroring the stream's lifecycle to **`home-assistant.log`**, which you
-can read from the app (Settings → System → Logs) or over SSH — no console required.
+`debug` card option fixes that by mirroring the stream's lifecycle to the HA log, which you can read from
+the app under **Settings → System → Logs** — no console required.
 
 **Turn it on** in one of two ways:
 
@@ -593,13 +593,28 @@ written to the HA log unless you opt in.
 
 Repeated identical events are **throttled**: the first logs immediately, further ones in a 10-second
 window are counted and flushed once as `(repeated N× in 10s)`, so a flapping camera can't flood the log.
-All events are at info/warning, so they appear with the default log level — no `logger:` override needed
-(the [Debug](#debug) snippet above only adds the browser-side `debug` verbosity).
 
-**Recipe for the 5G stream-loss case:** set `debug: input_boolean.debug` on the affected cameras, turn
-the helper on, reproduce the loss on the phone, then read `home-assistant.log`. A run of
-`connection-closed: no-data-watchdog` → `retry` → `stream-up` is the network dropping and the card
-recovering; the same run *immediately after* a `page-hidden` points at the app backgrounding instead.
+**You must raise the log level to `info` to see the `info` events.** The two `warning` events
+(`connection-closed`, `driver-error`) show up in **Settings → System → Logs** out of the box, but the
+`info` events (`retry`, `stream-up`, `page-hidden` / `page-visible`, `auto-pause` / `auto-resume`) are
+filtered out at the default level. Add this to `configuration.yaml` and restart:
+
+```yaml
+logger:
+  logs:
+    custom_components.webrtc: info
+```
+
+> **Note:** modern Home Assistant no longer keeps a persistent `home-assistant.log` file on disk (it was
+> dropped to cut SD-card write wear) — read the log live in the app under **Settings → System → Logs**,
+> not from a file over SSH. The `info` events exist only in that live stream; scope the `logger:` override
+> to `custom_components.webrtc` so you don't turn every other integration verbose and thrash the log.
+
+**Recipe for the 5G stream-loss case:** set `debug: input_boolean.debug` on the affected cameras, add the
+`logger:` block above, turn the helper on, reproduce the loss on the phone, then watch **Settings → System
+→ Logs**. A run of `connection-closed: no-data-watchdog` → `retry` → `stream-up` is the network dropping
+and the card recovering; the same run *immediately after* a `page-hidden` points at the app backgrounding
+instead.
 
 ## Known work cameras
 

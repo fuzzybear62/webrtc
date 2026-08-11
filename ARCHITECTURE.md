@@ -236,14 +236,16 @@ console. All off/inert by default — existing cards are byte-for-byte unaffecte
   reflow was always the video teardown, never the status text.
 - **Server-side logging** — opt-in `debug` card option: `true` (always) | `<entity_id>` e.g.
   `input_boolean.debug` (gated LIVE on that entity `== 'on'`, so one switch toggles the whole fleet)
-  | unset/false (off). `_logHA(level,event,detail)` mirrors lifecycle events to `home-assistant.log`
-  via `system_log.write` (logger `custom_components.webrtc`, message `[url] event: detail`),
+  | unset/false (off). `_logHA(level,event,detail)` mirrors lifecycle events to the HA log (Settings →
+  System → Logs; no on-disk file in modern HA) via `system_log.write` (logger
+  `custom_components.webrtc`, message `[url] event: detail`),
   **dedup-throttled** (`_logThrottle` Map, 10s window: first emits, repeats counted + flushed once as
   `(repeated N× in 10s)`) so a flapping stream can't flood the log. Events: `driver-error` (W),
   `connection-closed`+reason (W), `retry` (I), `stream-up` (I), `auto-pause`/`auto-resume` (I),
   `page-hidden`/`page-visible` (I — the 5G/backgrounding correlation, from an always-attached,
   emit-self-gated `visibilitychange` listener `_setupDebugVisibilityLog`, torn down + throttle
-  cleared in `disconnectedCallback`). All at info/warning so they show without a logger override.
+  cleared in `disconnectedCallback`). The two W events surface in the Logs panel by default; the I
+  events need `logger: { logs: { custom_components.webrtc: info } }` in `configuration.yaml` to appear.
 
 ## 5. Counter behaviour, fully explained
 
