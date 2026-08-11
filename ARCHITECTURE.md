@@ -3,17 +3,19 @@
 > Fork of AlexxIT/WebRTC. go2rtc streaming engine. HA custom integration.
 > This file is the **authoritative map** of what the code actually does. Consult it
 > instead of re-reading the large JS files; **keep it in sync** on every change.
-> Anchors (`file:line`) current as of **card v14.2.10 / driver v2.3.7**.
+> Anchors (`file:line`) current as of **card v14.2.11 / driver v2.3.7**.
 >
-> **Logging levels (rationalized, v14.2.10 / v2.3.7).** Both the JS console and the Python backend
-> use the *native* level filter as the gate — no custom console gating. `debug` = routine
-> lifecycle / negotiation / shadow-upgrade traces (hidden by default: browser Verbose off, HA log
-> at default). `info` = rare user-meaningful milestones only (version banner, Hard Reset, Next
-> Stream). `warn` = recoverable, auto-handled anomalies (connection-closed, no-data watchdog, RTC
-> revert, ws/ICE/SDP/buffer/video/mic errors, and — reclassified from error — `Main Driver Error` /
-> backend `Stream error`, since a `no route to host` is a network transient the retry loop handles).
-> `error` = unrecoverable (auth failure, go2rtc crash, binary download failure). The card's opt-in
-> `debug`→`custom_components.webrtc.card` server-side mirror (v14.2.9) is unaffected.
+> **Logging levels (rationalized, v14.2.10 / v2.3.7; card gate removed v14.2.11).** Both the JS
+> console and the Python backend use the *native* level filter as the gate — no custom gating
+> anywhere. `debug` = routine lifecycle / negotiation / shadow-upgrade traces (hidden by default:
+> browser Verbose off, HA log at default). `info` = rare user-meaningful milestones only (version
+> banner, Hard Reset, Next Stream). `warn` = recoverable, auto-handled anomalies (connection-closed,
+> no-data watchdog, RTC revert, ws/ICE/SDP/buffer/video/mic errors, and — reclassified from error —
+> `Main Driver Error` / backend `Stream error`, since a `no route to host` is a network transient the
+> retry loop handles). `error` = unrecoverable (auth failure, go2rtc crash, binary download failure).
+> The card's `custom_components.webrtc.card` server-side mirror (`_logHA`, v14.2.9) is now **always
+> on** — the old `debug` card-option gate was removed in v14.2.11; the sub-logger level is the only
+> filter (warn events default-visible; debug events need the sub-logger raised to `debug`).
 
 ## 1. File map
 
@@ -244,20 +246,20 @@ console. All off/inert by default — existing cards are byte-for-byte unaffecte
   media mode lands (the three healthy points: shared negotiated block, direct-RTC `onpcvideo`,
   `_promoteShadowToMain`). The header is `position:absolute` and never contributed to height — the
   reflow was always the video teardown, never the status text.
-- **Server-side logging** — opt-in `debug` card option: `true` (always) | `<entity_id>` e.g.
-  `input_boolean.debug` (gated LIVE on that entity `== 'on'`, so one switch toggles the whole fleet)
-  | unset/false (off). `_logHA(level,event,detail)` mirrors lifecycle events to the HA log (Settings →
-  System → Logs; no on-disk file in modern HA) via `system_log.write` (logger
-  `custom_components.webrtc.card` — a DEDICATED sub-logger, so it can be raised to info alone without
-  un-muting the backend proxy's chatty handshake/benchmark info logging on `custom_components.webrtc`;
-  message `[url] event: detail`),
-  **dedup-throttled** (`_logThrottle` Map, 10s window: first emits, repeats counted + flushed once as
-  `(repeated N× in 10s)`) so a flapping stream can't flood the log. Events: `driver-error` (W),
-  `connection-closed`+reason (W), `retry` (I), `stream-up` (I), `auto-pause`/`auto-resume` (I),
-  `page-hidden`/`page-visible` (I — the 5G/backgrounding correlation, from an always-attached,
-  emit-self-gated `visibilitychange` listener `_setupDebugVisibilityLog`, torn down + throttle
-  cleared in `disconnectedCallback`). The two W events surface in the Logs panel by default; the I
-  events need `logger: { logs: { custom_components.webrtc.card: info } }` in `configuration.yaml`.
+- **Server-side logging** — `_logHA(level,event,detail)` mirrors lifecycle events to the HA log
+  (Settings → System → Logs; no on-disk file in modern HA) via `system_log.write` (logger
+  `custom_components.webrtc.card` — a DEDICATED sub-logger, so it can be raised alone without
+  un-muting the backend proxy's chatty handshake/benchmark logging on `custom_components.webrtc`;
+  message `[url] event: detail`), **dedup-throttled** (`_logThrottle` Map, 10s window: first emits,
+  repeats counted + flushed once as `(repeated N× in 10s)`) so a flapping stream can't flood the log.
+  **v14.2.11: always on, no gate.** The original opt-in `debug` card option (`true` | `<entity_id>` |
+  off) and its `_debugEnabled()` check were removed — the only filter is now the native sub-logger
+  level (mirrors the console model). Events, at rationalized levels: `driver-error` (W),
+  `connection-closed`+reason (W), `retry` (D), `stream-up` (D), `auto-pause`/`auto-resume` (D),
+  `page-hidden`/`page-visible` (D — the 5G/backgrounding correlation, from an always-attached
+  `visibilitychange` listener `_setupDebugVisibilityLog`, torn down + throttle cleared in
+  `disconnectedCallback`). The two W events surface in the Logs panel by default; the D events need
+  `logger: { logs: { custom_components.webrtc.card: debug } }` in `configuration.yaml`.
 
 ## 5. Counter behaviour, fully explained
 
