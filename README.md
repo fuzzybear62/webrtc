@@ -606,6 +606,27 @@ then watch the log. A run of `connection-closed: no-data-watchdog` → `retry` �
 dropping and the card recovering; the same run *immediately after* a `page-hidden` points at the app
 backgrounding instead.
 
+## Companion add-on: cameras behind Wi-Fi repeaters (`no route to host`)
+
+If a camera reached over **cascaded Wi-Fi repeaters** intermittently becomes unreachable *from Home
+Assistant* — go2rtc logs `driver-error: … dial tcp <ip>:554: connect: no route to host` — while the
+**vendor app keeps working** and **only a camera reboot** recovers it, the cause is almost always
+ARP/broadcast black-holing across the repeater chain, not the card or go2rtc: Home Assistant's ARP
+resolution for the camera fails (the neighbor entry goes `INCOMPLETE`), so the direct LAN dial to `:554`
+dies even though the camera is up.
+
+A small companion Home Assistant add-on works around it by pinning each camera's `IP → MAC` as a
+**permanent ARP entry** on the host, so HA never needs to re-resolve it via the (black-holed) broadcast:
+
+**→ [Static ARP for cameras](https://github.com/fuzzybear62/ha-apps)** — add the repository URL under
+**Settings → Apps → App Store → ⋮ → Repositories**, then install.
+
+> **Scope:** this is a **Home Assistant OS** add-on built for **aarch64**, developed and validated on a
+> **Raspberry Pi 5** (it applies to other aarch64 HAOS hosts too). It relies on the Supervisor add-on model
+> (`host_network` + `NET_ADMIN`), so it does **not** apply to Home Assistant Container/Core installs or
+> other architectures without changes. It is a Layer-2 workaround for a flaky repeater path — the robust
+> structural fix remains a wired or mesh backhaul.
+
 ## Known work cameras
 
 | Brand        | Models                                                | Comment                                                                                                                                                                                                                              |
