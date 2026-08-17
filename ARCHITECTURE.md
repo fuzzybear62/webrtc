@@ -3,7 +3,7 @@
 > Fork of AlexxIT/WebRTC. go2rtc streaming engine. HA custom integration.
 > This file is the **authoritative map** of what the code actually does. Consult it
 > instead of re-reading the large JS files; **keep it in sync** on every change.
-> Anchors (`file:line`) current as of **card v14.2.14 / driver v2.3.7**.
+> Anchors (`file:line`) current as of **card v14.2.16 / driver v2.3.8**.
 >
 > **Logging levels (rationalized, v14.2.10 / v2.3.7; card gate removed v14.2.11).** Both the JS
 > console and the Python backend use the *native* level filter as the gate — no custom gating
