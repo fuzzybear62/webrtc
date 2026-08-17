@@ -1,5 +1,12 @@
 /**
- * VideoRTC v2.3.7 - Console log-level rationalization (no behaviour change)
+ * VideoRTC v2.3.8 - Revoke MSE blob URL on teardown (memory)
+ * * Changelog v2.3.8:
+ * - FIX: ondisconnect() now revokes the MSE blob URL (URL.createObjectURL(ms),
+ * legacy MediaSource path on Chrome/Firefox) if the {once} 'sourceopen' handler
+ * never fired — i.e. a driver torn down before the MediaSource opened (a shadow
+ * reaped within ms, or teardown mid-negotiation). Without it the blob->MediaSource
+ * mapping leaked one entry per such driver, growing slowly under reprobe churn.
+ * Double revoke is a harmless no-op; ManagedMediaSource (srcObject) is unaffected.
  * * Changelog v2.3.7:
  * - CHANGE: routine lifecycle/negotiation traces (Mode:*, pc state, RTC promote/commit/phase,
  * RTC-rejected, autoplay-warn, "WebRTC …; keeping MSE", relaxed-ws-error "Ignored") moved from
@@ -500,6 +507,17 @@ export class VideoRTC extends HTMLElement {
         
         // 3. Clear Video
         if (this.video) {
+            // [MEMORY] Revoke the MSE blob URL on the legacy MediaSource path
+            // (Chrome/Firefox: video.src = URL.createObjectURL(ms), onmse()).
+            // Normally the {once} 'sourceopen' handler already revoked it, but if
+            // this driver is torn down BEFORE sourceopen fires (a shadow reaped
+            // within ms, or teardown mid-negotiation) that handler never ran, so
+            // the blob->MediaSource mapping would leak. Revoke here too: a double
+            // revoke is a harmless no-op. The ManagedMediaSource path uses
+            // srcObject (src stays ''), so the blob: guard skips it.
+            if (this.video.src && this.video.src.startsWith('blob:')) {
+                URL.revokeObjectURL(this.video.src);
+            }
             this.video.src = '';
             this.video.srcObject = null;
         }

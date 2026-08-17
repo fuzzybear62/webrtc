@@ -115,6 +115,22 @@ async def validate_binary(hass: HomeAssistant) -> Optional[str]:
     return filename
 
 
+def read_driver_version(www_path) -> str:
+    """Parse the driver cache-bust pin (`video-rtc.js?v=X.Y.Z`) from webrtc-camera.js.
+
+    That import pin is the authoritative selector for which driver the card actually
+    loads, so it is the single source of truth for the driver version (no duplicated
+    constant to drift). Runs off the event loop (small file read). Returns '?' on any
+    failure — a missing banner must never break setup.
+    """
+    try:
+        text = (www_path / "webrtc-camera.js").read_text(encoding="utf-8")
+        m = re.search(r"video-rtc\.js\?v=([0-9]+\.[0-9]+\.[0-9]+)", text)
+        return m.group(1) if m else "?"
+    except Exception:  # noqa: BLE001 — banner is best-effort
+        return "?"
+
+
 async def register_static_path(hass: HomeAssistant, url_path: str, path: str):
     if (MAJOR_VERSION, MINOR_VERSION) >= (2024, 7):
         from homeassistant.components.http import StaticPathConfig

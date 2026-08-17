@@ -20,6 +20,20 @@
  *
  * CHANGELOG
  * ---------
+ * v14.2.16 — Fix a regression from the always-on server-side logging (v14.2.11): a failed
+ *   `system_log.write` popped a user-facing "Impossibile eseguire l'azione system_log.write"
+ *   toast — one PER CARD — on the Android companion when resuming from a long lock-screen (the
+ *   page-visible lifecycle write fires while the WS is still reconnecting, so it rejects with
+ *   unknown_error). `_emitLog` now passes `notifyOnError=false` to `hass.callService` (HA's
+ *   frontend defaults it to true and pops the toast itself) and `.catch()`es the returned promise
+ *   (the async rejection was never caught by the synchronous try/catch → unhandled rejection).
+ *   Diagnostic logging is now truly silent on failure. Also guards `!this._hass`.
+ * v14.2.15 — Memory-hygiene pass. (1) Load driver v2.3.8 (MSE blob-URL revoke on teardown) via
+ *   the `video-rtc.js?v=` import pin; the manifest bump re-fetches the card and pulls the new
+ *   driver past the browser/PWA cache. (2) Store each main driver's `connection-closed` listener
+ *   ON the driver (`_connClosedHandler`, via `_attachMainConnClosed`) instead of a single shared
+ *   card field, so `_nukeDriver` always removes the exact right listener regardless of call order
+ *   (removes a latent correctness fragility — see the `_attachMainConnClosed` docblock).
  * v14.2.14 — Fix a retry-latch deadlock: a recovered camera never reconnected. `_scheduleRetry`
  *   cleared `_retryTimer` BEFORE the `_isReconnecting` guard, so a burst of errors from the same
  *   dying driver (mse-fail → webrtc/offer-fail → ws-close, all within ms) landing inside the backoff
@@ -96,7 +110,7 @@
  *   _promoteShadowToMain().
  */
 
-import {VideoRTC} from './video-rtc.js?v=2.3.7';
+import {VideoRTC} from './video-rtc.js?v=2.3.8';
 import {DigitalPTZ} from './digital-ptz.js?v=3.3.0';
 // [SIDECAR INTEGRATION] Import the Interaction module.
 // This module handles legacy features (Shortcuts, PTZ, Styles) to keep the core driver clean.
@@ -204,7 +218,7 @@ class WebRTCCamera extends HTMLElement {
         // (correlates stream loss with the mobile app backgrounding / 5G handoff).
         this._logVisAbort = null;
 
-        console.info('[WebRTC Camera] v14.2.14');
+        console.info('[WebRTC Camera] v14.2.16');
     }
 
     setConfig(config) {
@@ -462,17 +476,36 @@ class WebRTCCamera extends HTMLElement {
     }
 
     _emitLog(level, event, detail) {
+        if (!this._hass) return;
         const cam = (this.config && (this.config.url || this.config.entity)) || '?';
         const message = `[${cam}] ${event}${detail != null ? ': ' + detail : ''}`;
         try {
-            this._hass.callService('system_log', 'write', {
-                level,
-                // Dedicated sub-logger so the card's lifecycle events can be raised alone
-                // (logger: logs: custom_components.webrtc.card: debug) without un-muting the
-                // chatty backend proxy logging (handshake/benchmark) on `custom_components.webrtc`.
-                logger: 'custom_components.webrtc.card',
-                message,
-            });
+            // [SILENT] This is best-effort diagnostic logging — it must never surface to the
+            // user. Two guards are required:
+            //  (1) notifyOnError=false (5th arg): HA's frontend callService defaults to
+            //      notifyOnError=true and pops a "Impossibile eseguire l'azione system_log.write"
+            //      toast on failure. On the Android companion resume-from-lock the WS is briefly
+            //      reconnecting, so a page-visible/lifecycle write can reject with unknown_error —
+            //      one toast PER CARD. false suppresses that toast.
+            //  (2) .catch() on the returned promise: callService is async, so the surrounding
+            //      try/catch only traps a synchronous throw (e.g. _hass gone), NOT a promise
+            //      rejection — without .catch() the rejection is unhandled.
+            const p = this._hass.callService(
+                'system_log', 'write',
+                {
+                    level,
+                    // Dedicated sub-logger so the card's lifecycle events can be raised alone
+                    // (logger: logs: custom_components.webrtc.card: debug) without un-muting the
+                    // chatty backend proxy logging (handshake/benchmark) on `custom_components.webrtc`.
+                    logger: 'custom_components.webrtc.card',
+                    message,
+                },
+                undefined,   // target
+                false,       // notifyOnError — stay silent; this is diagnostic logging
+            );
+            if (p && typeof p.catch === 'function') {
+                p.catch((e) => console.debug('[WebRTC Camera] system_log.write failed', e));
+            }
         } catch (e) {
             // Logging must never break the stream.
             console.debug('[WebRTC Camera] system_log.write failed', e);
@@ -613,13 +646,7 @@ class WebRTCCamera extends HTMLElement {
         // global retry. Pre-swap shadows deliberately have no such listener (they must fail
         // silently); without re-attaching it here a genuine ws death after the swap would go
         // unhandled (the old webrtc-only shadow froze black in exactly this gap).
-        this._handleConnectionClosed = (e) => {
-            const reason = (e && e.detail && e.detail.reason) || 'closed';
-            console.warn(`[WebRTC Camera] Main Driver Connection Closed (${reason})`);
-            this._logHA('warning', 'connection-closed', reason);
-            this._scheduleRetry();
-        };
-        newDriver.addEventListener('connection-closed', this._handleConnectionClosed);
+        this._attachMainConnClosed(newDriver);
 
         // [AUDIO] The shadow was force-muted for background negotiation. Restore the configured
         // audio state via the driver, which routes it to the correct element (RTC overlay while
@@ -805,6 +832,23 @@ class WebRTCCamera extends HTMLElement {
         }
     }
 
+    // [RESILIENCE] Attach the main driver's connection-closed → global retry handler.
+    // The exact listener reference is stored ON the driver (`_connClosedHandler`) — NOT in a
+    // single shared card field — so _nukeDriver always removes the right one no matter the call
+    // order. The previous shared-field design was correct only because nuke-before-reassign
+    // happened to hold; storing per-driver makes removal self-consistent by construction.
+    // Pre-swap shadows never get this handler (they must fail silently).
+    _attachMainConnClosed(driver) {
+        const handler = (e) => {
+            const reason = (e && e.detail && e.detail.reason) || 'closed';
+            console.warn(`[WebRTC Camera] Main Driver Connection Closed (${reason})`);
+            this._logHA('warning', 'connection-closed', reason);
+            this._scheduleRetry();
+        };
+        driver._connClosedHandler = handler;
+        driver.addEventListener('connection-closed', handler);
+    }
+
     _nukeDriver(driverRef, label) {
         if (!driverRef) return;
 
@@ -816,9 +860,14 @@ class WebRTCCamera extends HTMLElement {
             clearTimeout(this._shadowTimeout);
             this._shadowTimeout = null;
         }
-        
-        driverRef.removeEventListener('connection-closed', this._handleConnectionClosed);
-        
+
+        // Remove THIS driver's own connection-closed listener (stored on the driver), so
+        // removal never depends on a shared card field that may have been reassigned.
+        if (driverRef._connClosedHandler) {
+            driverRef.removeEventListener('connection-closed', driverRef._connClosedHandler);
+            driverRef._connClosedHandler = null;
+        }
+
         // Break callbacks
         driverRef.onmessage = () => {};
         driverRef.onpcvideo = () => {};
@@ -1100,13 +1149,7 @@ class WebRTCCamera extends HTMLElement {
         // Any unexpected connection close triggers a controlled retry.
         // [SEAMLESS HANDOVER] Only main driver triggers global retry. Shadow driver just dies silently.
         if (!isShadowMode) {
-            this._handleConnectionClosed = (e) => {
-                const reason = (e && e.detail && e.detail.reason) || 'closed';
-                console.warn(`[WebRTC Camera] Main Driver Connection Closed (${reason})`);
-                this._logHA('warning', 'connection-closed', reason);
-                this._scheduleRetry();
-            };
-            newDriver.addEventListener('connection-closed', this._handleConnectionClosed);
+            this._attachMainConnClosed(newDriver);
         }
 
         // Driver → UI messaging is intentionally minimal; the driver never touches the UI.

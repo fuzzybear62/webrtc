@@ -68,6 +68,16 @@ async def async_setup(hass: HomeAssistant, config: dict):
     version = getattr(hass.data["integrations"][DOMAIN], "version", 0)
     await utils.init_resource(hass, "/webrtc/webrtc-camera.js", str(version))
 
+    # [STARTUP BANNER] Log card + driver versions at setup, mirroring the x8000 integration.
+    # Card version = manifest version; driver version = the authoritative cache-bust pin
+    # (video-rtc.js?v=) read from webrtc-camera.js, so the banner reports exactly what loads.
+    driver_version = await hass.async_add_executor_job(utils.read_driver_version, path)
+    _LOGGER.info(
+        "Setting up WebRTC Camera integration (card v%s / driver v%s)",
+        version,
+        driver_version,
+    )
+
     await utils.register_static_path(hass, "/webrtc/embed", str(path / "embed.html"))
 
     hass.http.register_view(WebSocketView)
