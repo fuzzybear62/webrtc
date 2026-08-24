@@ -1,0 +1,58 @@
+name: Validate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # Weekly, so HA/HACS rule changes surface even without a push.
+    - cron: "30 4 * * 1"
+
+jobs:
+  hassfest:
+    # Validates manifest.json and that the integration imports cleanly
+    # (catches broken imports like an unguarded homeassistant.components.* path).
+    name: hassfest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: home-assistant/actions/hassfest@master
+
+  hacs:
+    # Validates the repository is installable as a HACS custom integration
+    # (hacs.json, structure, brands/version rules relaxed for a fork).
+    name: HACS
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hacs/action@main
+        with:
+          category: integration
+          # This is a fork of AlexxIT/WebRTC and not (yet) in the HACS default
+          # brands list; skip only the brand check, keep every other rule.
+          ignore: brands
+
+  pytest:
+    # Behavioral tests for the Python fixes (#956 auth 403, #961 ws_poster guard).
+    name: pytest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install -r requirements_test.txt
+      - run: pytest -q
+
+  jstest:
+    # Behavioral test for the JS fix (#951 autoplay mute-fallback gating).
+    name: vitest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: npm install
+      - run: npm test

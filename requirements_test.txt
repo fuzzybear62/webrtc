@@ -1,0 +1,4 @@
+# Test deps for the Python behavioral suite (tests/test_*.py).
+# pytest-homeassistant-custom-component pins a matched Home Assistant + pytest +
+# pytest-asyncio set, so importing custom_components.webrtc resolves cleanly.
+pytest-homeassistant-custom-component
