@@ -25,6 +25,14 @@
  *
  * CHANGELOG
  * ---------
+ * v14.3.1 — Fix `tap_action` (#668): the card now EXECUTES the action itself instead of
+ *   dispatching a `hass-action` event that nothing catches for a standalone custom card
+ *   (so `more-info` etc. silently did nothing). `handleAction` handles more-info
+ *   (via `hass-more-info`), navigate (`location-changed`), url, toggle, perform-action /
+ *   call-service (`hass.callService`) and fire-dom-event, with entity fallback
+ *   action.entity → config.entity → current stream's entity.
+ * v14.3.0 — Feature batch: media_player /api/ffmpeg (#942) + volume_entity (#945),
+ *   tap_action (#668, pinch/PTZ-safe), live_indicator dot (#922).
  * v14.2.16 — Fix a regression from the always-on server-side logging (v14.2.11): a failed
  *   `system_log.write` popped a user-facing "Impossibile eseguire l'azione system_log.write"
  *   toast — one PER CARD — on the Android companion when resuming from a long lock-screen (the
@@ -223,7 +231,7 @@ class WebRTCCamera extends HTMLElement {
         // (correlates stream loss with the mobile app backgrounding / 5G handoff).
         this._logVisAbort = null;
 
-        console.info('[WebRTC Camera] v14.2.16');
+        console.info('[WebRTC Camera] v14.3.1');
     }
 
     setConfig(config) {
@@ -1783,12 +1791,64 @@ class WebRTCCamera extends HTMLElement {
         }
     }
 
-    // Dispatch the standard Home Assistant action event so tap_action integrates
-    // with Lovelace exactly like any other card (navigate, more-info, call-service, url).
-    handleAction(action) {
-        const event = new Event('hass-action', {bubbles: true, composed: true});
-        event.detail = {config: this.config, action};
-        this.dispatchEvent(event);
+    // Perform the configured `<kind>_action` (kind = 'tap' | 'hold' | 'double_tap').
+    // A standalone custom card can't rely on the `hass-action` event bubbling to a
+    // Lovelace handler — nothing upstream catches it here — so we execute the action
+    // ourselves via the global events HA actually listens for (`hass-more-info`,
+    // `location-changed`) and `hass.callService`. Supports the standard action names:
+    // more-info, navigate, url, toggle, perform-action (a.k.a. call-service),
+    // fire-dom-event, none.
+    handleAction(kind) {
+        const cfg = (this.config && this.config[`${kind}_action`]) || null;
+        if (!cfg || !cfg.action || cfg.action === 'none') return;
+
+        // Entity resolution for entity-scoped actions: explicit action entity,
+        // then the card's top-level entity, then the current stream's entity.
+        const stream = (this.config.streams && this.config.streams[this.streamID]) || {};
+        const entityId = cfg.entity || this.config.entity || stream.entity;
+
+        switch (cfg.action) {
+            case 'more-info':
+                if (entityId) {
+                    this.dispatchEvent(new CustomEvent('hass-more-info', {
+                        bubbles: true, composed: true, detail: {entityId},
+                    }));
+                }
+                break;
+            case 'navigate':
+                if (cfg.navigation_path) {
+                    history.pushState(null, '', cfg.navigation_path);
+                    this.dispatchEvent(new CustomEvent('location-changed', {
+                        bubbles: true, composed: true, detail: {replace: false},
+                    }));
+                }
+                break;
+            case 'url':
+                if (cfg.url_path) window.open(cfg.url_path);
+                break;
+            case 'toggle':
+                if (entityId && this._hass) {
+                    this._hass.callService('homeassistant', 'toggle', {entity_id: entityId});
+                }
+                break;
+            case 'perform-action':
+            case 'call-service': {
+                const svc = cfg.perform_action || cfg.service;
+                if (svc && this._hass) {
+                    const [domain, service] = svc.split('.', 2);
+                    if (domain && service) {
+                        const data = cfg.data || cfg.service_data || {};
+                        this._hass.callService(domain, service, data, cfg.target);
+                    }
+                }
+                break;
+            }
+            case 'fire-dom-event':
+                this.dispatchEvent(new CustomEvent('ll-custom', {
+                    bubbles: true, composed: true, detail: cfg,
+                }));
+                break;
+        }
     }
 
     requestFullscreen(video) {
