@@ -1,3 +1,8 @@
+/*!
+ * Copyright (c) 2023 Alexey Khit (https://github.com/AlexxIT/WebRTC)
+ * Copyright (c) 2026 fuzzybear62 (https://github.com/fuzzybear62/webrtc)
+ * Derived from AlexxIT/WebRTC. Licensed under the MIT License — see LICENSE.
+ */
 /**
  * WebRTC Camera Card v14.1.0
  *
