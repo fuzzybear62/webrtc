@@ -1488,7 +1488,18 @@ class WebRTCCamera extends HTMLElement {
             .mode { cursor: pointer; opacity: 0.6; }
             .refresh { cursor: pointer; opacity: 0.6; }
             .refresh:hover, .mode:hover { opacity: 1; }
-            
+
+            /* Live indicator (opt-in via live_indicator: true). Red = no fresh
+               frames, green = video advancing. Driven by requestVideoFrameCallback
+               on the active driver's <video> — UI-only, independent of the
+               driver's promotion/first-frame logic. */
+            .live-dot {
+                width: 8px; height: 8px; border-radius: 50%;
+                background-color: #D2122E; align-self: center;
+                transition: background-color 0.3s;
+            }
+            .live-dot.live { background-color: #90EE90; }
+
             video-rtc { width: 100%; height: 100%; display: block; }
             ha-icon { color: white; cursor: pointer; }
             
@@ -1511,6 +1522,7 @@ class WebRTCCamera extends HTMLElement {
             <div class="header">
                 <div class="status"></div>
                 <div class="right-controls">
+                    ${this.config.live_indicator === true ? '<div class="live-dot"></div>' : ''}
                     <ha-icon class="refresh" icon="mdi:refresh" title="Hard Reset"></ha-icon>
                     <div class="mode"></div>
                 </div>
@@ -1706,6 +1718,77 @@ class WebRTCCamera extends HTMLElement {
         if (streamLabel) {
             streamLabel.style.display = this.config.streams.length > 1 ? 'block' : 'none';
         }
+
+        // --- tap_action (#668) -------------------------------------------------
+        // Fire the standard Lovelace `hass-action` on a CLEAN single-finger tap.
+        // Deliberately gated so it never steals a digital-PTZ gesture: a pinch
+        // (2 pointers) or a pan (movement) is ignored, and taps on the control
+        // overlay (.ui) are ignored. Listeners are passive and never
+        // stopPropagation, so digital-ptz keeps receiving the same events.
+        const tap = this.config.tap_action;
+        if (tap && tap.action && tap.action !== 'none') {
+            const player = root.querySelector('.player');
+            let sx = 0, sy = 0, active = 0, moved = false, multi = false;
+            player.addEventListener('pointerdown', ev => {
+                active++;
+                if (active > 1) { multi = true; return; }
+                sx = ev.clientX; sy = ev.clientY; moved = false; multi = false;
+            }, {signal});
+            player.addEventListener('pointermove', ev => {
+                if (active >= 1 && (Math.abs(ev.clientX - sx) > 10 || Math.abs(ev.clientY - sy) > 10)) {
+                    moved = true;
+                }
+            }, {signal});
+            const endPointer = ev => {
+                active = Math.max(0, active - 1);
+                if (active > 0) return;            // wait for the last finger up
+                const clean = !moved && !multi;
+                moved = false; multi = false;
+                if (!clean) return;
+                if (ev.target && ev.target.closest && ev.target.closest('.ui')) return;
+                this.handleAction('tap');
+            };
+            player.addEventListener('pointerup', endPointer, {signal});
+            player.addEventListener('pointercancel', () => {
+                active = Math.max(0, active - 1);
+                if (active === 0) { moved = false; multi = false; }
+            }, {signal});
+        }
+
+        // --- live indicator (#922) --------------------------------------------
+        // UI-only liveness dot, bound to the CURRENT driver's <video>. Uses
+        // requestVideoFrameCallback (fires per presented frame, so it also
+        // catches a silent freeze that emits no 'waiting') plus a 500ms watchdog.
+        // Rebound on every renderCustomUI (i.e. every driver swap); the interval
+        // is cleared when this render's AbortController fires.
+        if (this._liveTimer) { clearInterval(this._liveTimer); this._liveTimer = null; }
+        if (this.config.live_indicator === true) {
+            const dot = root.querySelector('.live-dot');
+            if (dot && video.requestVideoFrameCallback) {
+                let lastFrame = 0;
+                const beat = () => {
+                    lastFrame = Date.now();
+                    if (this.driver && this.driver.video === video && video.requestVideoFrameCallback) {
+                        video.requestVideoFrameCallback(beat);
+                    }
+                };
+                video.requestVideoFrameCallback(beat);
+                this._liveTimer = setInterval(() => {
+                    dot.classList.toggle('live', Date.now() - lastFrame < 500);
+                }, 500);
+                signal.addEventListener('abort', () => {
+                    if (this._liveTimer) { clearInterval(this._liveTimer); this._liveTimer = null; }
+                });
+            }
+        }
+    }
+
+    // Dispatch the standard Home Assistant action event so tap_action integrates
+    // with Lovelace exactly like any other card (navigate, more-info, call-service, url).
+    handleAction(action) {
+        const event = new Event('hass-action', {bubbles: true, composed: true});
+        event.detail = {config: this.config, action};
+        this.dispatchEvent(event);
     }
 
     requestFullscreen(video) {
