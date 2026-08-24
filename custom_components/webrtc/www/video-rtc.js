@@ -323,11 +323,15 @@ export class VideoRTC extends HTMLElement {
 
         this.video.play().catch(er => {
             if (er.name === 'AbortError') return; // Ignore aborts (user navigated away)
-            
-            // If play failed (likely due to Audio Policy), mute and try again.
-            if (!this.video.muted) {
+
+            // Mute-fallback ONLY on a real autoplay-policy block (NotAllowedError).
+            // Other rejections (transient decode errors, races during reconnect) must
+            // NOT force a permanent mute — that silences audio for a non-audio reason.
+            if (er.name === 'NotAllowedError' && !this.video.muted) {
                 this.video.muted = true;
                 this.video.play().catch(e => console.debug(`[VideoRTC:${this.clientId}] Autoplay warn:`, e));
+            } else {
+                console.debug(`[VideoRTC:${this.clientId}] play() rejected:`, er);
             }
         });
     }

@@ -8,7 +8,7 @@ from urllib.parse import urlencode, urljoin
 import jwt
 import voluptuous as vol
 from aiohttp import web
-from aiohttp.web_exceptions import HTTPUnauthorized, HTTPGone, HTTPNotFound
+from aiohttp.web_exceptions import HTTPForbidden, HTTPGone, HTTPNotFound
 from homeassistant.components.camera import async_get_stream_source, async_get_image
 from homeassistant.components.http import HomeAssistantView
 from homeassistant.config_entries import ConfigEntry
@@ -205,7 +205,7 @@ async def ws_poster(hass: HomeAssistant, params: dict) -> web.Response:
     if poster.startswith("image."):
         image_entity = _get_image_from_entity_id(hass, poster)
         image = await image_entity.async_image()
-        _LOGGER.debug(f"webrtc image_entity: {image_entity} - {len(image)}")
+        _LOGGER.debug(f"webrtc image_entity: {image_entity} - {len(image) if image else 0}")
         return web.Response(body=image, content_type="image/jpeg")
 
     entry = hass.data[DOMAIN]
@@ -252,7 +252,13 @@ class WebSocketView(HomeAssistantView):
             params = link
 
         elif not utils.validate_signed_request(request):
-            raise HTTPUnauthorized()
+            # Reject invalid/expired stream signatures with 403, not 401.
+            # HA's ban middleware counts HTTPUnauthorized as a failed login and
+            # can IP-ban the client after login_attempts_threshold hits. A sleeping
+            # dashboard tab that wakes and fires several reconnects with an expired
+            # signature would self-ban. 403 still denies the stream without
+            # touching the login-ban counter. See upstream #955/#956.
+            raise HTTPForbidden()
 
         hass = request.app["hass"]
 
@@ -364,7 +370,9 @@ class HLSView(HomeAssistantView):
 
     async def get(self, request: web.Request, filename: str):
         if request.cookies.get(HLS_COOKIE) != HLS_SESSION:
-            raise HTTPUnauthorized()
+            # Same ban footgun as the authSig check above: 403, not 401, so a
+            # stale HLS cookie can't trip HA's login-attempt IP ban. See #955/#956.
+            raise HTTPForbidden()
 
         if filename not in ("playlist.m3u8", "init.mp4", "segment.m4s", "segment.ts"):
             raise HTTPNotFound()
