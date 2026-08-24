@@ -42,7 +42,10 @@ hygiene). Do NOT "optimize" by reusing the driver — see the card header + memo
 
 1. `is_shadow = request.query.get("role") == "shadow"` (`:223`) → pick registry
    `SHADOW_SESSIONS if is_shadow else CLIENT_SESSIONS` (`:224`).
-2. Validate signed request (`?authSig=` JWT, `validate_signed_request`).
+2. Validate signed request (`?authSig=` JWT, `validate_signed_request`). Rejection
+   raises **`HTTPForbidden` (403)**, not 401 — 401 would trip HA's login-attempt IP
+   ban when a woken tab reconnects with an expired sig (fork #956; same for the HLS
+   cookie check in `HLSView`).
 3. Open `ws_server` (browser side, `heartbeat=30`); `ws_connect()` builds the upstream
    go2rtc URL and opens `ws_client`.
 4. **Register `registry[uuid4] = {client_id, entity_id, client_ip, user_agent, connected_at, expires_at}`** (`:281`) → dispatch `webrtc_sessions_updated` (`:290`).
