@@ -418,6 +418,79 @@ them, then watch two signals:
    On a wired camera you should also see the phase reach `committed` after ~3 minutes, and that camera's
    `proxied_connections` contribution drop as the MSE connection closes.
 
+## Card UI additions: `tap_action` and `live_indicator`
+
+Two small, opt-in UI features this fork adds to the card (both are `false`/absent by default).
+
+### `live_indicator` — liveness dot
+
+Set `live_indicator: true` to show a small dot in the top-right controls that is **green while frames
+are actually being presented** and **red when the video has silently frozen**. It is driven by
+`requestVideoFrameCallback` on the *current* driver's `<video>` (so it also catches freezes that emit no
+`waiting` event) plus a 500 ms watchdog, and it is re-bound automatically on every stream/driver swap.
+It is purely visual — it does not change the stream or the upgrade logic.
+
+```yaml
+type: custom:webrtc-camera
+url: mycamera
+live_indicator: true
+```
+
+### `tap_action` — action on tapping the video
+
+Set `tap_action` to run a standard Home Assistant action when you tap the video. It uses the usual
+Lovelace action shape (`more-info`, `navigate`, `url`, `toggle`, `perform-action` / `call-service`,
+`fire-dom-event`, `none`).
+
+The tap is **gated so it never steals a digital-PTZ gesture**: it fires only on a *clean single-finger
+tap that doesn't move*. A pinch (two fingers), a pan/drag (movement > ~10 px), and taps on the control
+overlay (shortcuts, PTZ, buttons) are all ignored — so pinch-zoom and pan keep working exactly as before.
+
+> **⚠️ This card is stream-based, not entity-based.** In the go2rtc spirit, `url: mystream` points at a
+> **go2rtc stream**, which is *not* a Home Assistant entity. So a bare `action: more-info` has **no entity
+> to open** and does nothing. You have two options:
+
+**1. Name the entity explicitly** (works even though the card itself has no entity):
+
+```yaml
+tap_action:
+  action: more-info
+  entity: switch.cancello_interno   # required — the card provides no entity of its own
+```
+
+**2. Use an action that needs no entity** — usually the more natural choice for a stream-only card:
+
+```yaml
+# Open a gate straight from the video
+tap_action:
+  action: perform-action
+  perform_action: switch.turn_on
+  target:
+    entity_id: switch.cancello_interno
+```
+
+```yaml
+# Jump to another dashboard view
+tap_action:
+  action: navigate
+  navigation_path: /lovelace/cameras
+```
+
+The action executor also accepts the older `call-service` name and the `service` + `service_data`
+shape (the same shape used by `shortcuts:`), so this is equivalent to the `perform-action` example above:
+
+```yaml
+tap_action:
+  action: call-service
+  service: switch.turn_on
+  service_data:
+    entity_id: switch.cancello_interno
+```
+
+If you configure the card with `entity: camera.foo` instead of `url:`, then a bare `action: more-info`
+works because the card *does* have an entity to fall back to (resolution order:
+`tap_action.entity` → card `entity:` → the current stream's `entity`).
+
 ## Diagnostic sensors
 
 This fork registers two number sensors under a **WebRTC Camera** device (upstream creates none). Every
