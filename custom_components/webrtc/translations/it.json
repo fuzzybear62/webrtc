@@ -10,7 +10,7 @@
     "step": {
       "user": {
         "title": "URL go2rtc",
-        "description": "Seleziona la versione del server di streaming [go2rtc](https://github.com/AlexxIT/go2rtc):\n1. Lascia vuoto se vuoi la versione integrata di go2rtc (*utenti base*)\n2. Imposta `http://localhost:1984` se installi l'add-on [go2rtc](https://github.com/AlexxIT/go2rtc#go2rtc-home-assistant-add-on) o [Frigate 12+](https://docs.frigate.video/) (*utenti avanzati*)\n3. Imposta un indirizzo personalizzato se installi go2rtc su un altro server (*hacker*)",
+        "description": "Seleziona la versione del server di streaming go2rtc:\n1. Lascia vuoto se vuoi la versione integrata di go2rtc (*utenti base*)\n2. Imposta `localhost:1984` se installi l'add-on go2rtc o Frigate 12+ (*utenti avanzati*)\n3. Imposta un indirizzo personalizzato se installi go2rtc su un altro server (*hacker*)",
         "data": {
           "url": "URL"
         }

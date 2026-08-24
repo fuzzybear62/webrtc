@@ -25,6 +25,11 @@ from .utils import DOMAIN, Server
 
 _LOGGER = logging.getLogger(__name__)
 
+# WebRTC is configured entirely from the UI (config entries); it has no YAML
+# config. Declaring the config-entry-only schema satisfies hassfest's CONFIG_SCHEMA
+# requirement for integrations that implement async_setup, with no behavior change.
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
+
 CREATE_LINK_SCHEMA = vol.Schema(
     {
         vol.Required("link_id"): cv.string,
