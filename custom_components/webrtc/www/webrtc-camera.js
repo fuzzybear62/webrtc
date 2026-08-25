@@ -25,6 +25,23 @@
  *
  * CHANGELOG
  * ---------
+ * v14.6.0 — [A0/B1] History-driven narrow-link RTC suppression + retry-storm damping. Card-only
+ *   (driver unchanged, pin stays ?v=2.4.2). Acts on the v14.5.2 field finding (memory
+ *   webrtc-mobile-collapse-is-rtc-additive): the multi-camera mobile collapse is RTC-ADDITIVE load,
+ *   not MSE concurrency — with RTC on, 4G streams land then die in 5-14s (RTC never promotes,
+ *   20-59% loss, MSE starved past the 5s watchdog), while the SAME 4 cameras MSE-only hold ~550KB/s
+ *   with zero watchdog trips. Fix, all as CARD state so it survives driver churn:
+ *     • [B1] A stream now becomes "healthy" (backoff reset) only after surviving STREAM_PROBATION_MS
+ *       (20s). Previously every 5-14s land reset _retryCount → the fixed-looking "retry #1 in 1000ms"
+ *       storm. A land that dies within probation lets the exponential backoff CLIMB instead.
+ *     • [A0] Each within-probation death is a "flap" feeding a decaying score (FLAP_DECAY_MS 45s).
+ *       At FLAP_SUPPRESS_AT (3) we LATCH MSE-only: every new driver is built with 'webrtc' stripped
+ *       from its mode and the re-probe loop is silenced, removing the additive RTC load entirely.
+ *       Self-releasing: after RTC_RETEST_MS (5min) the next build re-tests full mode; if it flaps
+ *       again it re-suppresses. A happy MSE-only stream is left undisturbed (re-test is lazy, at the
+ *       next cold start). Fat links never accumulate 3 flaps → behaviour byte-for-byte unchanged.
+ *       Opt out with `rtc_adaptive: false`. New HA log lines: rtc-flap / rtc-suppressed (warn) /
+ *       rtc-retest / stream-stable.
  * v14.5.3 — Driver v2.4.2 hotfix: onopen() null-mode crash guard. A null this.mode made the
  *   driver throw at ws-open (0-byte channel) and reconnect immediately -> reconnect storm, seen
  *   even on LAN. Card-side unchanged; pin bumped to ?v=2.4.2 (cache-bust).
@@ -279,6 +296,30 @@ class WebRTCCamera extends HTMLElement {
         this._reprobeDelay = 0;      // current backoff delay in ms (0 = loop idle)
         this._activeMode = null;     // last negotiated main-driver transport: 'mse' | 'rtc'
 
+        // [A0/B1] Narrow-link RTC suppression + retry-storm damping. Pure CARD state, so it
+        // survives the driver's per-reconnect teardown (the learning must outlive the churn).
+        // Signal: a stream that reaches media then dies within STREAM_PROBATION_MS is a "flap".
+        // On constrained mobile the reversible RTC negotiation + MSE keep-warm is ADDITIVE load
+        // that starves the MSE feed past the 5s no-data-watchdog seconds after it lands (validated
+        // 2026-08-25: MSE-only 4G holds ~550KB/s with 0 watchdog trips; RTC-on 4G = reconnect
+        // storm, RTC never even promotes, 20-59% loss). Flaps feed a decaying score; past
+        // FLAP_SUPPRESS_AT we LATCH _rtcSuppressed → every new driver is built MSE-only and the
+        // re-probe loop is silenced (A0), and the retry-backoff reset is withheld until a stream
+        // survives probation (B1) so the storm slows instead of hammering at 1000ms. The latch
+        // is self-releasing (RTC_RETEST_MS). Fat links never accumulate enough flaps to latch, so
+        // their behaviour is byte-for-byte unchanged. Opt out entirely with `rtc_adaptive: false`.
+        // See memory webrtc-mobile-collapse-is-rtc-additive.
+        this._healthyTimer = null;   // [B1] probation timer; on fire → confirm healthy, reset backoff
+        this._streamUpAt = 0;        // when the current media mode landed (ms)
+        this._flapScore = 0;         // decaying count of within-probation stream deaths
+        this._flapLast = 0;          // last flap/decay timestamp, for linear decay
+        this._rtcSuppressed = false; // [A0] latch: build MSE-only, no re-probe
+        this._rtcSuppressedAt = 0;   // when the latch engaged, for the RTC_RETEST_MS re-test
+        this.STREAM_PROBATION_MS = 20000; // survive this long before a stream counts as healthy
+        this.FLAP_DECAY_MS = 45000;       // one flap point ages linearly to zero over this span
+        this.FLAP_SUPPRESS_AT = 3;        // score ≥ this → suppress RTC (≈3 quick deaths)
+        this.RTC_RETEST_MS = 300000;      // suppressed this long → next build re-tests full mode
+
         // Groups the .ui overlay's video/click listeners so they can be dropped
         // in one shot on every rebuild (idempotent renderCustomUI).
         this._uiAbort = null;
@@ -301,7 +342,7 @@ class WebRTCCamera extends HTMLElement {
         // (correlates stream loss with the mobile app backgrounding / 5G handoff).
         this._logVisAbort = null;
 
-        console.info('[WebRTC Camera] v14.5.3');
+        console.info('[WebRTC Camera] v14.6.0');
     }
 
     setConfig(config) {
@@ -459,6 +500,7 @@ class WebRTCCamera extends HTMLElement {
         if (this._retryTimer) { clearTimeout(this._retryTimer); this._retryTimer = null; }
         if (this._upgradeTimer) { clearTimeout(this._upgradeTimer); this._upgradeTimer = null; }
         if (this._shadowTimeout) { clearTimeout(this._shadowTimeout); this._shadowTimeout = null; }
+        if (this._healthyTimer) { clearTimeout(this._healthyTimer); this._healthyTimer = null; }
         this._stopReprobe(); // [RTC RE-PROBE] no background upgrades while paused
         this._isReconnecting = false;
 
@@ -682,6 +724,8 @@ class WebRTCCamera extends HTMLElement {
         if (this._retryTimer) clearTimeout(this._retryTimer);
         // [PHANTOM FIX] Ensure upgrade timer is killed on unmount
         if (this._upgradeTimer) clearTimeout(this._upgradeTimer);
+        // [B1] Kill the probation timer on unmount.
+        if (this._healthyTimer) clearTimeout(this._healthyTimer);
         // [RTC RE-PROBE] Kill the periodic re-probe loop on unmount.
         this._stopReprobe();
 
@@ -919,8 +963,10 @@ class WebRTCCamera extends HTMLElement {
                     this.setStatus(msg.type.toUpperCase(), this.config.title || '',
                         msg.type === 'webrtc' ? 'Connected via WebRTC (Low Latency)' : '');
                 }
-                this._retryCount = 0;
-                this._streamHealthy = true;
+                // [B1] streamHealthy=true now, but the backoff reset is deferred until this
+                // stream survives probation (_markHealthy) — a land that dies in 5-14s must not
+                // keep restarting the retry backoff at 1000ms.
+                this._markHealthy();
                 // A real media mode is on screen: release any retry height-lock (the new stream
                 // now sizes the card) and log the recovery.
                 this._unlockHeight();
@@ -1038,6 +1084,16 @@ class WebRTCCamera extends HTMLElement {
         if (this._isReconnecting) return;
         if (this._retryTimer) clearTimeout(this._retryTimer);
 
+        // [A0/B1] Classify this teardown while the health state is still intact (before the
+        // _streamHealthy=false below). A stream that CAME UP and then died WITHIN probation
+        // (_healthyTimer still armed) is a "flap" — the constrained-link RTC-starvation signature
+        // — and feeds the decaying suppression score. A stream that never came up, or that died
+        // AFTER probation confirmed it healthy, is an ordinary reconnect and does NOT accuse RTC.
+        // Placed after the _isReconnecting guard so an error-burst from one dying driver counts
+        // once (the timer is cleared here; burst repeats return at the guard above).
+        if (this._streamHealthy && this._healthyTimer) this._noteRtcFlap();
+        if (this._healthyTimer) { clearTimeout(this._healthyTimer); this._healthyTimer = null; }
+
         // [LAYOUT] Freeze the current card height BEFORE the driver is torn down, so the video
         // area does not collapse during the retry gap and trigger a section-wide re-pack. The
         // <video> is still sized here (frozen last frame); released once a new mode comes up.
@@ -1074,6 +1130,7 @@ class WebRTCCamera extends HTMLElement {
     // various failure paths can all call this without stacking timers.
     _scheduleReprobe() {
         if (this.config && this.config.rtc_reprobe === false) return; // opt-out
+        if (this._rtcSuppressed) return;                              // [A0] narrow-link latch: no RTC probes
         if (this._reprobeTimer) return;                               // already armed
         const mode = (this.config && this.config.mode) || '';
         if (mode.indexOf('webrtc') < 0) return;                       // WebRTC not wanted
@@ -1112,6 +1169,78 @@ class WebRTCCamera extends HTMLElement {
     _stopReprobe() {
         if (this._reprobeTimer) { clearTimeout(this._reprobeTimer); this._reprobeTimer = null; }
         this._reprobeDelay = 0;
+    }
+
+    // ─── [A0/B1] Narrow-link RTC suppression ────────────────────────────────────────────────
+    //
+    // [B1] Called at every media land (direct RTC, or MSE/other). Marks the stream up NOW so the
+    // rest of the state machine (error gating, connection-closed retry) behaves as before, but
+    // WITHHOLDS the retry-backoff reset until the stream proves it can SURVIVE STREAM_PROBATION_MS.
+    // The mobile storm signature is a stream that lands then dies in 5-14s: resetting _retryCount
+    // on every such land pinned the backoff at 1000ms and hammered the server. Now only a stream
+    // that outlives probation resets the counter (and relaxes the flap score by a whole point — a
+    // clean stretch is positive evidence the link is fine).
+    _markHealthy() {
+        this._streamHealthy = true;
+        this._streamUpAt = Date.now();
+        if (this._healthyTimer) clearTimeout(this._healthyTimer);
+        this._healthyTimer = setTimeout(() => {
+            this._healthyTimer = null;
+            this._retryCount = 0;
+            this._decayFlap(1);
+            this._logHA('debug', 'stream-stable', `healthy ${Math.round(this.STREAM_PROBATION_MS / 1000)}s`);
+        }, this.STREAM_PROBATION_MS);
+    }
+
+    // [A0] Age the flap score toward zero by the wall-clock time since the last flap/decay, then
+    // optionally subtract `extra` whole points. Linear decay keeps the maths trivial and auditable.
+    _decayFlap(extra) {
+        const now = Date.now();
+        if (this._flapLast) {
+            const decayed = (now - this._flapLast) / this.FLAP_DECAY_MS;
+            this._flapScore = Math.max(0, this._flapScore - decayed);
+        }
+        this._flapLast = now;
+        if (extra) this._flapScore = Math.max(0, this._flapScore - extra);
+    }
+
+    // [A0] Record one flap (a stream that landed then died within probation) and latch MSE-only
+    // once the decaying score crosses FLAP_SUPPRESS_AT. Latching stops the re-probe loop so no
+    // shadow RTC probe launches; the mode strip in startStream() handles the main driver.
+    _noteRtcFlap() {
+        if (this.config && this.config.rtc_adaptive === false) return; // opt-out: never suppress
+        this._decayFlap(0);            // age to now …
+        this._flapScore += 1;          // … then add this flap
+        this._flapLast = Date.now();
+        this._logHA('debug', 'rtc-flap', `score=${this._flapScore.toFixed(1)}/${this.FLAP_SUPPRESS_AT}`);
+        if (!this._rtcSuppressed && this._flapScore >= this.FLAP_SUPPRESS_AT) {
+            this._rtcSuppressed = true;
+            this._rtcSuppressedAt = Date.now();
+            this._stopReprobe();       // no background RTC probes while suppressed
+            this._logHA('warning', 'rtc-suppressed',
+                `link narrow (${this._flapScore.toFixed(1)} flaps) — MSE-only, re-test in ${Math.round(this.RTC_RETEST_MS / 1000)}s`);
+        }
+    }
+
+    // [A0] Release the MSE-only latch once it has held RTC_RETEST_MS, so a link that has since
+    // recovered can earn RTC back. Called lazily before each (re)build: no standing timer, and a
+    // happy MSE-only stream that never reconnects is deliberately left undisturbed (MSE-only is
+    // fully watchable — the whole point of the latch — so RTC is re-tested opportunistically on
+    // the next cold start rather than by tearing down a working picture).
+    _maybeExpireSuppression() {
+        if (!this._rtcSuppressed) return;
+        if (Date.now() - this._rtcSuppressedAt < this.RTC_RETEST_MS) return;
+        this._rtcSuppressed = false;
+        this._flapScore = 0;
+        this._flapLast = 0;
+        this._logHA('debug', 'rtc-retest', 'suppression window elapsed — re-testing full mode');
+    }
+
+    // [A0] Remove 'webrtc' from a mode list, never yielding an empty mode.
+    _stripWebrtc(mode) {
+        const kept = String(mode || 'webrtc,mse,hls,mjpeg')
+            .split(',').map(s => s.trim()).filter(m => m && m !== 'webrtc');
+        return kept.length ? kept.join(',') : 'mse';
     }
 
     /**
@@ -1167,7 +1296,13 @@ class WebRTCCamera extends HTMLElement {
         this._isReconnecting = false;
         this._retryCount = 0;
         this._shadowAttempts = 0;
-        
+        // [A0/B1] Manual refresh = explicit fresh start: drop the probation timer and clear the
+        // narrow-link latch so this restart re-tests full RTC mode from scratch.
+        if (this._healthyTimer) { clearTimeout(this._healthyTimer); this._healthyTimer = null; }
+        this._rtcSuppressed = false;
+        this._flapScore = 0;
+        this._flapLast = 0;
+
         // 5. Force UI Feedback
         const spinner = this.shadowRoot.querySelector('.spinner');
         if (spinner) spinner.style.display = 'block';
@@ -1180,6 +1315,10 @@ class WebRTCCamera extends HTMLElement {
         if (!this._hass || !this.config) return;
         // [AUTO-PAUSE] Never start (or resurrect) a stream while paused off-screen.
         if (this._paused) return;
+
+        // [A0] Lazily release the MSE-only latch if its re-test window has elapsed, so THIS build
+        // gets full mode again and can earn RTC back on a recovered link.
+        this._maybeExpireSuppression();
 
         // [HA ICE COLD-START GATE (#923)] On a COLD start only, make sure HA's ICE servers
         // are resolved before we build the first driver, so its own reversible RTC can use
@@ -1247,7 +1386,14 @@ class WebRTCCamera extends HTMLElement {
         // camera->go2rtc path carries one feed regardless). The reversible handoff is now the
         // driver's ONLY RTC path (the legacy irreversible branch was removed in driver v2.3.5),
         // so there is no per-driver flag to set here any more.
-        newDriver.mode = effectiveConfig.mode;
+        // [A0] Under the narrow-link latch, strip 'webrtc' so this driver is MSE-only: the
+        // reversible RTC negotiation + MSE keep-warm is the additive load proven to starve MSE on
+        // constrained mobile (MSE-only 4G holds ~550KB/s, 0 watchdog trips; RTC-on 4G never
+        // promotes, 20-59% loss, MSE dies <5s → storm). The latch is card state so it holds across
+        // driver churn; it clears itself after RTC_RETEST_MS. Fat links never reach the latch.
+        newDriver.mode = this._rtcSuppressed
+            ? this._stripWebrtc(effectiveConfig.mode)
+            : effectiveConfig.mode;
         newDriver.media = effectiveConfig.media;
 
         // [ICE SERVERS] Optional browser-side ICE servers on THIS RTCPeerConnection.
@@ -1359,8 +1505,9 @@ class WebRTCCamera extends HTMLElement {
 
                 console.debug('[WebRTC Camera] Main Driver negotiated WebRTC directly.');
                 this.setStatus('RTC', this.config.title || '', 'Connected via WebRTC (Direct)');
-                this._retryCount = 0;
-                this._streamHealthy = true;
+                // [B1] Defer the backoff reset to probation; direct RTC that sustains >20s resets
+                // the counter and relaxes the flap score, direct RTC that dies fast counts as a flap.
+                this._markHealthy();
                 this._unlockHeight();
                 this._shadowAttempts = 0;
                 // [ORPHAN FIX] The main upgraded to WebRTC on its own while a shadow
