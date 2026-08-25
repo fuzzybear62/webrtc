@@ -25,6 +25,16 @@
  *
  * CHANGELOG
  * ---------
+ * v14.6.6 — [card-only, no driver change] Anti-lockstep retry backoff. Cameras mounted together
+ *   die together on a congested link; the old deterministic backoff (1000*2^n, capped 30s, no
+ *   jitter) made all of them re-fire at the identical instant -> simultaneous keyframe bursts ->
+ *   the congestion spike recurred -> self-synchronizing collapse that never broke on its own
+ *   (observed: 4x MSE-only on weak 4G, all four flapping in step every 5-7s). _scheduleRetry now
+ *   floors the delay at 2s (breathing room instead of a 1s hammer) and spreads it across 60-140%
+ *   of the target via jitter so the fleet de-syncs after the first collision. The exponential is
+ *   capped at 20s BELOW the 30s hard ceiling so jitter keeps room to spread near the top (a cap
+ *   applied after jitter would re-collapse every camera onto exactly 30000). Complements the
+ *   config-side cure (multi-cam grid on the camera substream) which addresses the raw bandwidth.
  * v14.6.5 — [driver-only fixes, pin ?v=2.4.5 → 2.4.6] (1) MSE strand recovery: a frozen MSE
  *   stream that only started after pressing pause+play — the 5s buffer eviction could strand
  *   currentTime below the buffered window (late initial autoplay, or a stall behind an evicted
@@ -409,7 +419,7 @@ class WebRTCCamera extends HTMLElement {
         // (correlates stream loss with the mobile app backgrounding / 5G handoff).
         this._logVisAbort = null;
 
-        console.info('[WebRTC Camera] v14.6.5');
+        console.info('[WebRTC Camera] v14.6.6');
     }
 
     setConfig(config) {
@@ -1203,9 +1213,25 @@ class WebRTCCamera extends HTMLElement {
         this._stopReprobe();
         this._setActiveMode(null);
 
-        const delay = Math.min(
-            1000 * Math.pow(2, this._retryCount),
-            30000
+        // [B / anti-lockstep] Cameras mounted together die together on a congested
+        // link and, with a purely deterministic backoff, re-fire in lockstep:
+        // identical delays -> simultaneous keyframe bursts -> the same congestion
+        // spike that killed them recurs -> collapse. It self-synchronizes and never
+        // breaks on its own (observed: 4x MSE-only on weak 4G, all four flapping in
+        // step). Two changes break the cycle:
+        //   - floor (RETRY_FLOOR_MS): never retry faster than this, so a congested
+        //     link gets breathing room instead of a 1s hammer on the first death.
+        //   - decorrelating jitter: spread each camera's delay across 60-140% of its
+        //     target so the fleet de-syncs after the first collision.
+        // The exponential is capped BELOW the 30s hard ceiling so jitter still has
+        // room to spread near the top; a cap applied AFTER jitter would re-collapse
+        // every camera onto exactly 30000 and re-synchronize them.
+        const RETRY_FLOOR_MS = 2000;
+        const RETRY_CAP_MS   = 30000;
+        const backoff = Math.min(1000 * Math.pow(2, this._retryCount), 20000);
+        const target  = Math.max(backoff, RETRY_FLOOR_MS);
+        const delay   = Math.round(
+            Math.min(target * (0.6 + Math.random() * 0.8), RETRY_CAP_MS)
         );
 
         console.debug(`[WebRTC Camera] Scheduling retry in ${delay}ms`);
