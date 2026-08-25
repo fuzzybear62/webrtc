@@ -25,6 +25,11 @@
  *
  * CHANGELOG
  * ---------
+ * v14.3.3 — Fix `"webrtc-camera" has already been used` on double module load (#932): the
+ *   `customElements.define('webrtc-camera')` at the bottom was unconditional while `video-rtc` was
+ *   guarded. A second evaluation (swipe-card, scoped registry, service-worker / `?v=` cache-bust
+ *   race) threw and aborted load. Now wrapped in `if (!customElements.get('webrtc-camera'))`, which
+ *   also de-dupes the `window.customCards` entry.
  * v14.3.2 — Two upstream items: (1) browser-side `ice_servers` (#952) — an optional card option
  *   that replaces the driver's default Google STUN with user-supplied STUN/TURN on every driver
  *   (main + shadow), for CGNAT homes without Nabu Casa; injected where the driver is created,
@@ -237,7 +242,7 @@ class WebRTCCamera extends HTMLElement {
         // (correlates stream loss with the mobile app backgrounding / 5G handoff).
         this._logVisAbort = null;
 
-        console.info('[WebRTC Camera] v14.3.2');
+        console.info('[WebRTC Camera] v14.3.3');
     }
 
     setConfig(config) {
@@ -1937,12 +1942,19 @@ class WebRTCCamera extends HTMLElement {
     static getStubConfig() { return {url: ''}; }
 }
 
-customElements.define('webrtc-camera', WebRTCCamera);
+// (#932) Guard the registration: if this module is evaluated twice — a swipe-card with two
+// instances, HA's scoped custom-element registry, a PWA/service-worker re-load, or a `?v=`
+// cache-bust race — a second unconditional `define('webrtc-camera', …)` throws
+// `"webrtc-camera" has already been used with this registry`, which aborts module load. Mirror
+// the guard already used for `video-rtc` above, and de-dupe the customCards entry too.
+if (!customElements.get('webrtc-camera')) {
+    customElements.define('webrtc-camera', WebRTCCamera);
 
-window.customCards = window.customCards || [];
-window.customCards.push({
-    type: 'webrtc-camera',
-    name: 'WebRTC Camera',
-    description: 'Ephemeral WebRTC Camera',
-    preview: false
-});
+    window.customCards = window.customCards || [];
+    window.customCards.push({
+        type: 'webrtc-camera',
+        name: 'WebRTC Camera',
+        description: 'Ephemeral WebRTC Camera',
+        preview: false
+    });
+}
