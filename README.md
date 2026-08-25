@@ -240,6 +240,20 @@ shortcuts:  # custom shortcuts, default none
     entity_id: switch.camera_record
 ```
 
+A shortcut may also `url:` (opens a link), `more_info:` (opens the more-info dialog of the given
+entity id), or use the special **`service: fire-dom-event`** (fork #940) to dispatch a Lovelace
+`ll-custom` DOM event — useful e.g. to close the current `browser_mod` popup. The whole shortcut item
+becomes the event detail, so your `browser_mod:` / custom keys pass through:
+
+```yaml
+shortcuts:
+- name: Close
+  icon: mdi:close
+  service: fire-dom-event
+  browser_mod:
+    command: close_popup
+```
+
 Pan, tilt, zoom controls: [PTZ config examples](https://github.com/AlexxIT/WebRTC/wiki/PTZ-Config-Examples).
 
 **Paused by default**
@@ -490,6 +504,33 @@ tap_action:
 If you configure the card with `entity: camera.foo` instead of `url:`, then a bare `action: more-info`
 works because the card *does* have an entity to fall back to (resolution order:
 `tap_action.entity` → card `entity:` → the current stream's `entity`).
+
+## Browser-side ICE servers (`ice_servers`)
+
+By default the card offers the browser a single public STUN server
+(`stun:stun.l.google.com:19302`). STUN is enough to discover your public address and set up a **direct**
+browser↔go2rtc WebRTC path on most networks. It is **not** enough when the home end is behind **CGNAT**
+or a symmetric NAT with no reachable public endpoint — there the browser needs a **TURN relay**.
+
+`ice_servers` (fork #952) lets you supply your own STUN/TURN list, which **replaces** the default on the
+browser's `RTCPeerConnection` (applied to every internal driver, main and shadow). It accepts the
+standard `RTCIceServer` shape — a bare string, a list of strings, or a list of objects with
+`urls` / `username` / `credential`:
+
+```yaml
+type: custom:webrtc-camera
+url: mycamera
+ice_servers:
+  - urls: stun:stun.cloudflare.com:3478
+  - urls: turn:turn.example.com:3478
+    username: myuser
+    credential: mysecret
+```
+
+> This is the browser side only. It does not touch how **go2rtc** (the home peer) gathers its own
+> candidates, and it is independent of Home Assistant / Nabu Casa — you run and pay for the TURN server
+> yourself. If you only have public-IP or port-forwarded access, a second **STUN** entry (e.g. Cloudflare)
+> is all you need; a **TURN** entry is required only for CGNAT/symmetric-NAT homes.
 
 ## Diagnostic sensors
 

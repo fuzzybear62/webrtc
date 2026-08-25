@@ -25,6 +25,12 @@
  *
  * CHANGELOG
  * ---------
+ * v14.3.2 — Two upstream items: (1) browser-side `ice_servers` (#952) — an optional card option
+ *   that replaces the driver's default Google STUN with user-supplied STUN/TURN on every driver
+ *   (main + shadow), for CGNAT homes without Nabu Casa; injected where the driver is created,
+ *   normalized by `_normalizeIceServers`. (2) `fire-dom-event` from `shortcuts` (#940) — a shortcut
+ *   with `service: fire-dom-event` now dispatches `ll-custom` (for browser_mod close_popup etc.)
+ *   instead of failing a bogus `fire-dom-event.undefined` service call (fix in ui-interaction.js).
  * v14.3.1 — Fix `tap_action` (#668): the card now EXECUTES the action itself instead of
  *   dispatching a `hass-action` event that nothing catches for a standalone custom card
  *   (so `more-info` etc. silently did nothing). `handleAction` handles more-info
@@ -231,7 +237,7 @@ class WebRTCCamera extends HTMLElement {
         // (correlates stream loss with the mobile app backgrounding / 5G handoff).
         this._logVisAbort = null;
 
-        console.info('[WebRTC Camera] v14.3.1');
+        console.info('[WebRTC Camera] v14.3.2');
     }
 
     setConfig(config) {
@@ -1146,6 +1152,17 @@ class WebRTCCamera extends HTMLElement {
         newDriver.mode = effectiveConfig.mode;
         newDriver.media = effectiveConfig.media;
 
+        // [ICE SERVERS] (#952) Optional browser-side ICE servers. When configured they REPLACE
+        // the driver's default Google STUN on THIS RTCPeerConnection, letting a user point the
+        // browser at their own STUN/TURN (e.g. a relay for a CGNAT home) without depending on
+        // Home Assistant / Nabu Casa. Injected here so every driver — cold main AND shadow —
+        // gets it, since pcConfig lives on the (disposable) driver. Accepts the standard
+        // RTCIceServer shape ({urls, username, credential}) or a bare string / array of strings.
+        const iceServers = this._normalizeIceServers(effectiveConfig.ice_servers);
+        if (iceServers) {
+            newDriver.pcConfig = Object.assign({}, newDriver.pcConfig, {iceServers});
+        }
+
         // [TUNABLES] Optional per-card overrides for the reversible-RTC timing knobs; defaults
         // live in the driver constructor. Accept only sane positive numbers, else keep default.
         const proveMs = Number(effectiveConfig.rtc_swap_prove_ms);
@@ -1789,6 +1806,26 @@ class WebRTCCamera extends HTMLElement {
                 });
             }
         }
+    }
+
+    // Normalize a user-supplied `ice_servers` config into an array of RTCIceServer objects,
+    // or null if nothing usable. Accepts a bare string, an array of strings, or an array of
+    // {urls|url, username?, credential?} objects (the standard HA/WebRTC shape).
+    _normalizeIceServers(raw) {
+        if (!raw) return null;
+        const arr = Array.isArray(raw) ? raw : [raw];
+        const out = [];
+        for (const s of arr) {
+            if (typeof s === 'string') {
+                if (s) out.push({urls: s});
+            } else if (s && (s.urls || s.url)) {
+                const server = {urls: s.urls || s.url};
+                if (s.username != null) server.username = s.username;
+                if (s.credential != null) server.credential = s.credential;
+                out.push(server);
+            }
+        }
+        return out.length ? out : null;
     }
 
     // Perform the configured `<kind>_action` (kind = 'tap' | 'hold' | 'double_tap').

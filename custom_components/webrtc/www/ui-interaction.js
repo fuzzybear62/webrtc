@@ -221,12 +221,24 @@ export class UIInteraction {
 
         // 1. Service Call
         if (item.service) {
-            const [domain, service] = item.service.split('.');
-            // Resolve templates in service data (e.g. dynamic camera_name or params)
-            const rawData = item.service_data || item.data || {};
-            const finalData = this._resolveDataTemplate(rawData, this.hass);
-            
-            this.hass.callService(domain, service, finalData);
+            // `fire-dom-event` (#940) is NOT a real HA service: splitting it as
+            // `domain.service` yields domain="fire-dom-event", service=undefined and the
+            // callService silently fails. Instead dispatch the standard Lovelace `ll-custom`
+            // DOM event so listeners such as browser_mod (e.g. `command: close_popup`) receive
+            // it. The whole item is the detail, so the user's `browser_mod:` / custom keys pass
+            // through — matching the card's tap_action `handleAction('fire-dom-event')` path.
+            if (item.service === 'fire-dom-event') {
+                this.card.dispatchEvent(new CustomEvent('ll-custom', {
+                    bubbles: true, composed: true, detail: item,
+                }));
+            } else {
+                const [domain, service] = item.service.split('.');
+                // Resolve templates in service data (e.g. dynamic camera_name or params)
+                const rawData = item.service_data || item.data || {};
+                const finalData = this._resolveDataTemplate(rawData, this.hass);
+
+                this.hass.callService(domain, service, finalData);
+            }
         }
         
         // 2. Navigation
