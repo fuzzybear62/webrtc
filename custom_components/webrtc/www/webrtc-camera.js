@@ -25,6 +25,34 @@
  *
  * CHANGELOG
  * ---------
+ * v14.5.0 — HA native ICE (#923): the card now also reuses Home Assistant's OWN ICE servers —
+ *   the user's `webrtc:` config plus any cloud-provided TURN (Nabu Casa / Homeway) — fetched
+ *   once via the native `web_rtc/ice_servers` WS command (pure JS; zero Python; fails soft on
+ *   older HA). This is the only way to reach the rotating, non-pasteable Nabu Casa TURN creds,
+ *   giving CGNAT / symmetric-NAT users relay for free. Precedence, most specific wins:
+ *   per-card `ice_servers` (#952, incl. `[]` opt-out) → HA native ICE (#923) → 2×STUN default
+ *   (#915). Logging (card sub-logger): resolved ICE source + HA-fetch outcome at `debug` (`ice` /
+ *   `ice-ha`, like the `mode` mirror); a configured-but-malformed per-card `ice_servers` is flagged
+ *   at `warning` (`ice-config`, default-visible) instead of being silently dropped. (video-rtc → v2.4.0.)
+ * v14.4.1 — ICE defaults (#915): the built-in default now offers TWO independent public STUN
+ *   servers (Google + Cloudflare) instead of Google alone, so a blocked/filtered/down provider
+ *   no longer kills srflx discovery out-of-the-box. Applies to every camera. `_normalizeIceServers`
+ *   now distinguishes an unset `ice_servers` (→ keep default) from an EXPLICIT `ice_servers: []`
+ *   (→ zero servers, a documented privacy opt-out); the injection uses `!== null` so `[]` is honored.
+ *   A per-card `ice_servers` list still fully REPLACES the default. (video-rtc → v2.4.0.)
+ * v14.4.0 — Custom-UI enhancement batch (all gated behind `ui: true`, no effect on the MSE↔RTC
+ *   path): (1) #913 — the `.play` control is now a real play/pause toggle: it stays visible and
+ *   mirrors the element state (`mdi:play`/`mdi:pause`), so a live stream can be frozen and resumed
+ *   (before, it only appeared to resume a pause). (2) #953 — `unmute_in_fullscreen: true` unmutes
+ *   while fullscreen and restores the prior muted state on exit (iOS `webkitendfullscreen` +
+ *   standard `fullscreenchange`). (3) #924 — `spinner: false` omits the loading spinner entirely;
+ *   `spinner_delay: <ms>` defers showing it on a `waiting`, so brief stalls don't flash it.
+ *   Also noted: #949 (local PNG poster) already works via the `poster` option (documented).
+ * v14.3.4 — Fix iOS 26.1 MSE stutter (#910/#884): the fork had inherited upstream v3.6.1's MSE
+ *   live-sync in `video-rtc.js` (`currentTime = start` re-seek + `playbackRate = gap`). On iOS 26.1
+ *   WebKit this pins playbackRate to the 0.1 floor near the live edge → video crawls at ~0.1x
+ *   ("~1 frame / 3s"). Removed the catch-up: MSE now plays at 1x (pre-3.6.1 behavior). WebRTC
+ *   remains the low-latency path; MSE is the reliable fallback.
  * v14.3.3 — Fix `"webrtc-camera" has already been used` on double module load (#932): the
  *   `customElements.define('webrtc-camera')` at the bottom was unconditional while `video-rtc` was
  *   guarded. A second evaluation (swipe-card, scoped registry, service-worker / `?v=` cache-bust
@@ -134,7 +162,7 @@
  *   _promoteShadowToMain().
  */
 
-import {VideoRTC} from './video-rtc.js?v=2.3.8';
+import {VideoRTC} from './video-rtc.js?v=2.4.0';
 import {DigitalPTZ} from './digital-ptz.js?v=3.3.0';
 // [SIDECAR INTEGRATION] Import the Interaction module.
 // This module handles legacy features (Shortcuts, PTZ, Styles) to keep the core driver clean.
@@ -242,7 +270,7 @@ class WebRTCCamera extends HTMLElement {
         // (correlates stream loss with the mobile app backgrounding / 5G handoff).
         this._logVisAbort = null;
 
-        console.info('[WebRTC Camera] v14.3.3');
+        console.info('[WebRTC Camera] v14.5.0');
     }
 
     setConfig(config) {
@@ -582,6 +610,17 @@ class WebRTCCamera extends HTMLElement {
 
     set hass(hass) {
         this._hass = hass;
+
+        // [HA NATIVE ICE (#923)] One-shot fetch of Home Assistant's own ICE servers
+        // (user `webrtc:` config + Nabu Casa / Homeway TURN, if any) via the native
+        // `web_rtc/ice_servers` WS command. This is the ONLY way to reach the
+        // rotating, non-pasteable Nabu Casa TURN credentials, so CGNAT / symmetric-NAT
+        // users get relay for free. Fire once — the result is cached and picked up by
+        // the next driver (reprobe handles late arrival).
+        if (!this._haIceFetched) {
+            this._haIceFetched = true;
+            this._fetchHaIceServers();
+        }
 
         // Start the stream only when:
         // - HA is available
@@ -1157,16 +1196,38 @@ class WebRTCCamera extends HTMLElement {
         newDriver.mode = effectiveConfig.mode;
         newDriver.media = effectiveConfig.media;
 
-        // [ICE SERVERS] (#952) Optional browser-side ICE servers. When configured they REPLACE
-        // the driver's default Google STUN on THIS RTCPeerConnection, letting a user point the
-        // browser at their own STUN/TURN (e.g. a relay for a CGNAT home) without depending on
-        // Home Assistant / Nabu Casa. Injected here so every driver — cold main AND shadow —
-        // gets it, since pcConfig lives on the (disposable) driver. Accepts the standard
-        // RTCIceServer shape ({urls, username, credential}) or a bare string / array of strings.
-        const iceServers = this._normalizeIceServers(effectiveConfig.ice_servers);
-        if (iceServers) {
+        // [ICE SERVERS] Optional browser-side ICE servers on THIS RTCPeerConnection.
+        // pcConfig lives on the (disposable) driver, so inject here — every driver, cold
+        // main AND shadow, gets it. Three-level precedence, most specific wins:
+        //   1. per-card `ice_servers` (#952) — REPLACES everything, incl. `[]` opt-out.
+        //   2. HA native ICE (#923) — the user's `webrtc:` config + Nabu Casa/Homeway TURN,
+        //      fetched once via `web_rtc/ice_servers`. The only path to rotating cloud TURN.
+        //   3. built-in 2×STUN default (#915) — kept if neither of the above applies.
+        // Accepts the standard RTCIceServer shape ({urls, username, credential}) or a bare
+        // string / array of strings.
+        const rawIce = effectiveConfig.ice_servers;
+        const perCard = this._normalizeIceServers(rawIce);
+        // The user CONFIGURED `ice_servers` but it parsed to nothing (non-empty input, all entries
+        // malformed → `_normalizeIceServers` returns null via its typo-guard). That's a user
+        // misconfiguration silently dropped — surface it at `warning` (default-visible, unlike the
+        // `debug` mirror below), so a fat-fingered STUN/TURN URL is diagnosable. `[]` (opt-out) is
+        // NOT flagged: it yields `perCard = []`, a deliberate, valid choice.
+        const iceConfigured = rawIce != null && rawIce !== '' &&
+            !(Array.isArray(rawIce) && rawIce.length === 0);
+        if (iceConfigured && perCard === null) {
+            this._logHA('warning', 'ice-config', 'ice_servers has no valid entries — ignored, using default');
+        }
+        const iceServers = perCard !== null ? perCard : this._haIceServers;
+        if (iceServers != null) {   // null/undefined → keep default; [] (opt-out) or list → replace
             newDriver.pcConfig = Object.assign({}, newDriver.pcConfig, {iceServers});
         }
+        // Mirror the RESOLVED ICE source on this pc, so the CGNAT/Nabu-Casa path #923 targets is
+        // diagnosable from the HA log (matches the `mode` mirror). `debug` + throttled by event
+        // name; detail is low-cardinality (source + count).
+        const iceSrc = perCard !== null
+            ? (perCard.length ? `per-card (${perCard.length})` : 'per-card (opt-out)')
+            : (this._haIceServers ? `ha-native (${this._haIceServers.length})` : 'default (2×STUN)');
+        this._logHA('debug', 'ice', iceSrc);
 
         // [TUNABLES] Optional per-card overrides for the reversible-RTC timing knobs; defaults
         // live in the driver constructor. Accept only sane positive numbers, else keep default.
@@ -1546,7 +1607,7 @@ class WebRTCCamera extends HTMLElement {
         </style>
         <ha-card class="card">
             <div class="player">
-                <ha-circular-progress class="spinner"></ha-circular-progress>
+                ${this.config.spinner === false ? '' : '<ha-circular-progress class="spinner"></ha-circular-progress>'}
                 <div class="ptz-transform"></div>
             </div>
             <div class="header">
@@ -1712,12 +1773,32 @@ class WebRTCCamera extends HTMLElement {
         // Apply initial icon state
         volBtn.icon = video.muted ? 'mdi:volume-mute' : 'mdi:volume-high';
 
-        // [FIX 1/2] Bind video events to the persistent spinner
-        video.addEventListener('waiting', () => { if(spinner) spinner.style.display = 'block'; }, {signal});
-        video.addEventListener('playing', () => { if(spinner) spinner.style.display = 'none'; }, {signal});
+        // [FIX 1/2] Bind video events to the persistent spinner.
+        // #924: `spinner: false` omits the element entirely (querySelector('.spinner')
+        // is null → every guard below no-ops). `spinner_delay: <ms>` defers showing it
+        // on a `waiting`, so a brief stall doesn't flash the overlay.
+        const spinnerDelay = Number(this.config.spinner_delay) || 0;
+        let spinnerTimer = null;
+        const clearSpinnerTimer = () => { if (spinnerTimer) { clearTimeout(spinnerTimer); spinnerTimer = null; } };
+        video.addEventListener('waiting', () => {
+            if (!spinner) return;
+            if (spinnerDelay > 0) {
+                if (spinnerTimer) return;
+                spinnerTimer = setTimeout(() => { spinnerTimer = null; spinner.style.display = 'block'; }, spinnerDelay);
+            } else {
+                spinner.style.display = 'block';
+            }
+        }, {signal});
+        video.addEventListener('playing', () => { clearSpinnerTimer(); if (spinner) spinner.style.display = 'none'; }, {signal});
+        // A pending delayed spinner must not fire after this UI is torn down/rebuilt.
+        signal.addEventListener('abort', clearSpinnerTimer);
 
-        video.addEventListener('play', () => playBtn.style.display = 'none', {signal});
-        video.addEventListener('pause', () => playBtn.style.display = 'block', {signal});
+        // #913: play/pause toggle. Under `ui: true` the button stays visible (like the
+        // other controls) and mirrors the element state, so the live stream can be
+        // paused (frozen) and resumed — previously it only appeared to resume a pause.
+        playBtn.icon = video.paused ? 'mdi:play' : 'mdi:pause';
+        video.addEventListener('play', () => { playBtn.icon = 'mdi:pause'; }, {signal});
+        video.addEventListener('pause', () => { playBtn.icon = 'mdi:play'; }, {signal});
         video.addEventListener('loadeddata', () => volBtn.style.display = this.hasAudio ? 'block' : 'none', {signal});
         video.addEventListener('volumechange', () => {
              volBtn.icon = video.muted ? 'mdi:volume-mute' : 'mdi:volume-high';
@@ -1729,6 +1810,7 @@ class WebRTCCamera extends HTMLElement {
         ui.addEventListener('click', ev => {
             const {icon} = ev.target;
             if (icon === 'mdi:play') this.driver.play();
+            else if (icon === 'mdi:pause') video.pause();
             else if (icon === 'mdi:volume-mute') video.muted = false;
             else if (icon === 'mdi:volume-high') video.muted = true;
             else if (icon === 'mdi:floppy') this.saveScreenshot();
@@ -1813,12 +1895,18 @@ class WebRTCCamera extends HTMLElement {
         }
     }
 
-    // Normalize a user-supplied `ice_servers` config into an array of RTCIceServer objects,
-    // or null if nothing usable. Accepts a bare string, an array of strings, or an array of
-    // {urls|url, username?, credential?} objects (the standard HA/WebRTC shape).
+    // Normalize a user-supplied `ice_servers` config. Returns:
+    //   • null  → not configured (undefined/null/empty string) → keep the built-in default.
+    //   • []    → EXPLICIT empty list (`ice_servers: []`) → deliberate privacy opt-out:
+    //             the injection replaces the default with NO STUN/TURN (zero third parties;
+    //             WebRTC then works on LAN via host candidates, remote falls back to MSE).
+    //   • [..]  → the parsed RTCIceServer list (REPLACES the default).
+    // Accepts a bare string, an array of strings, or an array of {urls|url, username?,
+    // credential?} objects (the standard HA/WebRTC shape).
     _normalizeIceServers(raw) {
-        if (!raw) return null;
+        if (raw == null || raw === '') return null;      // not configured → default
         const arr = Array.isArray(raw) ? raw : [raw];
+        if (arr.length === 0) return [];                 // explicit opt-out → no servers
         const out = [];
         for (const s of arr) {
             if (typeof s === 'string') {
@@ -1830,7 +1918,30 @@ class WebRTCCamera extends HTMLElement {
                 out.push(server);
             }
         }
+        // Non-empty input that parsed to nothing (all entries malformed) → treat as a
+        // typo and keep the default rather than silently wiping STUN.
         return out.length ? out : null;
+    }
+
+    // [HA NATIVE ICE (#923)] Ask Home Assistant for its own ICE servers via the native
+    // `web_rtc/ice_servers` WS command. This returns the user's `webrtc:` config plus any
+    // cloud-provided TURN (Nabu Casa / Homeway) — reusing HA's own list instead of
+    // reinventing it in Python. Cached in `this._haIceServers`; consumed at driver
+    // creation, below the per-card override. Fails soft: an older HA (command missing)
+    // leaves the cache null and we keep the built-in STUN default.
+    async _fetchHaIceServers() {
+        try {
+            const list = await this._hass.callWS({type: 'web_rtc/ice_servers'});
+            const servers = this._normalizeIceServers(list);
+            this._haIceServers = servers && servers.length ? servers : null;
+            // Mirror to the HA log like every other lifecycle event. `debug`: this is
+            // diagnostic, not an error. Low-cardinality detail → throttle keys by event name.
+            this._logHA('debug', 'ice-ha', this._haIceServers ? `${this._haIceServers.length} server(s)` : 'none');
+        } catch (e) {
+            this._haIceServers = null;   // command unavailable → keep default
+            // Old HA without the command is a benign/expected outcome, not a failure → `debug`.
+            this._logHA('debug', 'ice-ha', 'unavailable');
+        }
     }
 
     // Perform the configured `<kind>_action` (kind = 'tap' | 'hold' | 'double_tap').
@@ -1894,6 +2005,10 @@ class WebRTCCamera extends HTMLElement {
     }
 
     requestFullscreen(video) {
+        // #953: optionally unmute while fullscreen (restored on exit). Called from
+        // the fullscreen-icon click handler, i.e. inside a user gesture, so the
+        // browser autoplay policy allows the unmute.
+        if (this.config.unmute_in_fullscreen === true) this._unmuteWhileFullscreen(video);
         if (video.webkitEnterFullscreen) {
             video.webkitEnterFullscreen();
         } else {
@@ -1901,6 +2016,23 @@ class WebRTCCamera extends HTMLElement {
             if (card.requestFullscreen) card.requestFullscreen();
             else if (video.requestFullscreen) video.requestFullscreen();
         }
+    }
+
+    // #953: unmute the given video now and restore its previous (muted) state when
+    // fullscreen ends. iOS fires `webkitendfullscreen` on the <video>; the standard
+    // path fires `fullscreenchange` on document (exit = no fullscreenElement).
+    _unmuteWhileFullscreen(video) {
+        const prevMuted = video.muted;
+        if (!prevMuted) return;                 // already unmuted → nothing to do/restore
+        video.muted = false;
+        function cleanup() {
+            video.removeEventListener('webkitendfullscreen', restore);
+            document.removeEventListener('fullscreenchange', onFsChange);
+        }
+        function restore() { video.muted = prevMuted; cleanup(); }
+        function onFsChange() { if (!document.fullscreenElement) restore(); }
+        video.addEventListener('webkitendfullscreen', restore);
+        document.addEventListener('fullscreenchange', onFsChange);
     }
 
     saveScreenshot() {

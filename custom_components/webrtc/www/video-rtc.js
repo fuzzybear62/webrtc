@@ -4,7 +4,20 @@
  * Derived from AlexxIT/WebRTC. Licensed under the MIT License — see LICENSE.
  */
 /**
- * VideoRTC v2.3.8 - Revoke MSE blob URL on teardown (memory)
+ * VideoRTC v2.4.0 - Second default STUN (Cloudflare) alongside Google (#915)
+ * * Changelog v2.4.0:
+ * - Default pcConfig.iceServers now lists TWO independent public STUN servers
+ * (Google + Cloudflare). If one provider is blocked/filtered/down, the other still
+ * lets the browser discover its srflx candidate. Applies to every camera (the default
+ * lives on each driver). A per-card `ice_servers` REPLACES it; `ice_servers: []`
+ * removes all defaults (privacy opt-out). See webrtc-camera.js `_normalizeIceServers`.
+ * * Changelog v2.3.9:
+ * - FIX: removed the MSE `updateend` live-sync inherited from upstream v3.6.1
+ * (`this.video.currentTime = start` re-seek + `this.video.playbackRate = gap`).
+ * On iOS 26.1 WebKit the `gap > 0.1 ? gap : 0.1` floor pinned playbackRate to
+ * ~0.1x near the live edge, so the picture crawled at "~1 frame / 3s". MSE now
+ * plays at 1x (pre-3.6.1 behavior); the 5s buffer trim + setLiveSeekableRange are
+ * kept. WebRTC remains the low-latency path, MSE the reliable fallback.
  * * Changelog v2.3.8:
  * - FIX: ondisconnect() now revokes the MSE blob URL (URL.createObjectURL(ms),
  * legacy MediaSource path on Chrome/Firefox) if the {once} 'sourceopen' handler
@@ -262,10 +275,20 @@ export class VideoRTC extends HTMLElement {
         this.mode = 'webrtc,mse,hls,mjpeg';
         this.media = 'video,audio';
 
-        // Standard WebRTC Configuration (Google STUN)
+        // Standard WebRTC Configuration. Two INDEPENDENT public STUN servers (Google +
+        // Cloudflare, #915): STUN only lets the browser discover its own public srflx
+        // candidate — the provider identity affects reachability, not function — so two
+        // anycast providers on different orgs mean that if one is blocked/filtered/down
+        // (some ISPs/countries block Google), the other still answers. Covers ~every
+        // STUN-solvable NAT; CGNAT/symmetric NAT still needs the user's own TURN via the
+        // per-card `ice_servers` option, which REPLACES this default (see webrtc-camera.js).
+        // Privacy opt-out: `ice_servers: []` in the card removes all defaults (no third party).
         this.pcConfig = {
             bundlePolicy: 'max-bundle',
-            iceServers: [{urls: 'stun:stun.l.google.com:19302'}],
+            iceServers: [
+                {urls: 'stun:stun.l.google.com:19302'},
+                {urls: 'stun:stun.cloudflare.com:3478'},
+            ],
             sdpSemantics: 'unified-plan',
         };
 
@@ -698,13 +721,13 @@ export class VideoRTC extends HTMLElement {
                             sb.remove(start0, start);
                             ms.setLiveSeekableRange(start, end);
                         }
-                        // Sync video time if it fell behind
-                        if (this.video.currentTime < start) {
-                            this.video.currentTime = start;
-                        }
-                        // Catch up logic (increase playback speed)
-                        const gap = end - this.video.currentTime;
-                        this.video.playbackRate = gap > 0.1 ? gap : 0.1;
+                        // NOTE (#910/#884): NO currentTime re-seek / playbackRate catch-up here.
+                        // Upstream v3.6.1 added `currentTime = start` + `playbackRate = gap` as an
+                        // MSE live-latency optimization. On iOS 26.1 WebKit it pins playbackRate to
+                        // the 0.1 floor near the live edge (gap→0) → video crawls at ~0.1x → the
+                        // reported "~1 frame / 3s". The fork treats MSE as the *reliable* (not
+                        // lowest-latency) path — WebRTC is the low-latency path — so we drop the
+                        // catch-up and let MSE play at 1x, matching the working pre-3.6.1 behavior.
                     }
                 } catch (e) { /* ignore */ }
             });

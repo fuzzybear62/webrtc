@@ -505,17 +505,50 @@ If you configure the card with `entity: camera.foo` instead of `url:`, then a ba
 works because the card *does* have an entity to fall back to (resolution order:
 `tap_action.entity` → card `entity:` → the current stream's `entity`).
 
+## Custom-UI overlay options (`ui: true`)
+
+With `ui: true` the card draws its control overlay (fullscreen, screenshot, picture-in-picture,
+play/pause, volume). These fork options tune that overlay:
+
+| Option                 | Type    | Default | What it does |
+|------------------------|---------|---------|--------------|
+| `unmute_in_fullscreen` | boolean | `false` | (#953) Unmute the stream while it is fullscreen, then restore the previous muted state when fullscreen ends. Works on iOS (`webkitendfullscreen`) and desktop (`fullscreenchange`). |
+| `spinner`              | boolean | `true`  | (#924) Set `false` to remove the loading spinner entirely. |
+| `spinner_delay`        | number  | `0` (ms)| (#924) Delay before the spinner appears on a `waiting` event, so a brief stall doesn't flash it. |
+
+```yaml
+type: custom:webrtc-camera
+url: mycamera
+ui: true
+unmute_in_fullscreen: true
+spinner_delay: 800          # only show the spinner if a stall lasts > 0.8s
+# spinner: false            # …or drop it altogether
+```
+
+The **play/pause** control (#913) is a toggle: it stays visible under `ui: true` and mirrors the
+element state, so you can freeze the live picture and resume it (resuming re-seeks to the live edge).
+
+A **local still image** can be used as the `poster` (#949) — any HA-served path works, since a `poster`
+that starts with `/` (or contains `://`) is passed straight to the `<video>` element:
+
+```yaml
+poster: /local/mycamera.png   # file in <config>/www/mycamera.png
+```
+
 ## Browser-side ICE servers (`ice_servers`)
 
-By default the card offers the browser a single public STUN server
-(`stun:stun.l.google.com:19302`). STUN is enough to discover your public address and set up a **direct**
-browser↔go2rtc WebRTC path on most networks. It is **not** enough when the home end is behind **CGNAT**
-or a symmetric NAT with no reachable public endpoint — there the browser needs a **TURN relay**.
+By default the card offers the browser **two** independent public STUN servers — Google
+(`stun:stun.l.google.com:19302`) and Cloudflare (`stun:stun.cloudflare.com:3478`) (fork #915). STUN is
+enough to discover your public address and set up a **direct** browser↔go2rtc WebRTC path on most
+networks; using two providers means a blocked, filtered or down one (some ISPs/countries block Google)
+doesn't stop discovery. This default applies to **every camera**. STUN is **not** enough when the home
+end is behind **CGNAT** or a symmetric NAT with no reachable public endpoint — there the browser needs a
+**TURN relay**, which you must supply yourself.
 
-`ice_servers` (fork #952) lets you supply your own STUN/TURN list, which **replaces** the default on the
-browser's `RTCPeerConnection` (applied to every internal driver, main and shadow). It accepts the
-standard `RTCIceServer` shape — a bare string, a list of strings, or a list of objects with
-`urls` / `username` / `credential`:
+`ice_servers` (fork #952) lets you supply your own STUN/TURN list, which **fully replaces** the default on
+the browser's `RTCPeerConnection` (applied to every internal driver, main and shadow — it survives the
+MSE↔WebRTC driver swaps). It accepts the standard `RTCIceServer` shape — a bare string, a list of
+strings, or a list of objects with `urls` / `username` / `credential`:
 
 ```yaml
 type: custom:webrtc-camera
@@ -527,10 +560,41 @@ ice_servers:
     credential: mysecret
 ```
 
-> This is the browser side only. It does not touch how **go2rtc** (the home peer) gathers its own
-> candidates, and it is independent of Home Assistant / Nabu Casa — you run and pay for the TURN server
-> yourself. If you only have public-IP or port-forwarded access, a second **STUN** entry (e.g. Cloudflare)
-> is all you need; a **TURN** entry is required only for CGNAT/symmetric-NAT homes.
+**Privacy opt-out (zero third parties).** Setting an **explicit empty list** removes all default STUN
+servers, so the browser contacts no external provider. WebRTC then still works on the **LAN** (host
+candidates), while remote access simply falls back to the reliable MSE path. It costs nothing and is
+purely for those who don't want any third-party STUN:
+
+```yaml
+ice_servers: []   # no STUN/TURN at all — no Google, no Cloudflare
+```
+
+> Note: this is only meaningful as an **explicit** `ice_servers: []`. Omitting `ice_servers` keeps the
+> automatic behaviour below; a malformed non-empty list is treated as a typo and also keeps the default
+> (it is not silently wiped) — and that case is **logged at `warning`** (`ice-config`, visible in
+> Settings → System → Logs without enabling debug), so a fat-fingered STUN/TURN URL is easy to spot. The
+> resolved ICE source in effect is also mirrored to the log at `debug` (`ice` / `ice-ha`, card sub-logger).
+
+**Home Assistant's own ICE servers (automatic, incl. Nabu Casa TURN — fork #923).** When you do **not**
+set a per-card `ice_servers`, the card automatically reuses Home Assistant's **own** ICE list — anything
+you put under the core `webrtc:` config **plus any cloud-provided TURN** (Nabu Casa / Homeway) — fetched
+once via HA's native `web_rtc/ice_servers` command. This matters because Nabu Casa's TURN credentials are
+short-lived and rotating, so they **cannot** be pasted into `ice_servers` by hand — this is the only way a
+CGNAT / symmetric-NAT home gets a working relay, and Nabu Casa subscribers get it for free with zero
+config. It fails soft: on an HA too old to expose the command, the card just keeps the built-in STUN
+default.
+
+Precedence, most specific wins:
+
+1. **per-card `ice_servers`** (#952) — fully replaces everything, including the `[]` privacy opt-out;
+2. **HA native ICE** (#923) — the `webrtc:` config + Nabu Casa/Homeway TURN, used automatically when (1)
+   is unset;
+3. **built-in 2×STUN default** (#915) — Google + Cloudflare, used when HA exposes no ICE servers.
+
+> All of the above is the **browser** side only — it does not touch how **go2rtc** (the home peer) gathers
+> its own candidates. A per-card `ice_servers` entry is something you run and pay for yourself; the HA
+> native path (2) is the free automatic one. If you only have public-IP or port-forwarded access, STUN is
+> all you need; a **TURN** relay is required only for CGNAT/symmetric-NAT homes.
 
 ## Diagnostic sensors
 
