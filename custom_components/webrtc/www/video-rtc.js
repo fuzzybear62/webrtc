@@ -4,7 +4,7 @@
  * Derived from AlexxIT/WebRTC. Licensed under the MIT License — see LICENSE.
  */
 /**
- * VideoRTC v2.4.4 - on-screen element API + manual pause hold
+ * VideoRTC v2.4.5 - setMuted() targets on-screen element
  * * Changelog v2.4.4:
  * - FIX two card-facing bugs whose shared root cause was the card binding to `this.video` (the
  *   hidden MSE element) while, during the reversible-RTC `promoted` phase, the on-screen pixels
@@ -454,6 +454,20 @@ export class VideoRTC extends HTMLElement {
             if (seek && seek.length > 0) v.currentTime = seek.end(seek.length - 1);
         } catch (e) { /* ignore */ }
         v.play().catch(() => {});
+    }
+
+    /**
+     * [MUTE — card] Set the audio state the way the card's volume button should: apply it to the
+     * element that is actually AUDIBLE (the on-screen one — the overlay while promoted, else
+     * this.video) AND record it as `_mseWanted`, the driver's desired-audio state that promote/
+     * commit/revert restore. Toggling `this.video.muted` directly (the old card path) muted the
+     * hidden MSE while the audible overlay kept its sound, and the next handoff transition then
+     * overwrote the user's choice from the stale `_mseWanted`.
+     */
+    setMuted(muted) {
+        this._mseWanted = muted;
+        const v = this.onscreenVideo;
+        if (v) v.muted = muted;
     }
 
     /**

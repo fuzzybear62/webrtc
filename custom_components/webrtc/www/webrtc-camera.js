@@ -25,6 +25,12 @@
  *
  * CHANGELOG
  * ---------
+ * v14.6.4 — [mute fix] Same on-screen-element root cause as v14.6.3: the volume button set
+ *   `this.video.muted` directly, so during a promoted RTC stream it muted the hidden MSE while the
+ *   audible overlay `_rtcVideo` kept its sound, and the next handoff transition overwrote the
+ *   choice. Now routed through the driver's new `setMuted()` (v2.4.5), which mutes the on-screen
+ *   element AND records `_mseWanted` so promote/commit/revert restore the intended state. Icon
+ *   init, `volumechange` handler, and `hasAudio` also read the on-screen element.
  * v14.6.3 — [play/pause + live-dot fixes] Both bugs had ONE root cause: the card bound the play/
  *   pause button and the live-indicator dot to `this.driver.video` (the MSE element), but during
  *   the reversible-RTC `promoted` phase the on-screen pixels are the overlay `_rtcVideo` while MSE
@@ -239,7 +245,7 @@
  *   _promoteShadowToMain().
  */
 
-import {VideoRTC} from './video-rtc.js?v=2.4.4';
+import {VideoRTC} from './video-rtc.js?v=2.4.5';
 import {DigitalPTZ} from './digital-ptz.js?v=3.3.0';
 // [SIDECAR INTEGRATION] Import the Interaction module.
 // This module handles legacy features (Shortcuts, PTZ, Styles) to keep the core driver clean.
@@ -395,7 +401,7 @@ class WebRTCCamera extends HTMLElement {
         // (correlates stream loss with the mobile app backgrounding / 5G handoff).
         this._logVisAbort = null;
 
-        console.info('[WebRTC Camera] v14.6.3');
+        console.info('[WebRTC Camera] v14.6.4');
     }
 
     setConfig(config) {
@@ -2087,8 +2093,10 @@ class WebRTCCamera extends HTMLElement {
         const volBtn = root.querySelector('.volume');
         const pipIcon = root.querySelector('.pictureinpicture');
 
-        // Apply initial icon state
-        volBtn.icon = video.muted ? 'mdi:volume-mute' : 'mdi:volume-high';
+        // Apply initial icon state — reflect the AUDIBLE (on-screen) element, which during a
+        // promoted RTC stream is the overlay, not the hidden MSE this.video (v14.6.4).
+        volBtn.icon = ((this.driver && this.driver.onscreenVideo) || video).muted
+            ? 'mdi:volume-mute' : 'mdi:volume-high';
 
         // [FIX 1/2] Bind video events to the persistent spinner.
         // #924: `spinner: false` omits the element entirely (querySelector('.spinner')
@@ -2122,8 +2130,11 @@ class WebRTCCamera extends HTMLElement {
         video.addEventListener('play', () => { playBtn.icon = 'mdi:pause'; }, {signal});
         video.addEventListener('pause', () => { playBtn.icon = 'mdi:play'; }, {signal});
         video.addEventListener('loadeddata', () => volBtn.style.display = this.hasAudio ? 'block' : 'none', {signal});
+        // Reflect the on-screen (audible) element, not this.video: during promoted RTC the driver
+        // force-mutes this.video to kill echo, so reading video.muted here would show 'mute' while
+        // the overlay is actually audible (v14.6.4). External changes (fullscreen) still fire here.
         video.addEventListener('volumechange', () => {
-             volBtn.icon = video.muted ? 'mdi:volume-mute' : 'mdi:volume-high';
+             volBtn.icon = onScreen().muted ? 'mdi:volume-mute' : 'mdi:volume-high';
         }, {signal});
 
         video.addEventListener('enterpictureinpicture', () => pipIcon.icon = 'mdi:rectangle', {signal});
@@ -2133,8 +2144,13 @@ class WebRTCCamera extends HTMLElement {
             const {icon} = ev.target;
             if (icon === 'mdi:play') { this.driver.resume(); playBtn.icon = 'mdi:pause'; }
             else if (icon === 'mdi:pause') { this.driver.suspend(); playBtn.icon = 'mdi:play'; }
-            else if (icon === 'mdi:volume-mute') video.muted = false;
-            else if (icon === 'mdi:volume-high') video.muted = true;
+            // Route through the driver so it mutes the ON-SCREEN element and records the desired
+            // state in _mseWanted, which promote/commit/revert restore (v14.6.4). Old code set
+            // this.video.muted directly — muted the hidden MSE during a promoted RTC stream, and
+            // the next handoff overwrote the choice. Icon is set explicitly (the mute may land on
+            // _rtcVideo, whose volumechange doesn't bubble through this.video).
+            else if (icon === 'mdi:volume-mute') { this.driver.setMuted(false); volBtn.icon = 'mdi:volume-high'; }
+            else if (icon === 'mdi:volume-high') { this.driver.setMuted(true); volBtn.icon = 'mdi:volume-mute'; }
             else if (icon === 'mdi:floppy') this.saveScreenshot();
 
             else if (icon === 'mdi:fullscreen') this.requestFullscreen(video);
@@ -2414,7 +2430,9 @@ class WebRTCCamera extends HTMLElement {
     }
 
     get hasAudio() {
-        const v = this.driver ? this.driver.video : null;
+        // On-screen (audible) element: during promoted RTC the audio is on the overlay, not the
+        // hidden MSE this.video — check onscreenVideo so the volume button shows for RTC-only audio.
+        const v = this.driver ? this.driver.onscreenVideo : null;
         if (!v) return false;
         return (
             (v.srcObject && v.srcObject.getAudioTracks && v.srcObject.getAudioTracks().length) ||
