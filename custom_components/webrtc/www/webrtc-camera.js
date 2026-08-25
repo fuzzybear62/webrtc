@@ -25,6 +25,13 @@
  *
  * CHANGELOG
  * ---------
+ * v14.5.2 — Passive bandwidth instrumentation (driver v2.4.1). The card now logs the driver's
+ *   compact `metrics` line (RTT + min-baseline, loss%, goodput, jitter, RTC phase) at debug,
+ *   bypassing the dedup throttle so each 3s sample lands intact. Diagnostic ONLY — no stream
+ *   behaviour changes on any path. First data-gathering step toward history-driven adaptation of
+ *   the fixed RTC/retry/watchdog constants: on real links, does RTT bufferbloat / rising loss
+ *   PRECEDE the mse->rtc->mse reverts that collapse multi-camera mobile sessions? Enable with
+ *   `logger: logs: custom_components.webrtc.card: debug` and read in Settings → System → Logs.
  * v14.5.1 — HA native ICE (#923) cold-start gate: resolve HA's ICE servers BEFORE building the
  *   first driver, so the primary reversible-RTC path relays via Nabu Casa TURN from t=0 (~2s
  *   promote) instead of catching up 30s+ later through a shadow reprobe. Previously the one-shot
@@ -174,7 +181,7 @@
  *   _promoteShadowToMain().
  */
 
-import {VideoRTC} from './video-rtc.js?v=2.4.0';
+import {VideoRTC} from './video-rtc.js?v=2.4.1';
 import {DigitalPTZ} from './digital-ptz.js?v=3.3.0';
 // [SIDECAR INTEGRATION] Import the Interaction module.
 // This module handles legacy features (Shortcuts, PTZ, Styles) to keep the core driver clean.
@@ -291,7 +298,7 @@ class WebRTCCamera extends HTMLElement {
         // (correlates stream loss with the mobile app backgrounding / 5G handoff).
         this._logVisAbort = null;
 
-        console.info('[WebRTC Camera] v14.5.1');
+        console.info('[WebRTC Camera] v14.5.2');
     }
 
     setConfig(config) {
@@ -511,6 +518,11 @@ class WebRTCCamera extends HTMLElement {
     // a summary, so a continuously failing stream cannot flood the log even at warning level.
     _logHA(level, event, detail) {
         if (!this._hass) return;
+        // [BW INSTRUMENTATION] `metrics` is a periodic diagnostic sampler already rate-limited at
+        // the driver (METRICS_EMIT_MS=3s). Bypass the dedup throttle so each sample lands intact:
+        // its detail is high-cardinality (numbers change every time), so the name-keyed throttle
+        // would collapse successive samples into "(repeated N×)" and destroy the trend we're after.
+        if (event === 'metrics') { this._emitLog(level, event, detail); return; }
         if (!this._logThrottle) this._logThrottle = new Map();
 
         const WINDOW = 10000;
@@ -1303,10 +1315,15 @@ class WebRTCCamera extends HTMLElement {
         // error path (keep a healthy stream) instead of the shadow path (self-nuke as "Failed
         // Shadow" without a proper retry).
         newDriver.onmessage = {
-            ui_sync: (msg) =>
-                this.shadowDriver === newDriver
+            ui_sync: (msg) => {
+                // [BW INSTRUMENTATION] Metric lines are diagnostic and driver-cadence-gated (3s);
+                // route them straight to the HA log for BOTH main and shadow probes (a shadow's
+                // RTT/loss is exactly the bandwidth probe we want to see).
+                if (msg.type === 'metrics') { this._logHA('debug', 'metrics', msg.value); return; }
+                return this.shadowDriver === newDriver
                     ? this._onPreSwapShadowMessage(newDriver, msg)
-                    : this._onMainMessage(newDriver, msg),
+                    : this._onMainMessage(newDriver, msg);
+            },
         };
 
         // WebRTC success resets retry logic and updates UI.

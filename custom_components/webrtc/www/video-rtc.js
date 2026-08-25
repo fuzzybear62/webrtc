@@ -4,7 +4,16 @@
  * Derived from AlexxIT/WebRTC. Licensed under the MIT License — see LICENSE.
  */
 /**
- * VideoRTC v2.4.0 - Second default STUN (Cloudflare) alongside Google (#915)
+ * VideoRTC v2.4.1 - Passive bandwidth instrumentation (metric sampler)
+ * * Changelog v2.4.1:
+ * - Added a PASSIVE per-pc metric sampler (_sampleMetrics) piggybacking on the getStats poll
+ *   already running for framesDecoded. Harvests inbound-rtp (bytesReceived/packetsReceived/
+ *   packetsLost/jitter) + the selected candidate-pair currentRoundTripTime, and emits a compact
+ *   `metrics` line to the card every METRICS_EMIT_MS (3s). Diagnostic ONLY — the values never
+ *   feed the promote/commit/revert logic (that stays framesDecoded-only), so behaviour is
+ *   byte-identical on every path (fat LAN included: same stream, the numbers are just now
+ *   visible in the HA log). First data-gathering step toward history-driven adaptation: lets us
+ *   check on real links whether RTT bufferbloat / rising loss PRECEDES the mse->rtc->mse reverts.
  * * Changelog v2.4.0:
  * - Default pcConfig.iceServers now lists TWO independent public STUN servers
  * (Google + Cloudflare). If one provider is blocked/filtered/down, the other still
@@ -262,6 +271,16 @@ export class VideoRTC extends HTMLElement {
         this._stableSince = 0;     // start of the current gapless run (drives the commit clock)
         this._sustainedSignaled = false; // guards the one-shot rtc_sustained (shadow-swap) signal
 
+        // [BW INSTRUMENTATION v2.4.1] Passive metric sampler state (see _sampleMetrics). Emits a
+        // compact `metrics` line to the card every METRICS_EMIT_MS, harvested from the getStats
+        // poll already running for framesDecoded. Diagnostic only — never feeds stream decisions.
+        this._mLastBytes = -1;    // previous inbound-rtp bytesReceived (delta -> goodput)
+        this._mLastRecv = -1;     // previous packetsReceived           (delta -> loss %)
+        this._mLastLost = -1;     // previous packetsLost               (delta -> loss %)
+        this._mRttMin = Infinity; // session-min candidate-pair RTT (bufferbloat baseline)
+        this._mNextEmit = 0;      // Date.now() gate for the next emit
+        this.METRICS_EMIT_MS = 3000; // sampling cadence; bypasses the card's 10s log throttle
+
         // List of supported codecs to announce to the server
         this.CODECS = [
             'avc1.640029', 'avc1.64002A', 'avc1.640033', 'hvc1.1.6.L153.B0',
@@ -485,6 +504,49 @@ export class VideoRTC extends HTMLElement {
         if (this.reconnectTID) {
             clearTimeout(this.reconnectTID);
             this.reconnectTID = 0;
+        }
+    }
+
+    /**
+     * [BW INSTRUMENTATION v2.4.1] Passive metric sampler. Called every 500ms from the getStats
+     * poll; accumulates deltas over METRICS_EMIT_MS and emits a compact `metrics` line to the
+     * card. Side-effect-free w.r.t. the stream — it only observes and logs, so it is safe on
+     * every path (fat LAN included: same numbers, just now visible). Goal: see on real links
+     * whether RTT bufferbloat / rising loss PRECEDES the reverts that collapse mobile sessions.
+     */
+    _sampleMetrics(bytes, recv, lost, jit, rtt) {
+        const now = Date.now();
+        if (rtt >= 0 && rtt < this._mRttMin) this._mRttMin = rtt;
+        if (now < this._mNextEmit) return;
+        // Prime the deltas on the first tick so the first emitted goodput isn't a bogus spike.
+        if (this._mLastBytes < 0) {
+            this._mLastBytes = bytes; this._mLastRecv = recv; this._mLastLost = lost;
+            this._mNextEmit = now + this.METRICS_EMIT_MS;
+            return;
+        }
+        // Nothing decoding yet (no pc stats this window) → skip the emit but keep the clock moving.
+        if (rtt < 0 && bytes < 0) { this._mNextEmit = now + this.METRICS_EMIT_MS; return; }
+
+        const dtSec = this.METRICS_EMIT_MS / 1000;
+        const gp = bytes >= 0 && this._mLastBytes >= 0
+            ? Math.max(0, bytes - this._mLastBytes) / 1024 / dtSec : -1;        // KB/s over the window
+        const dLost = lost >= 0 && this._mLastLost >= 0 ? Math.max(0, lost - this._mLastLost) : -1;
+        const dRecv = recv >= 0 && this._mLastRecv >= 0 ? Math.max(0, recv - this._mLastRecv) : -1;
+        const lossPct = dLost >= 0 && dRecv >= 0 && (dLost + dRecv) > 0
+            ? (100 * dLost / (dLost + dRecv)) : -1;
+        if (bytes >= 0) this._mLastBytes = bytes;
+        if (recv >= 0) this._mLastRecv = recv;
+        if (lost >= 0) this._mLastLost = lost;
+        this._mNextEmit = now + this.METRICS_EMIT_MS;
+
+        const rttMs = rtt >= 0 ? Math.round(rtt * 1000) : -1;
+        const baseMs = this._mRttMin < Infinity ? Math.round(this._mRttMin * 1000) : -1;
+        const summary =
+            `phase=${this._rtcPhase} rtt=${rttMs}ms(min ${baseMs}) ` +
+            `loss=${lossPct >= 0 ? lossPct.toFixed(1) : '?'}% gp=${gp >= 0 ? gp.toFixed(0) : '?'}kb/s ` +
+            `jit=${jit >= 0 ? Math.round(jit * 1000) : '?'}ms`;
+        if (this.onmessage && typeof this.onmessage['ui_sync'] === 'function') {
+            this.onmessage['ui_sync']({ type: 'metrics', value: summary });
         }
     }
 
@@ -994,9 +1056,23 @@ export class VideoRTC extends HTMLElement {
             if (!this.pc) { clearInterval(this._firstFramePoll); this._firstFramePoll = 0; return; }
             this.pc.getStats().then(stats => {
                 let fd = -1;
+                // [BW INSTRUMENTATION v2.4.1] Harvest passive metrics from the SAME poll: inbound-rtp
+                // (goodput/loss/jitter) + selected candidate-pair RTT. Pure observation — the values
+                // below never feed the promote/commit/revert logic (that stays framesDecoded-only).
+                let mBytes = -1, mRecv = -1, mLost = -1, mJit = -1, mRtt = -1;
                 for (const r of stats.values()) {
-                    if (r.type === 'inbound-rtp' && r.kind === 'video') { fd = r.framesDecoded || 0; break; }
+                    if (r.type === 'inbound-rtp' && r.kind === 'video') {
+                        fd = r.framesDecoded || 0;
+                        if (r.bytesReceived != null) mBytes = r.bytesReceived;
+                        if (r.packetsReceived != null) mRecv = r.packetsReceived;
+                        if (r.packetsLost != null) mLost = r.packetsLost;
+                        if (r.jitter != null) mJit = r.jitter;
+                    } else if (r.type === 'candidate-pair' && (r.nominated || r.selected) &&
+                               r.currentRoundTripTime != null) {
+                        mRtt = r.currentRoundTripTime;
+                    }
                 }
+                this._sampleMetrics(mBytes, mRecv, mLost, mJit, mRtt);
                 if (fd < 0) return;
                 const advanced = lastDecoded >= 0 && fd > lastDecoded;
                 lastDecoded = fd;
