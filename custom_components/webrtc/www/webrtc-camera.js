@@ -25,6 +25,14 @@
  *
  * CHANGELOG
  * ---------
+ * v14.6.5 — [driver-only fixes, pin ?v=2.4.5 → 2.4.6] (1) MSE strand recovery: a frozen MSE
+ *   stream that only started after pressing pause+play — the 5s buffer eviction could strand
+ *   currentTime below the buffered window (late initial autoplay, or a stall behind an evicted
+ *   region) and the element waited forever for removed data. onmse now seeks to the live edge once
+ *   on that condition. (2) No-data watchdog reverted to always 5s: the v2.4.3 phase-aware 2.5s
+ *   shortening false-fired on bursty-but-alive MSE over congested 4G and tore down the working MSE
+ *   (retry storm), and starved the A0 severity gate; 5s lets 4×MSE settle. No card logic changed —
+ *   version bump + pin only.
  * v14.6.4 — [mute fix] Same on-screen-element root cause as v14.6.3: the volume button set
  *   `this.video.muted` directly, so during a promoted RTC stream it muted the hidden MSE while the
  *   audible overlay `_rtcVideo` kept its sound, and the next handoff transition overwrote the
@@ -245,7 +253,7 @@
  *   _promoteShadowToMain().
  */
 
-import {VideoRTC} from './video-rtc.js?v=2.4.5';
+import {VideoRTC} from './video-rtc.js?v=2.4.6';
 import {DigitalPTZ} from './digital-ptz.js?v=3.3.0';
 // [SIDECAR INTEGRATION] Import the Interaction module.
 // This module handles legacy features (Shortcuts, PTZ, Styles) to keep the core driver clean.
@@ -401,7 +409,7 @@ class WebRTCCamera extends HTMLElement {
         // (correlates stream loss with the mobile app backgrounding / 5G handoff).
         this._logVisAbort = null;
 
-        console.info('[WebRTC Camera] v14.6.4');
+        console.info('[WebRTC Camera] v14.6.5');
     }
 
     setConfig(config) {

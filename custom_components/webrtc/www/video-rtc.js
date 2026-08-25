@@ -4,7 +4,29 @@
  * Derived from AlexxIT/WebRTC. Licensed under the MIT License — see LICENSE.
  */
 /**
- * VideoRTC v2.4.5 - setMuted() targets on-screen element
+ * VideoRTC v2.4.6 - MSE strand recovery + no-data watchdog always 5s
+ * * Changelog v2.4.6:
+ * - FIX (MSE strand → frozen stream, "press pause+play to start"): the 5s buffer eviction
+ *   (sb.remove) can leave the element's currentTime BELOW the buffered window — initial autoplay
+ *   never started before the window slid past currentTime=0 (slow-4G / backgrounded first-frame),
+ *   or an MSE stall stranded currentTime behind an evicted region. The element then waits forever
+ *   for removed data and freezes; only a manual pause→play (resume() seeks to live) cleared it.
+ *   onmse's updateend now seeks to the live edge ONCE when it detects that strand (guarded by
+ *   !_manualHold, and by currentTime<buffered.start so it can't fire on a healthy stream) — NOT
+ *   the continuous upstream currentTime=start catch-up that caused the iOS 0.1x crawl.
+ * - REVERT of v2.4.3's phase-aware no-data watchdog shortening. `_feedWatchdog` now always uses
+ *   the full DISCONNECT_TIMEOUT (5s). That watchdog is fed by binary WS bytes = MSE chunks (RTC
+ *   is P2P), so it measures MSE liveness only; the 2.5s window while negotiating false-fired on
+ *   bursty-but-alive MSE over congested 4G (loss 29-54%), and `onclose()` tore down the working
+ *   MSE too (a retry storm, not the "revert to MSE" the old comment claimed). It also killed
+ *   streams before the first loss% metric was emitted, starving the card's A0 severity gate so
+ *   suppression latched slowly. At 5s the loss sample lands first and 4xMSE settles. Killing a
+ *   doomed RTC probe fast stays the job of the RTC give-up watchdog + card narrow-link suppression.
+ * * Changelog v2.4.5:
+ * - NEW `setMuted(muted)`: the card's volume button now mutes the ON-SCREEN element (onscreenVideo)
+ *   AND records `_mseWanted`, so promote/commit/revert restore the intended audio state. The old
+ *   card path set this.video.muted directly — muted the hidden MSE during promoted RTC while the
+ *   audible overlay kept its sound, and the next handoff overwrote the choice.
  * * Changelog v2.4.4:
  * - FIX two card-facing bugs whose shared root cause was the card binding to `this.video` (the
  *   hidden MSE element) while, during the reversible-RTC `promoted` phase, the on-screen pixels
@@ -583,12 +605,25 @@ export class VideoRTC extends HTMLElement {
     _feedWatchdog() {
         if (!this.DISCONNECT_TIMEOUT) return;
         if (this.reconnectTID) clearTimeout(this.reconnectTID);
-        // Phase-aware deadline: shorter while an un-committed RTC probe is on the link
-        // (negotiating/promoted), full timeout otherwise. See NEGOTIATING_DISCONNECT_TIMEOUT.
-        const probing = this._rtcPhase === 'negotiating' || this._rtcPhase === 'promoted';
-        const timeout = (probing && this.NEGOTIATING_DISCONNECT_TIMEOUT)
-            ? this.NEGOTIATING_DISCONNECT_TIMEOUT
-            : this.DISCONNECT_TIMEOUT;
+        // This watchdog is fed by binary WS bytes = the MSE fMP4 chunks (onopen's message
+        // handler). RTC media flows P2P and never touches it, so this measures MSE liveness
+        // ONLY. Therefore it always uses the full DISCONNECT_TIMEOUT.
+        //
+        // v2.4.6 REVERTS the v2.4.3 phase-aware shortening (2.5s while negotiating/promoted).
+        // Field data (congested 4G, loss 29-54%, 4 cams) proved it self-defeating on TWO fronts:
+        //   (1) It shortened the guardian of the MSE, not the RTC probe. Under TCP-over-lossy-uplink
+        //       the MSE arrives in bursts with >2.5s gaps despite 70-114 KB/s average goodput, so
+        //       the 2.5s window FALSE-fired and `onclose()` tore down the whole connection — the
+        //       working MSE included (the old "reverts to MSE, ~1 frame" claim was wrong: onclose
+        //       kills MSE too, hence the mode:mse->none retry storm).
+        //   (2) Deaths at ~2.5s landed BEFORE the first `metrics` (loss%) line was emitted, so the
+        //       card's A0 severity gate (latch rtc-suppressed on the first death with a fresh
+        //       loss ≥20% sample) had no data and never latched fast — the exact opposite of the
+        //       "reach MSE-only suppression faster" goal. At the full 5s the loss sample lands
+        //       first, so A0 latches on the first bad death and 4xMSE settles.
+        // Abandoning a doomed RTC probe fast is the job of the RTC give-up/first-frame watchdog +
+        // the card's narrow-link suppression, NOT this MSE no-data watchdog.
+        const timeout = this.DISCONNECT_TIMEOUT;
         this.reconnectTID = setTimeout(() => {
             this.reconnectTID = 0;
             console.warn(`[VideoRTC:${this.clientId}] No-data watchdog fired (${timeout}ms silent, phase=${this._rtcPhase}). Forcing close.`);
@@ -892,7 +927,26 @@ export class VideoRTC extends HTMLElement {
                             sb.remove(start0, start);
                             ms.setLiveSeekableRange(start, end);
                         }
-                        // NOTE (#910/#884): NO currentTime re-seek / playbackRate catch-up here.
+                        // STRAND RECOVERY (v2.4.6): currentTime fell BELOW the buffered window —
+                        // either the initial autoplay never started before the 5s window slid past
+                        // currentTime=0 (slow-4G / backgrounded first-frame), or an MSE stall left
+                        // currentTime behind an evicted region. The element then waits forever for
+                        // data that was just removed → permanent freeze, cleared only by a manual
+                        // pause→play (resume() seeks to the live edge). Seek to the live edge ONCE on
+                        // exactly that condition. This is NOT the continuous upstream currentTime=start
+                        // catch-up removed below (that pinned iOS playbackRate to 0.1 → crawl); it
+                        // fires only on the pathology (on a healthy stream currentTime sits at the
+                        // live edge, well above the buffered start), so no crawl. Never overrides a
+                        // user's manual hold.
+                        if (!this._manualHold && this.video && !this.video.seeking
+                            && this.video.buffered.length) {
+                            const lo = this.video.buffered.start(0);
+                            if (this.video.currentTime < lo) {
+                                this.video.currentTime = this.video.buffered.end(this.video.buffered.length - 1);
+                                if (this.video.paused) this.play();
+                            }
+                        }
+                        // NOTE (#910/#884): NO continuous currentTime re-seek / playbackRate catch-up.
                         // Upstream v3.6.1 added `currentTime = start` + `playbackRate = gap` as an
                         // MSE live-latency optimization. On iOS 26.1 WebKit it pins playbackRate to
                         // the 0.1 floor near the live edge (gap→0) → video crawls at ~0.1x → the
