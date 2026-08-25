@@ -25,6 +25,9 @@
  *
  * CHANGELOG
  * ---------
+ * v14.5.3 — Driver v2.4.2 hotfix: onopen() null-mode crash guard. A null this.mode made the
+ *   driver throw at ws-open (0-byte channel) and reconnect immediately -> reconnect storm, seen
+ *   even on LAN. Card-side unchanged; pin bumped to ?v=2.4.2 (cache-bust).
  * v14.5.2 — Passive bandwidth instrumentation (driver v2.4.1). The card now logs the driver's
  *   compact `metrics` line (RTT + min-baseline, loss%, goodput, jitter, RTC phase) at debug,
  *   bypassing the dedup throttle so each 3s sample lands intact. Diagnostic ONLY — no stream
@@ -181,7 +184,7 @@
  *   _promoteShadowToMain().
  */
 
-import {VideoRTC} from './video-rtc.js?v=2.4.1';
+import {VideoRTC} from './video-rtc.js?v=2.4.2';
 import {DigitalPTZ} from './digital-ptz.js?v=3.3.0';
 // [SIDECAR INTEGRATION] Import the Interaction module.
 // This module handles legacy features (Shortcuts, PTZ, Styles) to keep the core driver clean.
@@ -298,7 +301,7 @@ class WebRTCCamera extends HTMLElement {
         // (correlates stream loss with the mobile app backgrounding / 5G handoff).
         this._logVisAbort = null;
 
-        console.info('[WebRTC Camera] v14.5.2');
+        console.info('[WebRTC Camera] v14.5.3');
     }
 
     setConfig(config) {

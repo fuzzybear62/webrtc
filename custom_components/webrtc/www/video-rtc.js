@@ -4,7 +4,14 @@
  * Derived from AlexxIT/WebRTC. Licensed under the MIT License — see LICENSE.
  */
 /**
- * VideoRTC v2.4.1 - Passive bandwidth instrumentation (metric sampler)
+ * VideoRTC v2.4.2 - onopen null-mode crash guard
+ * * Changelog v2.4.2:
+ * - FIX: onopen() guards against a null/undefined this.mode. A stream entry without `mode`
+ *   or a teardown<->open race during rapid reconnect churn left this.mode null; the
+ *   `this.mode.includes(...)` calls threw, the ws died at open (0-byte channel) and the card
+ *   reconnected immediately -> reconnect storm (seen even on LAN). Now restores the default
+ *   ('webrtc,mse,hls,mjpeg') + warns once, so onopen can't throw. Behaviour unchanged when
+ *   this.mode is already a valid string.
  * * Changelog v2.4.1:
  * - Added a PASSIVE per-pc metric sampler (_sampleMetrics) piggybacking on the getStats poll
  *   already running for framesDecoded. Harvests inbound-rtp (bytesReceived/packetsReceived/
@@ -621,6 +628,17 @@ export class VideoRTC extends HTMLElement {
      * Called when WebSocket opens. Sets up message routing.
      */
     onopen() {
+        // GUARD: this.mode normally arrives from the card (effectiveConfig.mode). A stream
+        // entry without `mode`, or a teardown<->open race during rapid reconnect churn, can
+        // leave it null -> the `this.mode.includes(...)` calls below throw, the ws dies at
+        // open (0-byte channel) and the card immediately reconnects -> reconnect storm.
+        // Restore the default so onopen can't throw. Matches the defensive style of
+        // onconnect() and `this.onmessage = this.onmessage || {}` below.
+        if (!this.mode) {
+            console.warn(`[VideoRTC:${this.clientId}] onopen: this.mode was ${this.mode}; restoring default`);
+            this.mode = 'webrtc,mse,hls,mjpeg';
+        }
+
         this.ws.addEventListener('message', ev => {
             if (typeof ev.data === 'string') {
                 const msg = JSON.parse(ev.data);
