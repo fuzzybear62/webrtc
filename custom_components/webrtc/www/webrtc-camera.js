@@ -25,6 +25,18 @@
  *
  * CHANGELOG
  * ---------
+ * v14.5.1 — HA native ICE (#923) cold-start gate: resolve HA's ICE servers BEFORE building the
+ *   first driver, so the primary reversible-RTC path relays via Nabu Casa TURN from t=0 (~2s
+ *   promote) instead of catching up 30s+ later through a shadow reprobe. Previously the one-shot
+ *   fetch raced the cold start and always lost, so the FIRST stream after every (re)load carried
+ *   only the 2×STUN default — a remote CGNAT user glancing at a camera for <~35s never reached the
+ *   relay. The fetch is now a bounded (300ms), one-flight promise: `set hass` warms it, startStream
+ *   awaits the SAME promise on a cold start only (shadow/reprobe/reconnect skip it — already
+ *   cached). A `_coldStartInFlight` latch coalesces concurrent `set hass` ticks across the await,
+ *   and a post-await re-validation (isConnected/paused/driver) prevents resurrecting a card
+ *   detached mid-fetch. Fail-soft: timeout or old HA → 2×STUN default (worst case = prior
+ *   behaviour), with the periodic reprobe still the backstop for the rare timeout path. Added cost:
+ *   the single WS round-trip (~10ms) on the first frame. Card only; driver unchanged (v2.4.0).
  * v14.5.0 — HA native ICE (#923): the card now also reuses Home Assistant's OWN ICE servers —
  *   the user's `webrtc:` config plus any cloud-provided TURN (Nabu Casa / Homeway) — fetched
  *   once via the native `web_rtc/ice_servers` WS command (pure JS; zero Python; fails soft on
@@ -226,6 +238,15 @@ class WebRTCCamera extends HTMLElement {
         // on an already-playing stream (ignore).
         this._streamHealthy = false;
 
+        // [HA NATIVE ICE (#923) — COLD-START GATE] State for resolving Home Assistant's
+        // own ICE servers (Nabu Casa / Homeway TURN) BEFORE the first driver is built, so
+        // the primary reversible-RTC path can relay from t=0 (2s promote) instead of
+        // catching up 30s+ later via a shadow reprobe. See _ensureHaIceReady().
+        this._haIceServers = null;         // resolved value: RTCIceServer[] | null (none/unavailable)
+        this._haIceReady = false;          // true once the fetch RESOLVED or timed out (fail-soft)
+        this._haIcePromise = null;         // one-flight fetch promise (warm-up + gate join the same one)
+        this._coldStartInFlight = false;   // latch: coalesce concurrent set-hass ticks during the await
+
         // [SEAMLESS HANDOVER] Retry counter for background upgrades
         this._shadowAttempts = 0;
         // [SEAMLESS HANDOVER] Watchdog timer to kill stuck shadow connections
@@ -270,7 +291,7 @@ class WebRTCCamera extends HTMLElement {
         // (correlates stream loss with the mobile app backgrounding / 5G handoff).
         this._logVisAbort = null;
 
-        console.info('[WebRTC Camera] v14.5.0');
+        console.info('[WebRTC Camera] v14.5.1');
     }
 
     setConfig(config) {
@@ -611,16 +632,14 @@ class WebRTCCamera extends HTMLElement {
     set hass(hass) {
         this._hass = hass;
 
-        // [HA NATIVE ICE (#923)] One-shot fetch of Home Assistant's own ICE servers
-        // (user `webrtc:` config + Nabu Casa / Homeway TURN, if any) via the native
-        // `web_rtc/ice_servers` WS command. This is the ONLY way to reach the
-        // rotating, non-pasteable Nabu Casa TURN credentials, so CGNAT / symmetric-NAT
-        // users get relay for free. Fire once — the result is cached and picked up by
-        // the next driver (reprobe handles late arrival).
-        if (!this._haIceFetched) {
-            this._haIceFetched = true;
-            this._fetchHaIceServers();
-        }
+        // [HA NATIVE ICE (#923)] Warm up the one-shot fetch of Home Assistant's own ICE
+        // servers (user `webrtc:` config + Nabu Casa / Homeway TURN, if any) via the native
+        // `web_rtc/ice_servers` WS command — the ONLY path to the rotating, non-pasteable
+        // Nabu Casa TURN credentials, so CGNAT / symmetric-NAT users get relay for free.
+        // Fire-and-forget here so the fetch starts as early as possible; the cold-start gate
+        // in startStream() AWAITS the same one-flight promise so the FIRST driver already
+        // carries the TURN (2s promote) instead of catching up via a 30s+ shadow reprobe.
+        this._ensureHaIceReady();
 
         // Start the stream only when:
         // - HA is available
@@ -1146,6 +1165,26 @@ class WebRTCCamera extends HTMLElement {
         if (!this._hass || !this.config) return;
         // [AUTO-PAUSE] Never start (or resurrect) a stream while paused off-screen.
         if (this._paused) return;
+
+        // [HA ICE COLD-START GATE (#923)] On a COLD start only, make sure HA's ICE servers
+        // are resolved before we build the first driver, so its own reversible RTC can use
+        // the Nabu Casa TURN from t=0. Shadow/reprobe/reconnect starts skip this — by then
+        // `_haIceServers` is already resolved (cached). The await opens a window where
+        // `this.driver` is still null and more `set hass` ticks could re-enter, so latch it.
+        const coldStart = !this.driver && !this._isReconnecting;
+        if (coldStart && !this._haIceReady) {
+            if (this._coldStartInFlight) return;   // a cold start is already awaiting — coalesce
+            this._coldStartInFlight = true;
+            try {
+                await this._ensureHaIceReady();    // ~10ms typical; 300ms-bounded; fail-soft
+            } finally {
+                this._coldStartInFlight = false;
+            }
+            // State may have changed across the await: the card could have been detached
+            // (view switch — never resurrect it), paused, or torn down. Re-validate before
+            // building. If a driver appeared meanwhile the latch was bypassed — bail.
+            if (!this.isConnected || this._paused || !this._hass || !this.config || this.driver) return;
+        }
 
         // Resolve the effective stream configuration.
         // Stream-specific overrides are merged here only.
@@ -1929,6 +1968,30 @@ class WebRTCCamera extends HTMLElement {
     // reinventing it in Python. Cached in `this._haIceServers`; consumed at driver
     // creation, below the per-card override. Fails soft: an older HA (command missing)
     // leaves the cache null and we keep the built-in STUN default.
+    // [COLD-START GATE] Resolve HA's ICE servers exactly once, bounded by a short timeout,
+    // and remember that we resolved (or gave up). Idempotent and one-flight: the eager
+    // warm-up in `set hass` and the awaited gate in startStream() share the SAME promise, so
+    // in the common case the fetch is already resolving by the time the gate awaits it — the
+    // only added first-frame cost is the single WS round-trip (~10ms, field-measured), far
+    // below the ~500ms MSE land. `web_rtc/ice_servers` is a synchronous in-memory HA callback
+    // (no cloud I/O per call — the provider caches server-side), so N cameras cost N cheap
+    // round-trips, not N cloud fetches. FAIL-SOFT: on timeout (wedged WS) or an old HA missing
+    // the command, `_haIceServers` stays null and the driver keeps the 2×STUN default — i.e.
+    // the worst case is exactly today's behaviour.
+    async _ensureHaIceReady() {
+        if (this._haIceReady) return;                       // already resolved/timed out (cached)
+        if (!this._haIcePromise) {
+            // Bound the fetch: a genuinely wedged WS must never stall the first frame. The
+            // fetch itself never rejects (its own try/catch sets _haIceServers=null), so the
+            // race only trades a late fetch for the default. Old HA rejects fast → no wait.
+            const TIMEOUT_MS = 300;
+            const timeout = new Promise(resolve => setTimeout(resolve, TIMEOUT_MS));
+            this._haIcePromise = Promise.race([this._fetchHaIceServers(), timeout])
+                .then(() => { this._haIceReady = true; });
+        }
+        await this._haIcePromise;
+    }
+
     async _fetchHaIceServers() {
         try {
             const list = await this._hass.callWS({type: 'web_rtc/ice_servers'});
