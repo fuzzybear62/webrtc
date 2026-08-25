@@ -4,7 +4,17 @@
  * Derived from AlexxIT/WebRTC. Licensed under the MIT License — see LICENSE.
  */
 /**
- * VideoRTC v2.4.2 - onopen null-mode crash guard
+ * VideoRTC v2.4.3 - phase-aware no-data watchdog
+ * * Changelog v2.4.3:
+ * - The no-data watchdog (DISCONNECT_TIMEOUT) is now PHASE-AWARE. While an un-committed RTC
+ *   probe is live (_rtcPhase 'negotiating' or 'promoted') the RTC overlay is ADDITIVE load on
+ *   the link, so a ws MSE-media silence almost certainly means that experiment is choking the
+ *   link (the multi-camera 4G collapse). In those phases the watchdog fires at
+ *   NEGOTIATING_DISCONNECT_TIMEOUT (2.5s) instead of 5s, so the doomed probe is killed sooner,
+ *   the link is freed for the other cameras, and the card reaches MSE-only suppression faster.
+ *   Low risk: MSE is still warm underneath in both phases, so a watchdog fire reverts to MSE
+ *   (~1 frame), not a black screen; on a fat link MSE never goes 2.5s silent so it never trips.
+ *   'warm' (no experiment) and 'committed' (no MSE net) keep the full 5s.
  * * Changelog v2.4.2:
  * - FIX: onopen() guards against a null/undefined this.mode. A stream entry without `mode`
  *   or a teardown<->open race during rapid reconnect churn left this.mode null; the
@@ -196,6 +206,14 @@ export class VideoRTC extends HTMLElement {
         // No-media watchdog: if the socket stays open but no media bytes arrive
         // for this long, treat the stream as stalled and force a reconnect.
         this.DISCONNECT_TIMEOUT = 5000;
+
+        // Phase-aware variant of the above (v2.4.3). While an un-committed RTC probe is live
+        // (_rtcPhase 'negotiating'/'promoted') the RTC overlay is additive load on the link; a
+        // ws MSE-media silence there is almost certainly that experiment choking the link (the
+        // multi-camera 4G collapse), so we bail at this shorter deadline to free the link and
+        // fall back to the still-warm MSE (~1 frame revert, not a black screen). 'warm' and
+        // 'committed' keep the full DISCONNECT_TIMEOUT. Set to 0 to disable the shortening.
+        this.NEGOTIATING_DISCONNECT_TIMEOUT = 2500;
 
         // First-frame watchdog: 'connectionState=connected' is NOT proof of a working
         // WebRTC stream. On multi-hop paths ICE/DTLS connectivity checks (tiny packets)
@@ -498,13 +516,19 @@ export class VideoRTC extends HTMLElement {
     _feedWatchdog() {
         if (!this.DISCONNECT_TIMEOUT) return;
         if (this.reconnectTID) clearTimeout(this.reconnectTID);
+        // Phase-aware deadline: shorter while an un-committed RTC probe is on the link
+        // (negotiating/promoted), full timeout otherwise. See NEGOTIATING_DISCONNECT_TIMEOUT.
+        const probing = this._rtcPhase === 'negotiating' || this._rtcPhase === 'promoted';
+        const timeout = (probing && this.NEGOTIATING_DISCONNECT_TIMEOUT)
+            ? this.NEGOTIATING_DISCONNECT_TIMEOUT
+            : this.DISCONNECT_TIMEOUT;
         this.reconnectTID = setTimeout(() => {
             this.reconnectTID = 0;
-            console.warn(`[VideoRTC:${this.clientId}] No-data watchdog fired (${this.DISCONNECT_TIMEOUT}ms silent). Forcing close.`);
+            console.warn(`[VideoRTC:${this.clientId}] No-data watchdog fired (${timeout}ms silent, phase=${this._rtcPhase}). Forcing close.`);
             this.handoff = false; // a stall is a failure, not an intentional handover
             this._closeReason = 'no-data-watchdog';
             this.onclose();
-        }, this.DISCONNECT_TIMEOUT);
+        }, timeout);
     }
 
     _clearWatchdog() {

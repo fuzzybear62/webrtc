@@ -25,6 +25,21 @@
  *
  * CHANGELOG
  * ---------
+ * v14.6.2 — [Lever A + D1] Two latency/UX fixes shipped together (pin bumps ?v=2.4.2 → 2.4.3).
+ *   LEVER A (driver): the no-data watchdog is now phase-aware. While an un-committed RTC probe is
+ *   live (_rtcPhase negotiating/promoted) a doomed probe is declared dead after 2.5s
+ *   (NEGOTIATING_DISCONNECT_TIMEOUT) instead of the full 5s DISCONNECT_TIMEOUT. On a narrow link
+ *   the additive RTC probe starves the MSE ws, so the old 5s tolerance was a fleet-wide collateral
+ *   stall window; halving it during probes shortens the collateral damage without touching the
+ *   committed-stream watchdog. Answers the field hypothesis "we wait too long before declaring the
+ *   non-MSE attempt dead."
+ *   D1 (card): reconnect gap now shows a freeze-frame instead of a black box with a play glyph. The
+ *   last decoded frame is captured to a JPEG data URL in _scheduleRetry() (while the dying <video>
+ *   is still alive, same instant as _lockHeight) and applied as the NEXT driver's video.poster —
+ *   the browser natively shows it until the new stream decodes its first frame, and a poster also
+ *   suppresses the empty-state play glyph. One-shot (cleared once applied); Main driver only (the
+ *   Shadow negotiates hidden). Opt out with `freeze_frame: false`. Canvas is same-origin/untainted
+ *   (same as saveScreenshot). No static poster configured → freeze survives untouched to first frame.
  * v14.6.1 — [A0] Severity trigger for the suppression latch. Field logs of the real "pessima" 4G
  *   pattern showed the cumulative flap score never latched: the 4 cameras die together once per
  *   ~2-min burst (each counts only 1 flap on its own card state) and the 45s decay wiped the score
@@ -211,7 +226,7 @@
  *   _promoteShadowToMain().
  */
 
-import {VideoRTC} from './video-rtc.js?v=2.4.2';
+import {VideoRTC} from './video-rtc.js?v=2.4.3';
 import {DigitalPTZ} from './digital-ptz.js?v=3.3.0';
 // [SIDECAR INTEGRATION] Import the Interaction module.
 // This module handles legacy features (Shortcuts, PTZ, Styles) to keep the core driver clean.
@@ -367,7 +382,7 @@ class WebRTCCamera extends HTMLElement {
         // (correlates stream loss with the mobile app backgrounding / 5G handoff).
         this._logVisAbort = null;
 
-        console.info('[WebRTC Camera] v14.6.1');
+        console.info('[WebRTC Camera] v14.6.2');
     }
 
     setConfig(config) {
@@ -576,6 +591,31 @@ class WebRTCCamera extends HTMLElement {
     _unlockHeight() {
         const player = this.shadowRoot && this.shadowRoot.querySelector('.player');
         if (player) player.style.minHeight = '';
+    }
+
+    // [D1 FREEZE-FRAME] Grab the last decoded frame from the dying driver's <video> and stash it
+    // as a JPEG data URL. Called from _scheduleRetry() while the old driver is still alive (frozen
+    // last frame, same point _lockHeight() relies on). The stashed frame is applied as the NEXT
+    // driver's video.poster (see startStream), so the reconnect gap shows the last live frame
+    // instead of a black box with a browser play glyph. One-shot: consumed and cleared when applied.
+    //
+    // Same-origin, so the canvas is never tainted (saveScreenshot() proves this). Opt out with
+    // `freeze_frame: false`. Silently no-ops if nothing has decoded yet (videoWidth 0) — cold start
+    // has no frame to freeze, and that's fine (falls back to any static poster, else black).
+    _captureFreezeFrame() {
+        if (this.config.freeze_frame === false) return;
+        const video = this.driver && this.driver.video;
+        if (!video || !video.videoWidth || !video.videoHeight) return;
+        try {
+            const canvas = document.createElement('canvas');
+            canvas.width = video.videoWidth;
+            canvas.height = video.videoHeight;
+            canvas.getContext('2d').drawImage(video, 0, 0);
+            this._freezeFrameUrl = canvas.toDataURL('image/jpeg', 0.7);
+        } catch (e) {
+            // Tainted canvas or draw failure: leave the gap black rather than throw.
+            this._freezeFrameUrl = null;
+        }
     }
 
     // [LIFECYCLE LOGGING] Mirror one stream-lifecycle event to the HA log via system_log.write,
@@ -1124,6 +1164,11 @@ class WebRTCCamera extends HTMLElement {
         // <video> is still sized here (frozen last frame); released once a new mode comes up.
         this._lockHeight();
 
+        // [D1 FREEZE-FRAME] Same instant, same reason the <video> is still live here: grab its last
+        // decoded frame so the reconnect gap shows that frame (as the new driver's poster) instead
+        // of a black box with a play glyph. Must run before _cleanupDriver() removes the element.
+        this._captureFreezeFrame();
+
         this._isReconnecting = true;
         this._streamHealthy = false;
         // [RTC RE-PROBE] The driver is being torn down and cold-restarted; a fresh
@@ -1639,8 +1684,18 @@ class WebRTCCamera extends HTMLElement {
         if (newDriver.video) {
             newDriver.video.controls = false;
             
-            // [SEAMLESS HANDOVER] Apply poster to new driver immediately (including shadow)
-            if (this.config.poster) {
+            // [SEAMLESS HANDOVER] Apply poster to new driver immediately (including shadow).
+            // [D1 FREEZE-FRAME] Prefer the last live frame captured from the dying driver at
+            // teardown: it fills the reconnect gap with the real last frame (no black box, no play
+            // glyph) until the new stream decodes. One-shot — cleared once applied, so it only ever
+            // covers the gap that just opened, and never leaks onto an unrelated later start. Only
+            // the Main driver is user-visible; the Shadow negotiates hidden, so it keeps the static
+            // poster path. Absent a freeze frame (cold start, or opted out), fall back to any static
+            // poster exactly as before.
+            if (!isShadowMode && this._freezeFrameUrl) {
+                newDriver.video.poster = this._freezeFrameUrl;
+                this._freezeFrameUrl = null;
+            } else if (this.config.poster) {
                 if (this.config.poster_remote) {
                     newDriver.video.poster = this.config.poster;
                 } else if (!newDriver.video.poster) {
