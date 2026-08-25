@@ -25,6 +25,16 @@
  *
  * CHANGELOG
  * ---------
+ * v14.6.1 — [A0] Severity trigger for the suppression latch. Field logs of the real "pessima" 4G
+ *   pattern showed the cumulative flap score never latched: the 4 cameras die together once per
+ *   ~2-min burst (each counts only 1 flap on its own card state) and the 45s decay wiped the score
+ *   between bursts → stuck at 1.0/3, RTC never suppressed, all cameras black with no recovery. But
+ *   the metrics sampled the instant before each death read loss 35-50% — proof the link is narrow.
+ *   Now the card parses loss% from the metrics line; a within-probation death preceded by a FRESH
+ *   (≤8s) sample with loss ≥ FLAP_LOSS_PCT (20%) weighs a full FLAP_SUPPRESS_AT → latches on the
+ *   FIRST such death instead of never. Decay widened 45s→120s so the slow cumulative path still
+ *   accumulates across bursty failures. Card-only, pin stays ?v=2.4.2. Using loss ONLY for the
+ *   suppress policy is consistent with v14.5.2 (promote/commit/revert stay framesDecoded-only).
  * v14.6.0 — [A0/B1] History-driven narrow-link RTC suppression + retry-storm damping. Card-only
  *   (driver unchanged, pin stays ?v=2.4.2). Acts on the v14.5.2 field finding (memory
  *   webrtc-mobile-collapse-is-rtc-additive): the multi-camera mobile collapse is RTC-ADDITIVE load,
@@ -308,16 +318,31 @@ class WebRTCCamera extends HTMLElement {
         // survives probation (B1) so the storm slows instead of hammering at 1000ms. The latch
         // is self-releasing (RTC_RETEST_MS). Fat links never accumulate enough flaps to latch, so
         // their behaviour is byte-for-byte unchanged. Opt out entirely with `rtc_adaptive: false`.
-        // See memory webrtc-mobile-collapse-is-rtc-additive.
+        //
+        // [A0 v14.6.1] Severity trigger. Field logs of the real "pessima" pattern (2026-08-25) show
+        // the cumulative score alone never latches: the 4 cameras die *together* once per ~2-min
+        // burst (each camera counts only 1 flap on its own state) and the 45s decay wiped the score
+        // between bursts → stuck at 1.0/3 forever, RTC never suppressed. But the metrics sampled the
+        // instant before each death read loss 35-50% — unambiguous proof the link is narrow. So a
+        // within-probation death preceded by a FRESH high-loss sample (_lastLossPct ≥ FLAP_LOSS_PCT)
+        // now weighs a full FLAP_SUPPRESS_AT → latches on the FIRST such death; the decaying score is
+        // kept as the slow path for moderate degradation (decay widened 45s→120s so bursty-but-
+        // repeated failures accumulate instead of resetting). Using loss ONLY for the suppress policy
+        // is consistent with the v14.5.2 principle: promote/commit/revert stay framesDecoded-only;
+        // the metrics feed adaptation, which is exactly this. See webrtc-mobile-collapse-is-rtc-additive.
         this._healthyTimer = null;   // [B1] probation timer; on fire → confirm healthy, reset backoff
         this._streamUpAt = 0;        // when the current media mode landed (ms)
         this._flapScore = 0;         // decaying count of within-probation stream deaths
         this._flapLast = 0;          // last flap/decay timestamp, for linear decay
+        this._lastLossPct = 0;       // most recent inbound-rtp loss% parsed from the metrics line
+        this._lastLossAt = 0;        // when that sample arrived, for the freshness gate
         this._rtcSuppressed = false; // [A0] latch: build MSE-only, no re-probe
         this._rtcSuppressedAt = 0;   // when the latch engaged, for the RTC_RETEST_MS re-test
         this.STREAM_PROBATION_MS = 20000; // survive this long before a stream counts as healthy
-        this.FLAP_DECAY_MS = 45000;       // one flap point ages linearly to zero over this span
+        this.FLAP_DECAY_MS = 120000;      // one flap point ages linearly to zero over this span
         this.FLAP_SUPPRESS_AT = 3;        // score ≥ this → suppress RTC (≈3 quick deaths)
+        this.FLAP_LOSS_PCT = 20;          // a within-probation death with loss ≥ this → latch at once
+        this.LOSS_FRESH_MS = 8000;        // only trust a loss sample this recent for the severity gate
         this.RTC_RETEST_MS = 300000;      // suppressed this long → next build re-tests full mode
 
         // Groups the .ui overlay's video/click listeners so they can be dropped
@@ -342,7 +367,7 @@ class WebRTCCamera extends HTMLElement {
         // (correlates stream loss with the mobile app backgrounding / 5G handoff).
         this._logVisAbort = null;
 
-        console.info('[WebRTC Camera] v14.6.0');
+        console.info('[WebRTC Camera] v14.6.1');
     }
 
     setConfig(config) {
@@ -1210,15 +1235,23 @@ class WebRTCCamera extends HTMLElement {
     _noteRtcFlap() {
         if (this.config && this.config.rtc_adaptive === false) return; // opt-out: never suppress
         this._decayFlap(0);            // age to now …
-        this._flapScore += 1;          // … then add this flap
+        // Severity: if a FRESH metrics sample just before this death read high loss, the link is
+        // provably narrow — weigh the flap a full threshold so it latches on the first such death
+        // instead of waiting for 3 to accumulate (which they never do, one-per-burst per camera).
+        const lossFresh = this._lastLossAt && (Date.now() - this._lastLossAt) <= this.LOSS_FRESH_MS;
+        const severe = lossFresh && this._lastLossPct >= this.FLAP_LOSS_PCT;
+        this._flapScore += severe ? this.FLAP_SUPPRESS_AT : 1;
         this._flapLast = Date.now();
-        this._logHA('debug', 'rtc-flap', `score=${this._flapScore.toFixed(1)}/${this.FLAP_SUPPRESS_AT}`);
+        this._logHA('debug', 'rtc-flap',
+            `score=${this._flapScore.toFixed(1)}/${this.FLAP_SUPPRESS_AT}` +
+            (severe ? ` (loss ${this._lastLossPct.toFixed(0)}%)` : ''));
         if (!this._rtcSuppressed && this._flapScore >= this.FLAP_SUPPRESS_AT) {
             this._rtcSuppressed = true;
             this._rtcSuppressedAt = Date.now();
             this._stopReprobe();       // no background RTC probes while suppressed
+            const why = severe ? `loss ${this._lastLossPct.toFixed(0)}%` : `${this._flapScore.toFixed(1)} flaps`;
             this._logHA('warning', 'rtc-suppressed',
-                `link narrow (${this._flapScore.toFixed(1)} flaps) — MSE-only, re-test in ${Math.round(this.RTC_RETEST_MS / 1000)}s`);
+                `link narrow (${why}) — MSE-only, re-test in ${Math.round(this.RTC_RETEST_MS / 1000)}s`);
         }
     }
 
@@ -1302,6 +1335,8 @@ class WebRTCCamera extends HTMLElement {
         this._rtcSuppressed = false;
         this._flapScore = 0;
         this._flapLast = 0;
+        this._lastLossPct = 0;
+        this._lastLossAt = 0;
 
         // 5. Force UI Feedback
         const spinner = this.shadowRoot.querySelector('.spinner');
@@ -1468,7 +1503,14 @@ class WebRTCCamera extends HTMLElement {
                 // [BW INSTRUMENTATION] Metric lines are diagnostic and driver-cadence-gated (3s);
                 // route them straight to the HA log for BOTH main and shadow probes (a shadow's
                 // RTT/loss is exactly the bandwidth probe we want to see).
-                if (msg.type === 'metrics') { this._logHA('debug', 'metrics', msg.value); return; }
+                if (msg.type === 'metrics') {
+                    // [A0] Harvest loss% for the severity trigger. The value is a preformatted
+                    // string (`… loss=X.X% …`); a defensive regex avoids a driver change (pin bump).
+                    const m = /loss=([\d.]+)%/.exec(msg.value);
+                    if (m) { this._lastLossPct = parseFloat(m[1]); this._lastLossAt = Date.now(); }
+                    this._logHA('debug', 'metrics', msg.value);
+                    return;
+                }
                 return this.shadowDriver === newDriver
                     ? this._onPreSwapShadowMessage(newDriver, msg)
                     : this._onMainMessage(newDriver, msg);
