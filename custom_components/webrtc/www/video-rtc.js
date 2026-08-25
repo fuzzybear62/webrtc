@@ -4,7 +4,18 @@
  * Derived from AlexxIT/WebRTC. Licensed under the MIT License — see LICENSE.
  */
 /**
- * VideoRTC v2.4.3 - phase-aware no-data watchdog
+ * VideoRTC v2.4.4 - on-screen element API + manual pause hold
+ * * Changelog v2.4.4:
+ * - FIX two card-facing bugs whose shared root cause was the card binding to `this.video` (the
+ *   hidden MSE element) while, during the reversible-RTC `promoted` phase, the on-screen pixels
+ *   are the overlay `_rtcVideo`. New `get onscreenVideo()` returns the element the viewer actually
+ *   sees (overlay while promoted, else this.video). The card now targets it for BOTH the live-dot
+ *   and play/pause.
+ * - NEW manual-pause API: `suspend()` soft-pauses the on-screen element and sets `_manualHold`,
+ *   which freezes the commit/revert poll (and the give-up timer) so the handoff machine can't call
+ *   play() and auto-resume behind the user. `resume()` clears the hold, seeks MSE to the live edge
+ *   (RTC unaffected), and plays. Instant freeze/resume — decoder+socket kept warm on purpose;
+ *   bandwidth teardown stays the OFF-SCREEN auto-pause's job.
  * * Changelog v2.4.3:
  * - The no-data watchdog (DISCONNECT_TIMEOUT) is now PHASE-AWARE. While an un-committed RTC
  *   probe is live (_rtcPhase 'negotiating' or 'promoted') the RTC overlay is ADDITIVE load on
@@ -260,6 +271,8 @@ export class VideoRTC extends HTMLElement {
         // transition is logged in exactly one place (free observability, no counters).
         this._rtcVideo = null;     // overlaid <video> carrying the RTC MediaStream
         this._rtcPhase = 'warm';   // 'warm' | 'negotiating' | 'promoted' | 'committed'
+        this._manualHold = false;  // [MANUAL PAUSE] user soft-paused: freeze the on-screen element
+                                   // AND hold the commit/revert poll so it can't auto-resume.
         this._commitTID = 0;       // unused in the poll-driven commit model; kept for _clearRtcTimers
         this._mseWanted = false;   // desired mute state of the MSE element, restored on revert/commit
         // Flowing decode required before we REVEAL RTC (make it visible). Small because
@@ -401,6 +414,46 @@ export class VideoRTC extends HTMLElement {
                 console.debug(`[VideoRTC:${this.clientId}] play() rejected:`, er);
             }
         });
+    }
+
+    /**
+     * [MANUAL PAUSE — card #913] The element the viewer actually sees. While RTC is REVEALED but
+     * not yet committed (`promoted`), the on-screen pixels are the overlay (`_rtcVideo`) and the
+     * MSE element (`this.video`) is hidden underneath; warm/negotiating/committed all present
+     * `this.video`. The card binds the play/pause button and the live-indicator dot to THIS getter
+     * so both act on what's on screen, not on the hidden MSE element (the old bug: pause froze the
+     * invisible MSE while RTC kept playing; the dot watched the stalled hidden MSE and went red on
+     * a perfect RTC stream).
+     */
+    get onscreenVideo() {
+        return (this._rtcPhase === 'promoted' && this._rtcVideo) ? this._rtcVideo : this.video;
+    }
+
+    /**
+     * [MANUAL PAUSE] Soft-freeze the on-screen element and HOLD the RTC handoff poll so its
+     * commit/revert can't call play() and silently auto-resume (which would defeat the pause).
+     * Intentionally does NOT free the decoder or close the socket — that's the OFF-SCREEN
+     * auto-pause's job (bandwidth). A viewer pausing a stream they're watching wants an instant
+     * freeze and an instant resume, so the flow is kept warm.
+     */
+    suspend() {
+        this._manualHold = true;
+        const v = this.onscreenVideo;
+        if (v) v.pause();
+    }
+
+    resume() {
+        this._manualHold = false;
+        const v = this.onscreenVideo;
+        if (!v) return;
+        // MSE keeps only ~5s of buffer, so after a longer pause currentTime lags behind the buffer
+        // start; jump to the live edge before playing. A MediaStream/RTC element has empty
+        // seekable and is unaffected.
+        try {
+            const seek = v.seekable;
+            if (seek && seek.length > 0) v.currentTime = seek.end(seek.length - 1);
+        } catch (e) { /* ignore */ }
+        v.play().catch(() => {});
     }
 
     /**
@@ -1096,6 +1149,11 @@ export class VideoRTC extends HTMLElement {
 
         this._firstFramePoll = setInterval(() => {
             if (!this.pc) { clearInterval(this._firstFramePoll); this._firstFramePoll = 0; return; }
+            // [MANUAL PAUSE] While the viewer holds the stream soft-paused, freeze the phase
+            // machine: no promote/commit/revert, no liveness-stall reconnect. Otherwise commit()
+            // (or a revert) would call play() and auto-resume behind the user's back. The PC keeps
+            // flowing (soft pause), so decode resumes instantly on resume().
+            if (this._manualHold) return;
             this.pc.getStats().then(stats => {
                 let fd = -1;
                 // [BW INSTRUMENTATION v2.4.1] Harvest passive metrics from the SAME poll: inbound-rtp
@@ -1166,10 +1224,17 @@ export class VideoRTC extends HTMLElement {
 
         // Give-up deadline: if RTC never sustains decode at all, reap and signal rtc_failed
         // (MSE keeps serving untouched throughout).
-        this._firstFrameTID = setTimeout(() => {
+        const giveUp = () => {
             this._firstFrameTID = 0;
+            // [MANUAL PAUSE] Don't tear the probe down under the user's hold; re-arm and re-check
+            // once they resume (the poll is frozen while held, so nothing else advances it).
+            if (this._manualHold) {
+                this._firstFrameTID = setTimeout(giveUp, this.FIRSTFRAME_TIMEOUT);
+                return;
+            }
             this._revertToWarmMSE(`connected but decoded no sustained video within ${this.FIRSTFRAME_TIMEOUT}ms`);
-        }, this.FIRSTFRAME_TIMEOUT);
+        };
+        this._firstFrameTID = setTimeout(giveUp, this.FIRSTFRAME_TIMEOUT);
     }
 
     /**

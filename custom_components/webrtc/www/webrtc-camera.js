@@ -25,6 +25,19 @@
  *
  * CHANGELOG
  * ---------
+ * v14.6.3 — [play/pause + live-dot fixes] Both bugs had ONE root cause: the card bound the play/
+ *   pause button and the live-indicator dot to `this.driver.video` (the MSE element), but during
+ *   the reversible-RTC `promoted` phase the on-screen pixels are the overlay `_rtcVideo` while MSE
+ *   is hidden underneath. Driver v2.4.4 adds `get onscreenVideo()`; the card now targets it.
+ *   (1) PLAY/PAUSE: pause used to call video.pause() on the hidden MSE element → the icon flipped
+ *   to ▶ but the visible RTC kept playing. Now the button calls the driver's suspend()/resume()
+ *   (chosen semantics "C"): soft-pause the ON-SCREEN element AND hold the commit/revert poll so the
+ *   handoff machine can't call play() and auto-resume. Instant freeze/resume (<100ms); decoder+
+ *   socket kept warm on purpose — bandwidth teardown stays the off-screen auto-pause's job.
+ *   (2) LIVE-DOT: the dot watched the hidden, no-longer-fed MSE element → RED on a perfect RTC
+ *   stream, and never recovered because the commit's srcObject swap cancelled the pending rVFC.
+ *   The dot now binds to `onscreenVideo`, re-targets when the on-screen element changes
+ *   (promote/commit/revert), and re-arms after a source swap. Pin bumps ?v=2.4.3 → 2.4.4.
  * v14.6.2 — [Lever A + D1] Two latency/UX fixes shipped together (pin bumps ?v=2.4.2 → 2.4.3).
  *   LEVER A (driver): the no-data watchdog is now phase-aware. While an un-committed RTC probe is
  *   live (_rtcPhase negotiating/promoted) a doomed probe is declared dead after 2.5s
@@ -226,7 +239,7 @@
  *   _promoteShadowToMain().
  */
 
-import {VideoRTC} from './video-rtc.js?v=2.4.3';
+import {VideoRTC} from './video-rtc.js?v=2.4.4';
 import {DigitalPTZ} from './digital-ptz.js?v=3.3.0';
 // [SIDECAR INTEGRATION] Import the Interaction module.
 // This module handles legacy features (Shortcuts, PTZ, Styles) to keep the core driver clean.
@@ -382,7 +395,7 @@ class WebRTCCamera extends HTMLElement {
         // (correlates stream loss with the mobile app backgrounding / 5G handoff).
         this._logVisAbort = null;
 
-        console.info('[WebRTC Camera] v14.6.2');
+        console.info('[WebRTC Camera] v14.6.3');
     }
 
     setConfig(config) {
@@ -1885,8 +1898,9 @@ class WebRTCCamera extends HTMLElement {
 
             /* Live indicator (opt-in via live_indicator: true). Red = no fresh
                frames, green = video advancing. Driven by requestVideoFrameCallback
-               on the active driver's <video> — UI-only, independent of the
-               driver's promotion/first-frame logic. */
+               on the driver's ON-SCREEN element (onscreenVideo: the RTC overlay while
+               promoted, else this.video) — UI-only, independent of the driver's
+               promotion/first-frame logic. */
             .live-dot {
                 width: 8px; height: 8px; border-radius: 50%;
                 background-color: #D2122E; align-self: center;
@@ -2096,10 +2110,15 @@ class WebRTCCamera extends HTMLElement {
         // A pending delayed spinner must not fire after this UI is torn down/rebuilt.
         signal.addEventListener('abort', clearSpinnerTimer);
 
-        // #913: play/pause toggle. Under `ui: true` the button stays visible (like the
-        // other controls) and mirrors the element state, so the live stream can be
-        // paused (frozen) and resumed — previously it only appeared to resume a pause.
-        playBtn.icon = video.paused ? 'mdi:play' : 'mdi:pause';
+        // #913: play/pause toggle. Under `ui: true` the button stays visible (like the other
+        // controls). Driven by the driver's suspend()/resume() (v2.4.4) so it acts on the ON-SCREEN
+        // element, not the hidden MSE one: the old code called video.pause() on this.video, which
+        // during a promoted RTC stream froze the invisible MSE while the visible overlay kept
+        // playing — the icon flipped but the picture didn't stop. The icon is set explicitly here
+        // (the pause may land on _rtcVideo, whose events don't bubble through this.video); the
+        // this.video listeners below still catch external play/pause (fullscreen, PiP).
+        const onScreen = () => (this.driver && this.driver.onscreenVideo) || video;
+        playBtn.icon = onScreen().paused ? 'mdi:play' : 'mdi:pause';
         video.addEventListener('play', () => { playBtn.icon = 'mdi:pause'; }, {signal});
         video.addEventListener('pause', () => { playBtn.icon = 'mdi:play'; }, {signal});
         video.addEventListener('loadeddata', () => volBtn.style.display = this.hasAudio ? 'block' : 'none', {signal});
@@ -2112,8 +2131,8 @@ class WebRTCCamera extends HTMLElement {
 
         ui.addEventListener('click', ev => {
             const {icon} = ev.target;
-            if (icon === 'mdi:play') this.driver.play();
-            else if (icon === 'mdi:pause') video.pause();
+            if (icon === 'mdi:play') { this.driver.resume(); playBtn.icon = 'mdi:pause'; }
+            else if (icon === 'mdi:pause') { this.driver.suspend(); playBtn.icon = 'mdi:play'; }
             else if (icon === 'mdi:volume-mute') video.muted = false;
             else if (icon === 'mdi:volume-high') video.muted = true;
             else if (icon === 'mdi:floppy') this.saveScreenshot();
@@ -2171,24 +2190,39 @@ class WebRTCCamera extends HTMLElement {
         }
 
         // --- live indicator (#922) --------------------------------------------
-        // UI-only liveness dot, bound to the CURRENT driver's <video>. Uses
-        // requestVideoFrameCallback (fires per presented frame, so it also
-        // catches a silent freeze that emits no 'waiting') plus a 500ms watchdog.
-        // Rebound on every renderCustomUI (i.e. every driver swap); the interval
-        // is cleared when this render's AbortController fires.
+        // UI-only liveness dot. Uses requestVideoFrameCallback (fires per PRESENTED frame, so it
+        // also catches a silent freeze that emits no 'waiting') plus a 500ms watchdog.
+        //
+        // v14.6.3 FIX: bind to the driver's `onscreenVideo` (the element actually on screen), not
+        // this.driver.video. During a promoted RTC stream the pixels come from the overlay
+        // (_rtcVideo) while the MSE this.video is hidden and no longer fed — the old code watched
+        // that stalled MSE element and drove the dot RED on a perfectly live RTC stream. It also
+        // never recovered: the commit swaps this.video.srcObject on the SAME element, which cancels
+        // the pending rVFC, so beat stopped re-arming. arm() now re-targets whenever the on-screen
+        // element changes (promote/commit/revert) AND re-arms after a same-element source swap, so
+        // the chain survives every handoff transition.
         if (this._liveTimer) { clearInterval(this._liveTimer); this._liveTimer = null; }
         if (this.config.live_indicator === true) {
             const dot = root.querySelector('.live-dot');
-            if (dot && video.requestVideoFrameCallback) {
-                let lastFrame = 0;
-                const beat = () => {
-                    lastFrame = Date.now();
-                    if (this.driver && this.driver.video === video && video.requestVideoFrameCallback) {
-                        video.requestVideoFrameCallback(beat);
-                    }
+            if (dot) {
+                let bound = null;              // element rVFC is currently armed on
+                let pending = false;           // a rVFC is outstanding on `bound`
+                let lastFrame = Date.now();
+                const beat = () => { pending = false; lastFrame = Date.now(); arm(); };
+                const arm = () => {
+                    const v = this.driver && this.driver.onscreenVideo;
+                    if (!v || !v.requestVideoFrameCallback) return;
+                    if (v !== bound) { bound = v; pending = false; lastFrame = Date.now(); }
+                    if (pending) return;
+                    pending = true;
+                    v.requestVideoFrameCallback(beat);
                 };
-                video.requestVideoFrameCallback(beat);
+                arm();
+                // A source swap on the SAME element (the commit collapse) cancels the pending rVFC;
+                // loadeddata fires right after it, so force a re-arm on the next tick.
+                video.addEventListener('loadeddata', () => { pending = false; }, {signal});
                 this._liveTimer = setInterval(() => {
+                    arm();  // re-target on handoff transitions / re-arm after a swap
                     dot.classList.toggle('live', Date.now() - lastFrame < 500);
                 }, 500);
                 signal.addEventListener('abort', () => {
