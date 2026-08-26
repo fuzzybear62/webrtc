@@ -25,6 +25,22 @@
  *
  * CHANGELOG
  * ---------
+ * v14.6.11 — [DRIVER CHANGE, pin ?v=2.6.0 → 2.7.0 — needs a PWA hard reload] Two changes.
+ *   (1) [Strato-1 step 3] RTC ABORT propagation. The v2.7.0 driver gives up a non-committing RTC probe
+ *   that holds a pathological jitter-buffer/RTT reading (measured cause of the direct-4G collapse =
+ *   bufferbloat: jbuf 1500-2100ms, RTT standing ~1.5s, pkt sub-MTU, path srflx/…/udp), reverting to the
+ *   warm MSE in a deterministic ~6-9s instead of letting the adaptive watchdog balloon to 30×. The
+ *   revert emits the existing `rtc_failed`, so the card's backed-off re-probe loop is the suppression —
+ *   no new signal. New per-card knobs (parametric, defaults sane): `mse_abort` (false = classic
+ *   extend-only), `mse_abort_jbuf` (1200 ms), `mse_abort_rtt` (5000 ms), `mse_abort_hold` (6000 ms),
+ *   `mse_abort_futility_k` (0.5 — a repeatedly-doomed path gives up faster). The driver also fixed the
+ *   futility inversion (futility now shortens the abort hold, no longer lengthens the extend).
+ *   (2) [FIX] `url_fullscreen` never actually switched to hi-res on ANY platform. The signed WS URL in
+ *   _fetchWebsocketURL — the stream the driver really dials — was built without `_fsStreamOverride`, so
+ *   the card-path fullscreen swap reached only mode/ice/tunables while the connect URL stayed on the
+ *   substream. Now the override is spread into that URL too, so entering fullscreen streams
+ *   `url_fullscreen` (desktop / Android PWA). The iOS webkit path still shows the substream (fullscreen
+ *   is bound to the <video>; documented limitation, unchanged).
  * v14.6.10 — [DRIVER CHANGE, pin ?v=2.5.0 → 2.6.0 — needs a PWA hard reload] Transport diagnostics.
  *   No behaviour change: the driver `metrics` line now also carries `jbuf`/`nack`/`pkt`/`path` from
  *   the same getStats poll, to settle bufferbloat-vs-fragmentation on the direct-4G path (the
@@ -302,7 +318,7 @@
  *   _promoteShadowToMain().
  */
 
-import {VideoRTC} from './video-rtc.js?v=2.6.0';
+import {VideoRTC} from './video-rtc.js?v=2.7.0';
 import {DigitalPTZ} from './digital-ptz.js?v=3.3.0';
 // [SIDECAR INTEGRATION] Import the Interaction module.
 // This module handles legacy features (Shortcuts, PTZ, Styles) to keep the core driver clean.
@@ -462,7 +478,7 @@ class WebRTCCamera extends HTMLElement {
         // (correlates stream loss with the mobile app backgrounding / 5G handoff).
         this._logVisAbort = null;
 
-        console.info('[WebRTC Camera] v14.6.10');
+        console.info('[WebRTC Camera] v14.6.11');
     }
 
     setConfig(config) {
@@ -1640,6 +1656,23 @@ class WebRTCCamera extends HTMLElement {
         if (Number.isFinite(adaptMaxExtend) && adaptMaxExtend >= 1) newDriver.ADAPT_MAX_EXTEND = adaptMaxExtend;
         const adaptAlpha = Number(effectiveConfig.mse_adapt_alpha);
         if (Number.isFinite(adaptAlpha) && adaptAlpha > 0 && adaptAlpha <= 1) newDriver.ADAPT_EWMA_ALPHA = adaptAlpha;
+        // [TUNABLE] RTC abort (Strato-1 step 3, driver v2.7.0). Gives up a non-committing RTC probe
+        // that holds a pathological jitter-buffer/RTT reading for `mse_abort_hold` ms (deterministic
+        // teardown instead of babying it via the adaptive extend). Absolute ceilings — NOT `cong`,
+        // which saturates and can't tell recoverable bufferbloat from pathological. Parametric even
+        // though futility self-adapts the hold. `mse_abort: false` pins the classic (extend-only)
+        // behaviour; set a ceiling to 0 to disable just that limb.
+        if (effectiveConfig.mse_abort !== undefined) {
+            newDriver.RTC_ABORT_ENABLED = effectiveConfig.mse_abort !== false;
+        }
+        const abortJbuf = Number(effectiveConfig.mse_abort_jbuf);
+        if (Number.isFinite(abortJbuf) && abortJbuf >= 0) newDriver.RTC_ABORT_JBUF_MS = abortJbuf;
+        const abortRtt = Number(effectiveConfig.mse_abort_rtt);
+        if (Number.isFinite(abortRtt) && abortRtt >= 0) newDriver.RTC_ABORT_RTT_MS = abortRtt;
+        const abortHold = Number(effectiveConfig.mse_abort_hold);
+        if (Number.isFinite(abortHold) && abortHold > 0) newDriver.RTC_ABORT_HOLD_MS = abortHold;
+        const abortFutilityK = Number(effectiveConfig.mse_abort_futility_k);
+        if (Number.isFinite(abortFutilityK) && abortFutilityK >= 0 && abortFutilityK <= 1) newDriver.RTC_ABORT_FUTILITY_K = abortFutilityK;
 
         // Network strict mode propagates directly to the driver.
         newDriver.strictMode =
@@ -1909,7 +1942,12 @@ class WebRTCCamera extends HTMLElement {
          * URLs are never cached to avoid token reuse and invalid sessions.
          */
         const stream = this.config.streams[this.streamID];
-        const effectiveConfig = {...this.config, ...stream};
+        // [B / url_fullscreen] The signed WS URL is the ACTUAL stream the driver dials (target.src
+        // below). It MUST honour the fullscreen hi-res override — without this spread the override set
+        // by _applyFullscreenStream() reached only newDriver's mode/ice/tunables in startStream(), while
+        // the connect URL here stayed on the substream, so the card-path fullscreen never switched to
+        // `url_fullscreen` (it always showed the low-res substream, on every platform, not just iOS).
+        const effectiveConfig = {...this.config, ...stream, ...(this._fsStreamOverride || {})};
 
         const data = await this._hass.callWS({
             type: 'auth/sign_path',
