@@ -4,15 +4,19 @@
  * Derived from AlexxIT/WebRTC. Licensed under the MIT License — see LICENSE.
  */
 /**
+ * VideoRTC v2.12.1 - [Alg.4.1 excess not ratio] the self-calibrating band primitive becomes the ABSOLUTE
+ *   standing-queue EXCESS = rttEwma - session-min-RTT (_mRttMin, queue-empty baseline), in ms — replacing
+ *   v2.12's rttEwma/rttMin RATIO. The ratio was scale-free and EXPLODED at a tiny LAN baseline (min 2-3ms):
+ *   a few ms of harmless jitter (2ms->7ms) fabricated infl 3-4x, false-flagging 'path' and abort-storming a
+ *   0%-loss LAN grid in a loop (the "su lan sempre peggio" regression). Excess in ms is scale-correct — 5ms
+ *   of queue is 5ms — while still subtracting the link's own floor, so it stays RELATIVE (a 4G judged by its
+ *   LIVE queue, not by "it's 4G"). Label + continuous abort severity both key off excess; loss stays the
+ *   absolute backstop. Metrics line: `exc=Nms` (was `infl=`). See webrtc-mobile-collapse memory.
  * VideoRTC v2.12.0 - [Alg.4 self-calibrating band] the 3 categorical band buckets collapse to ONE
- *   continuous primitive: bufferbloat INFLATION = rttEwma / session-min-RTT (_mRttMin, the queue-empty
- *   baseline). Relative, so a link is judged by its LIVE queue, never by absolute RTT ("it's 4G"):
- *   the SAME 4G holds 4 RTC one moment and storms the next — only the queue tells the truth. The abort
- *   accumulator now integrates a CONTINUOUS severity (∝ how far infl/loss exceed their floors), deleting
- *   the 'degr' HOLD dead-zone that let a doomed 4G canary storm ~15s before giving up; a runaway (infl
- *   4-6x) now blows through the hold in ~2s. The gate's perf/path label is derived from infl too, so an
- *   in-form 4G (infl≈1 at rtt~200ms) OPENS the gate instead of being mislabelled degr by an absolute
- *   ceiling. `infl=` added to the metrics line. See webrtc-mobile-collapse memory.
+ *   continuous primitive: bufferbloat INFLATION = rttEwma / session-min-RTT (superseded by v2.12.1's
+ *   absolute excess — the ratio was too twitchy at small LAN baselines). The abort accumulator integrates
+ *   a CONTINUOUS severity (∝ how far the stressors exceed their floors), deleting the 'degr' HOLD dead-zone
+ *   that let a doomed 4G canary storm ~15s before giving up. See webrtc-mobile-collapse memory.
  * VideoRTC v2.11.0 - [Alg.2 band-adaptive] the probe serializer now uses the FIRST probe as a canary:
  *   it serializes ramps only until the canary's Alg.1 verdict lands (~2s). band=perf OPENS the gate
  *   (fat pipe → no storm possible → drain the queue, ramp everyone in PARALLEL, zero serialization cost);
@@ -557,31 +561,35 @@ export class VideoRTC extends HTMLElement {
         // structurally blind to the pure-LOSS pathology the field logs exposed (direct-4G 2026-08-26:
         // esternacancello RTT pinned at 107ms with 10-29% loss — healthy by any RTT/jbuf ceiling, yet the
         // stream was unusable). The decision reads the same two live stressors the band classifier folds —
-        // bufferbloat INFLATION (rttEwma / session-min RTT, relative) and short-window loss — so it inherits
-        // loss-awareness for free and the absolute ceilings are deleted (no dead code).
+        // standing-queue EXCESS (rttEwma - session-min RTT, absolute ms) and short-window loss — so it
+        // inherits loss-awareness for free and the absolute RTT ceilings are deleted (no dead code).
         //
         // A LEAKY ASYMMETRIC ACCUMULATOR integrates a CONTINUOUS severity over time (worsen fast, recover
-        // slow — field finding A): each poll adds pollMs*severity, where severity ramps 0→SEV_MAX as infl/
+        // slow — field finding A): each poll adds pollMs*severity, where severity ramps 0→SEV_MAX as excess/
         // loss exceed their floors. This replaced v2.9's 3-bucket accrual (path=+pollMs, degr=HOLD,
         // perf=bleed): the 20:36 4G disaster proved 'degr' was a DEAD-ZONE where a clearly-dying canary
         // (rtt 5.7x its floor, loss 15%) accrued NOTHING for ~10s and stormed HA off the uplink before the
         // abort fired. Continuous severity gives up in ~2s on a runaway while still absorbing verdict flap
-        // and the optimistic opening (infl unknown → sev 0 until a baseline+window exist). The revert bumps
+        // and the optimistic opening (excess unknown → sev 0 until a baseline+window exist). The revert bumps
         // `_rtcFutility`, which SHORTENS the next probe's hold toward HOLD*(1-K) so a repeatedly-doomed path
         // gives up faster; rtc_failed then arms the card's backed-off re-probe loop. Master switch only
-        // (per-card `mse_abort`); the tuning surface is the internal infl/loss severity shaping constants.
+        // (per-card `mse_abort`); the tuning surface is the internal excess/loss severity shaping constants.
         this.RTC_ABORT_ENABLED = true;   // master switch (per-card `mse_abort`)
         this.RTC_ABORT_HOLD_MS = 6000;   // integrated severity·time (ms, at futility 0) that -> abort
         this.RTC_ABORT_FUTILITY_K = 0.5; // futility [0,1] shortens the hold toward HOLD*(1-K)
         this.RTC_ABORT_RECOVER_K = 0.5;  // a healthy poll bleeds _bandBadMs at pollMs*K (<1 -> recover slow)
-        // [Alg.4] CONTINUOUS severity (replaces the old perf/degr/path 3-bucket accrual). Each poll adds
-        // pollMs*severity, where severity ramps 0 -> SEV_MAX as inflation climbs past INFL_LOW (or loss
-        // past LOSS_LOW): a mildly-bloated link accrues slowly, a runaway (infl 4-6x, the 4G-disaster
-        // signature) blows through the hold in ~2s. This deletes the old 'degr' HOLD dead-zone — the
-        // 20:36 4G log sat at 'degr' with rtt 5.7x its floor and loss 15% for ~10s accruing NOTHING, so
-        // the doomed canary stormed the uplink to rtt 3546ms (killing HA) before Alg.3 finally aborted.
-        this.RTC_ABORT_INFL_LOW = 1.5;   // inflation below which no severity accrues (GCC ramp headroom)
-        this.RTC_ABORT_INFL_REF = 1.5;   // inflation span per 1.0 severity unit (infl LOW+REF => sev 1)
+        // [Alg.4.1] CONTINUOUS severity (replaces the old perf/degr/path 3-bucket accrual). Each poll adds
+        // pollMs*severity, where severity ramps 0 -> SEV_MAX as the standing-queue EXCESS climbs past
+        // EXCESS_LOW (or loss past LOSS_LOW): a mildly-bloated link accrues slowly, a runaway (the
+        // 4G-disaster signature: excess growing into the hundreds of ms) blows through the hold in ~2s.
+        // This deletes the old 'degr' HOLD dead-zone — the 20:36 4G log sat at 'degr' with rtt 5.7x its
+        // floor and loss 15% for ~10s accruing NOTHING, so the doomed canary stormed the uplink to rtt
+        // 3546ms (killing HA) before Alg.3 finally aborted. v2.12.1: severity is driven by ABSOLUTE excess
+        // (ms of standing queue), not the rttEwma/rttMin RATIO — the ratio is scale-free and explodes at
+        // a tiny LAN baseline (min 2-3ms), where a few ms of harmless jitter fabricated infl 3-4x and
+        // false-aborted a 0%-loss LAN grid in a loop. Excess in ms is scale-correct: 5ms of queue is 5ms.
+        this.RTC_ABORT_EXCESS_LOW_MS = 200; // standing-queue excess (rttEwma-rttMin, ms) below which no severity accrues
+        this.RTC_ABORT_EXCESS_REF_MS = 300; // excess span (ms) per 1.0 severity unit (LOW+REF => sev 1)
         this.RTC_ABORT_LOSS_LOW = 8;     // loss (%) below which no loss-severity accrues
         this.RTC_ABORT_LOSS_REF = 12;    // loss span (%) per 1.0 severity unit (loss LOW+REF => sev 1)
         this.RTC_ABORT_SEV_MAX = 3;      // per-poll severity cap (an extreme link -> abort in ~2s)
@@ -594,29 +602,30 @@ export class VideoRTC extends HTMLElement {
         // PERFORMANT link from a non-performant one within ~2s of a probe. This classifier folds the
         // per-poll signals ALREADY harvested for the metrics line (candidate-pair RTT, session-min RTT,
         // short-window loss%) into a live signal. Two consumers: the gate reads the coarse label
-        // ('perf' | 'degr' | 'path'), the abort reads the continuous inflation/loss severity. It runs
+        // ('perf' | 'degr' | 'path'), the abort reads the continuous excess/loss severity. It runs
         // ONLY while an un-committed probe is live (negotiating/promoted); '' otherwise. Field-validated
         // against real 4G/LAN logs: the v2.8 absolute BAND_*_RTT_MS ceilings both mislabelled an in-form
         // 4G (rtt~200ms) as degr AND were too lenient to catch the 20:36 disaster path until rtt had run
-        // to seconds — v2.12 replaced them with the relative INFLATION signal below. NOT user knobs (the
-        // goal is to eliminate YAML tuning; these stay internal and self-calibrate off _mRttMin).
+        // to seconds; the v2.12 rttEwma/rttMin RATIO fixed the 4G mislabel but exploded on a tiny LAN
+        // baseline (jitter 2ms->7ms => infl 3-4x => false path/abort on a 0%-loss LAN). v2.12.1 uses the
+        // ABSOLUTE standing-queue EXCESS below. NOT user knobs (self-calibrate off _mRttMin).
         this.BAND_CLASSIFY_MS = 2000;    // min observation before the first verdict (the user's "~2s")
-        // [Alg.4] Self-calibrating band signal: bufferbloat INFLATION = rttEwma / session-min-RTT
-        // (_mRttMin, the queue-empty baseline). infl≈1 = empty queue → healthy at ANY absolute RTT
-        // (LAN 2ms OR in-form 4G 200ms); infl growing = a standing queue building under the RTC ramp.
-        // RELATIVE by construction, so the same 4G that holds 4 RTC one moment and storms the next is
-        // judged by its LIVE queue, not by "it's 4G" — the absolute BAND_*_RTT_MS ceilings are RETIRED
-        // (they mislabelled an in-form 4G as degr and serialized it needlessly, and were too lenient to
-        // catch the disaster path until rtt had already run away). Loss stays an ABSOLUTE backstop
-        // (a lossy path is bad regardless of RTT). This label is display+gate only; the abort integrates
-        // the continuous infl/loss severity above.
-        this.BAND_GOOD_INFL = 1.3;       // infl <= this (with low loss) => 'perf' (queue ~empty)
-        this.BAND_PATH_INFL = 3.0;       // infl >= this (or high loss)  => 'path' (standing queue)
-        this.BAND_GOOD_LOSS_PCT = 3;     // loss (%) below which, with low infl, the link is 'perf'
+        // [Alg.4.1] Self-calibrating band signal: standing-queue EXCESS = rttEwma - session-min-RTT
+        // (_mRttMin, the queue-empty baseline), in ms. excess≈0 = empty queue → healthy at ANY absolute
+        // RTT (LAN 2ms OR in-form 4G 200ms); excess growing = a standing queue building under the RTC
+        // ramp. Subtracting the link's own floor keeps it self-calibrating (the same 4G that holds 4 RTC
+        // one moment and storms the next is judged by its LIVE queue, not by "it's 4G"), while measuring
+        // in ABSOLUTE ms keeps it scale-correct — unlike the v2.12 rttEwma/rttMin ratio, a 2ms LAN floor
+        // no longer manufactures huge "inflation" from single-digit-ms jitter. Loss stays an ABSOLUTE
+        // backstop (a lossy path is bad regardless of RTT). This label is display+gate only; the abort
+        // integrates the continuous excess/loss severity above.
+        this.BAND_GOOD_EXCESS_MS = 80;   // excess <= this (with low loss) => 'perf' (queue ~empty)
+        this.BAND_PATH_EXCESS_MS = 400;  // excess >= this (or high loss)  => 'path' (standing queue)
+        this.BAND_GOOD_LOSS_PCT = 3;     // loss (%) below which, with low excess, the link is 'perf'
         this.BAND_PATH_LOSS_PCT = 15;    // loss (%) at/above which the link is 'path' (lossy path)
         this.BAND_EWMA_ALPHA = 0.4;      // rtt/loss EWMA smoothing (twitchy enough to converge by ~2s)
         this._bandClass = '';            // display/gate label: '' (not probing) | 'perf' | 'degr' | 'path'
-        this._bandInfl = -1;             // last inflation ratio rttEwma/rttMin (-1 = unknown/no baseline)
+        this._bandExcess = -1;           // last standing-queue excess rttEwma-rttMin (ms; -1 = unknown/no baseline)
         this._bandT0 = 0;                // Date.now() the current probe's classification window opened
         this._bandRtt = -1;              // EWMA of instantaneous RTT (ms); -1 = no sample yet
         this._bandLoss = -1;             // EWMA of short-window loss (%); -1 = no sample yet
@@ -956,7 +965,7 @@ export class VideoRTC extends HTMLElement {
     /**
      * [RTC ABORT — Alg.4] Integrate the CONTINUOUS band severity into the abort decision, once per
      * poll (`pollMs` cadence) while an un-committed RTC probe is live (negotiating/promoted). Leaky
-     * ASYMMETRIC accumulator driven by severity = max(inflation-severity, loss-severity), each 0..SEV_MAX:
+     * ASYMMETRIC accumulator driven by severity = max(excess-severity, loss-severity), each 0..SEV_MAX:
      * accrue `pollMs*severity` (worsen ∝ how bad AND how long), bleed `pollMs*RECOVER_K` only when clearly
      * healthy (K<1 → recover slow), hold in the narrow middle. Replaces the v2.9 perf/degr/path 3-bucket
      * accrual whose 'degr' HOLD was a dead-zone (the 4G disaster sat there ~10s accruing nothing). Aborting
@@ -966,21 +975,22 @@ export class VideoRTC extends HTMLElement {
     _evaluateBandAbort(pollMs) {
         if (!this.RTC_ABORT_ENABLED) return;
         if (this._rtcPhase !== 'negotiating' && this._rtcPhase !== 'promoted') return;
-        // [Alg.4] Continuous severity from the two live stressors: bufferbloat inflation (relative to
-        // the link's own queue-empty floor) and absolute loss. Each ramps 0 -> SEV_MAX past its floor;
-        // accrue pollMs*max(sev) (worsen ∝ how bad AND how long), bleed only when clearly healthy, and
-        // HOLD in the narrow middle. No categorical bucket -> no 'degr' dead-zone.
-        const infl = this._bandInfl, loss = this._bandLoss, cap = this.RTC_ABORT_SEV_MAX;
+        // [Alg.4.1] Continuous severity from the two live stressors: standing-queue EXCESS (rttEwma minus
+        // the link's own queue-empty floor, in ms) and absolute loss. Each ramps 0 -> SEV_MAX past its
+        // floor; accrue pollMs*max(sev) (worsen ∝ how bad AND how long), bleed only when clearly healthy,
+        // and HOLD in the narrow middle. No categorical bucket -> no 'degr' dead-zone. Excess in ms (not
+        // the rttEwma/rttMin ratio) keeps a tiny LAN baseline from fabricating severity out of jitter.
+        const excess = this._bandExcess, loss = this._bandLoss, cap = this.RTC_ABORT_SEV_MAX;
         const clamp = (x) => Math.max(0, Math.min(cap, x));
-        const sevInfl = infl >= 0 ? clamp((infl - this.RTC_ABORT_INFL_LOW) / this.RTC_ABORT_INFL_REF) : 0;
+        const sevExcess = excess >= 0 ? clamp((excess - this.RTC_ABORT_EXCESS_LOW_MS) / this.RTC_ABORT_EXCESS_REF_MS) : 0;
         const sevLoss = loss >= 0 ? clamp((loss - this.RTC_ABORT_LOSS_LOW) / this.RTC_ABORT_LOSS_REF) : 0;
-        const sev = Math.max(sevInfl, sevLoss);
+        const sev = Math.max(sevExcess, sevLoss);
         if (sev > 0) {
             this._bandBadMs += pollMs * sev;                       // worsen ∝ severity × time
-        } else if ((infl < 0 || infl <= this.BAND_GOOD_INFL) &&
+        } else if ((excess < 0 || excess <= this.BAND_GOOD_EXCESS_MS) &&
                    (loss < 0 || loss < this.BAND_GOOD_LOSS_PCT)) {
             this._bandBadMs = Math.max(0, this._bandBadMs - pollMs * this.RTC_ABORT_RECOVER_K); // heal
-        } // mild middle (GOOD_INFL < infl < INFL_LOW): hold — far narrower than the old 'degr' bucket
+        } // mild middle (GOOD_EXCESS < excess < EXCESS_LOW): hold — far narrower than the old 'degr' bucket
         const k = Math.max(0, Math.min(1, this.RTC_ABORT_FUTILITY_K));
         const hold = this.RTC_ABORT_HOLD_MS * (1 - k * Math.max(0, Math.min(1, this._rtcFutility)));
         if (this._bandBadMs >= hold) {
@@ -997,7 +1007,7 @@ export class VideoRTC extends HTMLElement {
      */
     _abortRtcProbe(hold, held) {
         console.warn(`[VideoRTC:${this.clientId}] RTC probe ABORTED — sustained bad band ` +
-            `(band=${this._bandClass || '?'} infl=${this._bandInfl >= 0 ? this._bandInfl.toFixed(1) : '?'} ` +
+            `(band=${this._bandClass || '?'} exc=${this._bandExcess >= 0 ? Math.round(this._bandExcess) + 'ms' : '?'} ` +
             `integral ${held}ms >= ${hold}ms, phase=${this._rtcPhase}, ` +
             `futility=${this._rtcFutility.toFixed(2)}).`);
         this._revertToWarmMSE(`RTC aborted: sustained bad band (band=${this._bandClass || '?'}, ${held}ms)`);
@@ -1027,17 +1037,17 @@ export class VideoRTC extends HTMLElement {
         }
         if (lostCount >= 0) this._bandLastLost = lostCount;
         if (recvCount >= 0) this._bandLastRecv = recvCount;
-        // [Alg.4] Bufferbloat inflation vs the session-min RTT (_mRttMin, the queue-empty baseline).
-        // Needs both a baseline and a smoothed RTT; until then infl is unknown (-1) and no relative
-        // verdict is possible (loss can still condemn via the absolute backstop below).
+        // [Alg.4.1] Standing-queue EXCESS vs the session-min RTT (_mRttMin, the queue-empty baseline),
+        // in ms. Needs both a baseline and a smoothed RTT; until then excess is unknown (-1) and no
+        // relative verdict is possible (loss can still condemn via the absolute backstop below).
         const minMs = this._mRttMin < Infinity ? this._mRttMin * 1000 : -1;
-        this._bandInfl = (minMs > 0 && this._bandRtt >= 0) ? this._bandRtt / minMs : -1;
+        this._bandExcess = (minMs >= 0 && this._bandRtt >= 0) ? Math.max(0, this._bandRtt - minMs) : -1;
         // Hold the verdict until we have both a starting timestamp and BAND_CLASSIFY_MS of samples.
         if (!this._bandT0 || Date.now() - this._bandT0 < this.BAND_CLASSIFY_MS) return;
-        const infl = this._bandInfl, loss = this._bandLoss;
-        const pathBad = (infl >= 0 && infl >= this.BAND_PATH_INFL) ||
+        const excess = this._bandExcess, loss = this._bandLoss;
+        const pathBad = (excess >= 0 && excess >= this.BAND_PATH_EXCESS_MS) ||
                         (loss >= 0 && loss >= this.BAND_PATH_LOSS_PCT);
-        const good = infl >= 0 && infl <= this.BAND_GOOD_INFL &&
+        const good = excess >= 0 && excess <= this.BAND_GOOD_EXCESS_MS &&
                      (loss < 0 || loss < this.BAND_GOOD_LOSS_PCT);
         this._bandClass = pathBad ? 'path' : good ? 'perf' : 'degr';
     }
@@ -1046,7 +1056,7 @@ export class VideoRTC extends HTMLElement {
      *  classification window opens (phase -> negotiating) and `false` on leaving the probe. */
     _resetBandClassifier(arm) {
         this._bandClass = '';
-        this._bandInfl = -1;
+        this._bandExcess = -1;
         this._bandT0 = arm ? Date.now() : 0;
         this._bandRtt = -1;
         this._bandLoss = -1;
@@ -1125,7 +1135,7 @@ export class VideoRTC extends HTMLElement {
             `jit=${jit >= 0 ? Math.round(jit * 1000) : '?'}ms cong=${this._congestion.toFixed(2)} ` +
             `jbuf=${jbufMs >= 0 ? jbufMs : '?'}ms nack=${dNack >= 0 ? dNack : '?'} ` +
             `pkt=${pktB >= 0 ? pktB : '?'}B path=${path || '?'} band=${this._bandClass || '?'} ` +
-            `infl=${this._bandInfl >= 0 ? this._bandInfl.toFixed(1) : '?'}`;
+            `exc=${this._bandExcess >= 0 ? Math.round(this._bandExcess) + 'ms' : '?'}`;
         if (this.onmessage && typeof this.onmessage['ui_sync'] === 'function') {
             this.onmessage['ui_sync']({ type: 'metrics', value: summary });
         }

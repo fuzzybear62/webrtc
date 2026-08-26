@@ -25,6 +25,16 @@
  *
  * CHANGELOG
  * ---------
+ * v14.6.18 — [DRIVER CHANGE, pin ?v=2.12.0 → 2.12.1 — needs a PWA hard reload] Alg.4.1: fix the LAN
+ *   regression. The v2.12.0 band primitive (bufferbloat INFLATION = rttEwma / session-min RTT) is scale-
+ *   free and EXPLODES at a tiny LAN baseline (min 2-3ms): a few ms of harmless jitter (2ms→7ms) fabricated
+ *   infl 3-4×, so the network dot flickered through all colours on every camera and the continuous abort
+ *   severity accrued to a false RTC abort across the whole 0%-loss grid, in a loop ("su lan sempre peggio").
+ *   Driver v2.12.1 swaps the ratio for the ABSOLUTE standing-queue EXCESS = rttEwma − session-min RTT (ms):
+ *   scale-correct (5ms of queue is 5ms → LAN stays green/perf, no abort) while still relative (subtracts the
+ *   link's own floor → a real 4G runaway of hundreds of ms still aborts, ~before it storms HA). Card side:
+ *   only the metrics token changed (`infl=` → `exc=Nms`); the dot still parses `band=`, so no card logic
+ *   change. See webrtc-mobile-collapse-is-rtc-additive memory.
  * v14.6.17 — [DRIVER CHANGE, pin ?v=2.11.0 → 2.12.0 — needs a PWA hard reload] Alg.4: self-calibrating
  *   band + network-state dot. The 20:36 direct-4G log was a "disastro" (lost the HA connection): Alg.2
  *   SERIAL held (only the canary ramped, no cascade — a real win over the 19:37 storm) but the SINGLE
@@ -380,7 +390,7 @@
  *   _promoteShadowToMain().
  */
 
-import {VideoRTC} from './video-rtc.js?v=2.12.0';
+import {VideoRTC} from './video-rtc.js?v=2.12.1';
 import {DigitalPTZ} from './digital-ptz.js?v=3.3.0';
 // [SIDECAR INTEGRATION] Import the Interaction module.
 // This module handles legacy features (Shortcuts, PTZ, Styles) to keep the core driver clean.
@@ -544,7 +554,7 @@ class WebRTCCamera extends HTMLElement {
         // (correlates stream loss with the mobile app backgrounding / 5G handoff).
         this._logVisAbort = null;
 
-        console.info('[WebRTC Camera] v14.6.17');
+        console.info('[WebRTC Camera] v14.6.18');
     }
 
     setConfig(config) {
