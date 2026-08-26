@@ -25,6 +25,15 @@
  *
  * CHANGELOG
  * ---------
+ * v14.6.7 — [card-only, no driver change] New per-card tunable `mse_timeout` (ms): exposes the
+ *   driver's MSE no-data watchdog (`DISCONNECT_TIMEOUT`, default 5000) as YAML config. The watchdog
+ *   is fed by binary WS bytes = MSE liveness only, so it governs how long a stalled MSE stream is
+ *   tolerated before a teardown+cold-restart. On lossy 4G the 5s default false-fires on transient
+ *   TCP stalls that would self-recover, turning a recoverable pause into a reconnect storm; raising
+ *   it (e.g. 12000) lets mobile links ride out stalls. `0` EXPLICITLY disables the watchdog. Read
+ *   live in the driver, so per-card changes take effect on a card reload — no driver pin bump / PWA
+ *   hard reload. Default unchanged (driver still 5000); set it per-camera. Complements the config
+ *   cure (multi-cam grid on /stream2 substream) and v14.6.6 anti-lockstep backoff.
  * v14.6.6 — [card-only, no driver change] Anti-lockstep retry backoff. Cameras mounted together
  *   die together on a congested link; the old deterministic backoff (1000*2^n, capped 30s, no
  *   jitter) made all of them re-fire at the identical instant -> simultaneous keyframe bursts ->
@@ -419,7 +428,7 @@ class WebRTCCamera extends HTMLElement {
         // (correlates stream loss with the mobile app backgrounding / 5G handoff).
         this._logVisAbort = null;
 
-        console.info('[WebRTC Camera] v14.6.6');
+        console.info('[WebRTC Camera] v14.6.7');
     }
 
     setConfig(config) {
@@ -1568,6 +1577,16 @@ class WebRTCCamera extends HTMLElement {
         if (Number.isFinite(proveMs) && proveMs > 0) newDriver.RTC_SWAP_PROVE_MS = proveMs;
         const firstFrameMs = Number(effectiveConfig.firstframe_timeout);
         if (Number.isFinite(firstFrameMs) && firstFrameMs > 0) newDriver.FIRSTFRAME_TIMEOUT = firstFrameMs;
+        // [TUNABLE] MSE no-data watchdog (ms). Fed by binary WS bytes = MSE liveness ONLY, so this
+        // is how long a stalled MSE stream is tolerated before a teardown+cold-restart. Default 5s
+        // is aggressive on lossy 4G — a transient TCP stall self-recovers, but the watchdog kills
+        // it first, turning a recoverable pause into a reconnect storm. Raise it (e.g. 12000) so
+        // mobile links ride out stalls. Unlike the knobs above, 0 is meaningful here: it EXPLICITLY
+        // disables the watchdog (never tear down on silence — the driver guards `if (!DISCONNECT_
+        // TIMEOUT) return`), so accept >= 0. Read live in `_feedWatchdog`; changing per-card YAML
+        // takes effect on a card reload, no driver pin bump / service-worker hard reload needed.
+        const mseTimeout = Number(effectiveConfig.mse_timeout);
+        if (Number.isFinite(mseTimeout) && mseTimeout >= 0) newDriver.DISCONNECT_TIMEOUT = mseTimeout;
 
         // Network strict mode propagates directly to the driver.
         newDriver.strictMode =
