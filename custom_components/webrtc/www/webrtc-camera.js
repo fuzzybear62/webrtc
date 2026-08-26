@@ -25,6 +25,19 @@
  *
  * CHANGELOG
  * ---------
+ * v14.6.17 — [DRIVER CHANGE, pin ?v=2.11.0 → 2.12.0 — needs a PWA hard reload] Alg.4: self-calibrating
+ *   band + network-state dot. The 20:36 direct-4G log was a "disastro" (lost the HA connection): Alg.2
+ *   SERIAL held (only the canary ramped, no cascade — a real win over the 19:37 storm) but the SINGLE
+ *   canary still stormed the weak uplink to rtt 3546ms because Alg.3 aborted ~15s late — the canary
+ *   never promoted, band sat at 'degr' (rtt 1147ms = 5.7× its floor, loss 15%) accruing NOTHING for
+ *   ~10s, flipping to 'path' only once rtt had already run away. Root cause: the band used ABSOLUTE RTT
+ *   ceilings, which are both too lenient to catch a bad path early AND wrong for a non-deterministic 4G
+ *   (the same link held 4 RTC in another test). Driver v2.12.0 replaces them with a RELATIVE bufferbloat
+ *   INFLATION signal (rttEwma / session-min RTT) feeding a CONTINUOUS abort severity — no 'degr' dead-
+ *   zone, a runaway gives up in ~2s, and an in-form 4G (infl≈1) now OPENS the gate instead of being
+ *   mislabelled degr. Card adds an opt-in `network_indicator: true` dot: white = no fresh sample,
+ *   green = perf, yellow = degr, red = path (parsed off the metrics `band=` token). See
+ *   webrtc-mobile-collapse-is-rtc-additive memory.
  * v14.6.16 — [DRIVER CHANGE, pin ?v=2.10.0 → 2.11.0 — needs a PWA hard reload] Alg.2 goes band-adaptive.
  *   The serializer no longer holds cameras in a queue on a fat pipe: it uses the FIRST probe as a canary and
  *   serializes ramps only until that probe's Alg.1 band verdict lands (~2s). band=perf → OPEN the gate (no
@@ -367,7 +380,7 @@
  *   _promoteShadowToMain().
  */
 
-import {VideoRTC} from './video-rtc.js?v=2.11.0';
+import {VideoRTC} from './video-rtc.js?v=2.12.0';
 import {DigitalPTZ} from './digital-ptz.js?v=3.3.0';
 // [SIDECAR INTEGRATION] Import the Interaction module.
 // This module handles legacy features (Shortcuts, PTZ, Styles) to keep the core driver clean.
@@ -496,6 +509,10 @@ class WebRTCCamera extends HTMLElement {
         this._flapLast = 0;          // last flap/decay timestamp, for linear decay
         this._lastLossPct = 0;       // most recent inbound-rtp loss% parsed from the metrics line
         this._lastLossAt = 0;        // when that sample arrived, for the freshness gate
+        this._lastBand = '';         // most recent band verdict parsed from the metrics line (net dot)
+        this._lastBandAt = 0;        // when that band sample arrived (staleness -> white)
+        this._netTimer = null;       // network-indicator staleness interval handle
+        this.NET_DOT_STALE_MS = 5000; // no band sample for this long -> net dot back to white (emit ~3s)
         this._rtcSuppressed = false; // [A0] latch: build MSE-only, no re-probe
         this._rtcSuppressedAt = 0;   // when the latch engaged, for the RTC_RETEST_MS re-test
         this.STREAM_PROBATION_MS = 20000; // survive this long before a stream counts as healthy
@@ -527,7 +544,7 @@ class WebRTCCamera extends HTMLElement {
         // (correlates stream loss with the mobile app backgrounding / 5G handoff).
         this._logVisAbort = null;
 
-        console.info('[WebRTC Camera] v14.6.16');
+        console.info('[WebRTC Camera] v14.6.17');
     }
 
     setConfig(config) {
@@ -1769,6 +1786,9 @@ class WebRTCCamera extends HTMLElement {
                     // string (`… loss=X.X% …`); a defensive regex avoids a driver change (pin bump).
                     const m = /loss=([\d.]+)%/.exec(msg.value);
                     if (m) { this._lastLossPct = parseFloat(m[1]); this._lastLossAt = Date.now(); }
+                    // [net dot] Harvest the band verdict for the network-state indicator (opt-in).
+                    const b = /band=(perf|degr|path)/.exec(msg.value);
+                    if (b) { this._lastBand = b[1]; this._lastBandAt = Date.now(); this._paintNetDot(); }
                     this._logHA('debug', 'metrics', msg.value);
                     return;
                 }
@@ -2116,6 +2136,18 @@ class WebRTCCamera extends HTMLElement {
             }
             .live-dot.live { background-color: #90EE90; }
 
+            /* Network-state dot (opt-in via network_indicator: true). Mirrors the driver's live band
+               classifier: white = no fresh sample (not probing / unknown), green = perf (queue ~empty),
+               yellow = degr (mild bufferbloat), red = path (standing queue / lossy). UI-only. */
+            .net-dot {
+                width: 8px; height: 8px; border-radius: 50%;
+                background-color: #FFFFFF; align-self: center;
+                transition: background-color 0.3s;
+            }
+            .net-dot.perf { background-color: #90EE90; }
+            .net-dot.degr { background-color: #FFD400; }
+            .net-dot.path { background-color: #D2122E; }
+
             video-rtc { width: 100%; height: 100%; display: block; }
             ha-icon { color: white; cursor: pointer; }
             
@@ -2139,6 +2171,7 @@ class WebRTCCamera extends HTMLElement {
                 <div class="status"></div>
                 <div class="right-controls">
                     ${this.config.live_indicator === true ? '<div class="live-dot"></div>' : ''}
+                    ${this.config.network_indicator === true ? '<div class="net-dot" title="Network state"></div>' : ''}
                     <ha-icon class="refresh" icon="mdi:refresh" title="Hard Reset"></ha-icon>
                     <div class="mode"></div>
                 </div>
@@ -2448,6 +2481,34 @@ class WebRTCCamera extends HTMLElement {
                 });
             }
         }
+
+        // --- network-state indicator (opt-in) ---------------------------------
+        // Paints the .net-dot from the driver's band verdict (parsed off the metrics line in the
+        // message router). A staleness sweep returns it to white once band samples stop arriving —
+        // metrics only emit while an un-committed probe polls, so "no fresh sample" is the honest
+        // MSE-only/idle state. The paint helper is a no-op when the dot isn't in the DOM.
+        if (this._netTimer) { clearInterval(this._netTimer); this._netTimer = null; }
+        if (this.config.network_indicator === true) {
+            this._paintNetDot();
+            this._netTimer = setInterval(() => {
+                if (this._lastBand && Date.now() - this._lastBandAt > this.NET_DOT_STALE_MS) {
+                    this._lastBand = '';
+                    this._paintNetDot();
+                }
+            }, 1000);
+            signal.addEventListener('abort', () => {
+                if (this._netTimer) { clearInterval(this._netTimer); this._netTimer = null; }
+            });
+        }
+    }
+
+    // Paint the opt-in network-state dot from `_lastBand` ('' | perf | degr | path). White (no class)
+    // = no fresh band sample. Safe to call when the dot is absent (indicator off / not yet rendered).
+    _paintNetDot() {
+        const dot = this.shadowRoot && this.shadowRoot.querySelector('.net-dot');
+        if (!dot) return;
+        dot.classList.remove('perf', 'degr', 'path');
+        if (this._lastBand) dot.classList.add(this._lastBand);
     }
 
     // Normalize a user-supplied `ice_servers` config. Returns:

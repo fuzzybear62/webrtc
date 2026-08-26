@@ -4,6 +4,15 @@
  * Derived from AlexxIT/WebRTC. Licensed under the MIT License — see LICENSE.
  */
 /**
+ * VideoRTC v2.12.0 - [Alg.4 self-calibrating band] the 3 categorical band buckets collapse to ONE
+ *   continuous primitive: bufferbloat INFLATION = rttEwma / session-min-RTT (_mRttMin, the queue-empty
+ *   baseline). Relative, so a link is judged by its LIVE queue, never by absolute RTT ("it's 4G"):
+ *   the SAME 4G holds 4 RTC one moment and storms the next — only the queue tells the truth. The abort
+ *   accumulator now integrates a CONTINUOUS severity (∝ how far infl/loss exceed their floors), deleting
+ *   the 'degr' HOLD dead-zone that let a doomed 4G canary storm ~15s before giving up; a runaway (infl
+ *   4-6x) now blows through the hold in ~2s. The gate's perf/path label is derived from infl too, so an
+ *   in-form 4G (infl≈1 at rtt~200ms) OPENS the gate instead of being mislabelled degr by an absolute
+ *   ceiling. `infl=` added to the metrics line. See webrtc-mobile-collapse memory.
  * VideoRTC v2.11.0 - [Alg.2 band-adaptive] the probe serializer now uses the FIRST probe as a canary:
  *   it serializes ramps only until the canary's Alg.1 verdict lands (~2s). band=perf OPENS the gate
  *   (fat pipe → no storm possible → drain the queue, ramp everyone in PARALLEL, zero serialization cost);
@@ -543,53 +552,71 @@ export class VideoRTC extends HTMLElement {
         this._congestion = 0;            // smoothed congestion score [0,1]
         this._rtcFutility = 0;           // decaying penalty for recent doomed RTC promotes [0,1]
 
-        // [RTC ABORT — Alg.3, v2.9.0] Give up a doomed un-committed RTC probe and snap back to the warm
+        // [RTC ABORT — Alg.3→Alg.4] Give up a doomed un-committed RTC probe and snap back to the warm
         // MSE. This SUPERSEDES the v2.7.0 blind-ceiling abort (jbuf/RTT over a hard limit), which was
         // structurally blind to the pure-LOSS pathology the field logs exposed (direct-4G 2026-08-26:
         // esternacancello RTT pinned at 107ms with 10-29% loss — healthy by any RTT/jbuf ceiling, yet the
-        // stream was unusable). The decision now consumes the Alg.1 band classifier (`_bandClass`), which
-        // already folds BOTH stressors (rttExcess bufferbloat AND short-window loss) into one verdict, so
-        // the abort inherits loss-awareness for free and the ceilings are deleted (no dead code).
+        // stream was unusable). The decision reads the same two live stressors the band classifier folds —
+        // bufferbloat INFLATION (rttEwma / session-min RTT, relative) and short-window loss — so it inherits
+        // loss-awareness for free and the absolute ceilings are deleted (no dead code).
         //
-        // The verdict flaps on bursty links (loss spikes + a fast EWMA oscillate perf↔degr↔path), so a raw
-        // `band=='path'` MUST NOT abort on sight. Instead a LEAKY ASYMMETRIC ACCUMULATOR integrates the
-        // verdict over time (worsen fast, recover slow — field finding A): each poll adds POLL_MS while the
-        // band is 'path', HOLDS on the ambiguous 'degr', and bleeds POLL_MS*RECOVER_K (<1, so recovery is
-        // slower than accrual) while 'perf'. We abort only once the integral `_bandBadMs` crosses
-        // RTC_ABORT_HOLD_MS — an intrinsic stability window (~12 net 'path' polls at 500ms) that also
-        // absorbs the optimistic opening verdict (finding B: the classifier holds '' until BAND_CLASSIFY_MS,
-        // and '' neither accrues nor bleeds). The revert bumps `_rtcFutility`, which SHORTENS the next
-        // probe's hold toward HOLD*(1-K) so a repeatedly-doomed path gives up faster; rtc_failed then arms
-        // the card's backed-off re-probe loop. Master switch only (per-card `mse_abort`); the former
-        // jbuf/rtt ceiling knobs are gone — the band thresholds (internal, Alg.1) are the tuning surface.
+        // A LEAKY ASYMMETRIC ACCUMULATOR integrates a CONTINUOUS severity over time (worsen fast, recover
+        // slow — field finding A): each poll adds pollMs*severity, where severity ramps 0→SEV_MAX as infl/
+        // loss exceed their floors. This replaced v2.9's 3-bucket accrual (path=+pollMs, degr=HOLD,
+        // perf=bleed): the 20:36 4G disaster proved 'degr' was a DEAD-ZONE where a clearly-dying canary
+        // (rtt 5.7x its floor, loss 15%) accrued NOTHING for ~10s and stormed HA off the uplink before the
+        // abort fired. Continuous severity gives up in ~2s on a runaway while still absorbing verdict flap
+        // and the optimistic opening (infl unknown → sev 0 until a baseline+window exist). The revert bumps
+        // `_rtcFutility`, which SHORTENS the next probe's hold toward HOLD*(1-K) so a repeatedly-doomed path
+        // gives up faster; rtc_failed then arms the card's backed-off re-probe loop. Master switch only
+        // (per-card `mse_abort`); the tuning surface is the internal infl/loss severity shaping constants.
         this.RTC_ABORT_ENABLED = true;   // master switch (per-card `mse_abort`)
-        this.RTC_ABORT_HOLD_MS = 6000;   // integrated bad-band time (ms, at futility 0) that -> abort
+        this.RTC_ABORT_HOLD_MS = 6000;   // integrated severity·time (ms, at futility 0) that -> abort
         this.RTC_ABORT_FUTILITY_K = 0.5; // futility [0,1] shortens the hold toward HOLD*(1-K)
-        this.RTC_ABORT_RECOVER_K = 0.5;  // 'perf' bleeds _bandBadMs at POLL_MS*K (<1 -> recover slower than accrue)
-        this._bandBadMs = 0;             // leaky integral of bad-band time (ms); 0 = clear
+        this.RTC_ABORT_RECOVER_K = 0.5;  // a healthy poll bleeds _bandBadMs at pollMs*K (<1 -> recover slow)
+        // [Alg.4] CONTINUOUS severity (replaces the old perf/degr/path 3-bucket accrual). Each poll adds
+        // pollMs*severity, where severity ramps 0 -> SEV_MAX as inflation climbs past INFL_LOW (or loss
+        // past LOSS_LOW): a mildly-bloated link accrues slowly, a runaway (infl 4-6x, the 4G-disaster
+        // signature) blows through the hold in ~2s. This deletes the old 'degr' HOLD dead-zone — the
+        // 20:36 4G log sat at 'degr' with rtt 5.7x its floor and loss 15% for ~10s accruing NOTHING, so
+        // the doomed canary stormed the uplink to rtt 3546ms (killing HA) before Alg.3 finally aborted.
+        this.RTC_ABORT_INFL_LOW = 1.5;   // inflation below which no severity accrues (GCC ramp headroom)
+        this.RTC_ABORT_INFL_REF = 1.5;   // inflation span per 1.0 severity unit (infl LOW+REF => sev 1)
+        this.RTC_ABORT_LOSS_LOW = 8;     // loss (%) below which no loss-severity accrues
+        this.RTC_ABORT_LOSS_REF = 12;    // loss span (%) per 1.0 severity unit (loss LOW+REF => sev 1)
+        this.RTC_ABORT_SEV_MAX = 3;      // per-poll severity cap (an extreme link -> abort in ~2s)
+        this._bandBadMs = 0;             // leaky integral of severity·time (ms); 0 = clear
 
         // [EARLY BAND CLASSIFIER — Alg.1, v2.8.0] The self-configuring rework's foundation. The
         // reactive levers above (adaptive-watchdog EXTEND, step-3 ABORT) treat SYMPTOMS after a doomed
         // promote has already loaded the link; field analysis (2026-08-26, see
         // webrtc-mse-timeout-zero-validation memory) showed the instrumentation already tells a
         // PERFORMANT link from a non-performant one within ~2s of a probe. This classifier folds the
-        // per-poll signals ALREADY harvested for the metrics line (instantaneous candidate-pair RTT,
-        // rttExcess over session-min, short-window loss%) into a live verdict — 'perf' | 'degr' | 'path'
-        // — after BAND_CLASSIFY_MS of samples, then keeps it updated every poll. It runs ONLY while an
-        // un-committed probe is live (negotiating/promoted); '' otherwise. OBSERVE-FIRST: for now it only
-        // surfaces `band=` on the metrics line so we can validate the thresholds against real 4G/LAN logs
-        // BEFORE any decision keys on it. Alg.2 (serialized ramp) and Alg.3 (class-driven commit) will
-        // consume `this._bandClass` next, at which point the blind step-3 abort it supersedes is removed.
-        // Thresholds are seeded from the field logs (pathological direct-4G: RTT→seconds and/or loss
-        // 16-24%; performant LAN/CF-tunnel: RTT 2-130ms, loss 0%) — NOT user knobs (the goal is to
-        // eliminate YAML tuning, so these stay internal and will become path-percentile-derived in Alg.4).
+        // per-poll signals ALREADY harvested for the metrics line (candidate-pair RTT, session-min RTT,
+        // short-window loss%) into a live signal. Two consumers: the gate reads the coarse label
+        // ('perf' | 'degr' | 'path'), the abort reads the continuous inflation/loss severity. It runs
+        // ONLY while an un-committed probe is live (negotiating/promoted); '' otherwise. Field-validated
+        // against real 4G/LAN logs: the v2.8 absolute BAND_*_RTT_MS ceilings both mislabelled an in-form
+        // 4G (rtt~200ms) as degr AND were too lenient to catch the 20:36 disaster path until rtt had run
+        // to seconds — v2.12 replaced them with the relative INFLATION signal below. NOT user knobs (the
+        // goal is to eliminate YAML tuning; these stay internal and self-calibrate off _mRttMin).
         this.BAND_CLASSIFY_MS = 2000;    // min observation before the first verdict (the user's "~2s")
-        this.BAND_GOOD_RTT_MS = 200;     // RTT (ms) at/below which, with low loss, the link is 'perf'
-        this.BAND_GOOD_LOSS_PCT = 3;     // loss (%) below which, with low RTT, the link is 'perf'
-        this.BAND_PATH_RTT_MS = 1500;    // RTT (ms) at/above which the link is 'path' (bufferbloat)
+        // [Alg.4] Self-calibrating band signal: bufferbloat INFLATION = rttEwma / session-min-RTT
+        // (_mRttMin, the queue-empty baseline). infl≈1 = empty queue → healthy at ANY absolute RTT
+        // (LAN 2ms OR in-form 4G 200ms); infl growing = a standing queue building under the RTC ramp.
+        // RELATIVE by construction, so the same 4G that holds 4 RTC one moment and storms the next is
+        // judged by its LIVE queue, not by "it's 4G" — the absolute BAND_*_RTT_MS ceilings are RETIRED
+        // (they mislabelled an in-form 4G as degr and serialized it needlessly, and were too lenient to
+        // catch the disaster path until rtt had already run away). Loss stays an ABSOLUTE backstop
+        // (a lossy path is bad regardless of RTT). This label is display+gate only; the abort integrates
+        // the continuous infl/loss severity above.
+        this.BAND_GOOD_INFL = 1.3;       // infl <= this (with low loss) => 'perf' (queue ~empty)
+        this.BAND_PATH_INFL = 3.0;       // infl >= this (or high loss)  => 'path' (standing queue)
+        this.BAND_GOOD_LOSS_PCT = 3;     // loss (%) below which, with low infl, the link is 'perf'
         this.BAND_PATH_LOSS_PCT = 15;    // loss (%) at/above which the link is 'path' (lossy path)
         this.BAND_EWMA_ALPHA = 0.4;      // rtt/loss EWMA smoothing (twitchy enough to converge by ~2s)
-        this._bandClass = '';            // '' (not probing) | 'perf' | 'degr' | 'path'
+        this._bandClass = '';            // display/gate label: '' (not probing) | 'perf' | 'degr' | 'path'
+        this._bandInfl = -1;             // last inflation ratio rttEwma/rttMin (-1 = unknown/no baseline)
         this._bandT0 = 0;                // Date.now() the current probe's classification window opened
         this._bandRtt = -1;              // EWMA of instantaneous RTT (ms); -1 = no sample yet
         this._bandLoss = -1;             // EWMA of short-window loss (%); -1 = no sample yet
@@ -927,23 +954,33 @@ export class VideoRTC extends HTMLElement {
     }
 
     /**
-     * [RTC ABORT — Alg.3] Integrate the Alg.1 band verdict into the abort decision, once per poll
-     * (`pollMs` cadence) while an un-committed RTC probe is live (negotiating/promoted). Leaky
-     * ASYMMETRIC accumulator: 'path' accrues `_bandBadMs += pollMs` (worsen fast), 'degr' HOLDS
-     * (ambiguous — neither condemns nor forgives), 'perf' bleeds `_bandBadMs -= pollMs*RECOVER_K`
-     * floored at 0 (recover slow, K<1), and '' (verdict not yet decided) is a no-op. Aborting only
-     * when the integral crosses the futility-shortened hold gives an intrinsic stability window that
-     * absorbs verdict flapping (finding A) and the optimistic opening verdict (finding B). Outside the
-     * probe the accumulator is held at 0 by `_resetBandClassifier`.
+     * [RTC ABORT — Alg.4] Integrate the CONTINUOUS band severity into the abort decision, once per
+     * poll (`pollMs` cadence) while an un-committed RTC probe is live (negotiating/promoted). Leaky
+     * ASYMMETRIC accumulator driven by severity = max(inflation-severity, loss-severity), each 0..SEV_MAX:
+     * accrue `pollMs*severity` (worsen ∝ how bad AND how long), bleed `pollMs*RECOVER_K` only when clearly
+     * healthy (K<1 → recover slow), hold in the narrow middle. Replaces the v2.9 perf/degr/path 3-bucket
+     * accrual whose 'degr' HOLD was a dead-zone (the 4G disaster sat there ~10s accruing nothing). Aborting
+     * only when the integral crosses the futility-shortened hold keeps the flap-absorbing stability window;
+     * outside the probe the accumulator is held at 0 by `_resetBandClassifier`.
      */
     _evaluateBandAbort(pollMs) {
         if (!this.RTC_ABORT_ENABLED) return;
         if (this._rtcPhase !== 'negotiating' && this._rtcPhase !== 'promoted') return;
-        if (this._bandClass === 'path') {
-            this._bandBadMs += pollMs;
-        } else if (this._bandClass === 'perf') {
-            this._bandBadMs = Math.max(0, this._bandBadMs - pollMs * this.RTC_ABORT_RECOVER_K);
-        } // 'degr' and '' hold the integral
+        // [Alg.4] Continuous severity from the two live stressors: bufferbloat inflation (relative to
+        // the link's own queue-empty floor) and absolute loss. Each ramps 0 -> SEV_MAX past its floor;
+        // accrue pollMs*max(sev) (worsen ∝ how bad AND how long), bleed only when clearly healthy, and
+        // HOLD in the narrow middle. No categorical bucket -> no 'degr' dead-zone.
+        const infl = this._bandInfl, loss = this._bandLoss, cap = this.RTC_ABORT_SEV_MAX;
+        const clamp = (x) => Math.max(0, Math.min(cap, x));
+        const sevInfl = infl >= 0 ? clamp((infl - this.RTC_ABORT_INFL_LOW) / this.RTC_ABORT_INFL_REF) : 0;
+        const sevLoss = loss >= 0 ? clamp((loss - this.RTC_ABORT_LOSS_LOW) / this.RTC_ABORT_LOSS_REF) : 0;
+        const sev = Math.max(sevInfl, sevLoss);
+        if (sev > 0) {
+            this._bandBadMs += pollMs * sev;                       // worsen ∝ severity × time
+        } else if ((infl < 0 || infl <= this.BAND_GOOD_INFL) &&
+                   (loss < 0 || loss < this.BAND_GOOD_LOSS_PCT)) {
+            this._bandBadMs = Math.max(0, this._bandBadMs - pollMs * this.RTC_ABORT_RECOVER_K); // heal
+        } // mild middle (GOOD_INFL < infl < INFL_LOW): hold — far narrower than the old 'degr' bucket
         const k = Math.max(0, Math.min(1, this.RTC_ABORT_FUTILITY_K));
         const hold = this.RTC_ABORT_HOLD_MS * (1 - k * Math.max(0, Math.min(1, this._rtcFutility)));
         if (this._bandBadMs >= hold) {
@@ -960,7 +997,8 @@ export class VideoRTC extends HTMLElement {
      */
     _abortRtcProbe(hold, held) {
         console.warn(`[VideoRTC:${this.clientId}] RTC probe ABORTED — sustained bad band ` +
-            `(band=${this._bandClass || '?'} integral ${held}ms >= ${hold}ms, phase=${this._rtcPhase}, ` +
+            `(band=${this._bandClass || '?'} infl=${this._bandInfl >= 0 ? this._bandInfl.toFixed(1) : '?'} ` +
+            `integral ${held}ms >= ${hold}ms, phase=${this._rtcPhase}, ` +
             `futility=${this._rtcFutility.toFixed(2)}).`);
         this._revertToWarmMSE(`RTC aborted: sustained bad band (band=${this._bandClass || '?'}, ${held}ms)`);
     }
@@ -989,12 +1027,17 @@ export class VideoRTC extends HTMLElement {
         }
         if (lostCount >= 0) this._bandLastLost = lostCount;
         if (recvCount >= 0) this._bandLastRecv = recvCount;
+        // [Alg.4] Bufferbloat inflation vs the session-min RTT (_mRttMin, the queue-empty baseline).
+        // Needs both a baseline and a smoothed RTT; until then infl is unknown (-1) and no relative
+        // verdict is possible (loss can still condemn via the absolute backstop below).
+        const minMs = this._mRttMin < Infinity ? this._mRttMin * 1000 : -1;
+        this._bandInfl = (minMs > 0 && this._bandRtt >= 0) ? this._bandRtt / minMs : -1;
         // Hold the verdict until we have both a starting timestamp and BAND_CLASSIFY_MS of samples.
         if (!this._bandT0 || Date.now() - this._bandT0 < this.BAND_CLASSIFY_MS) return;
-        const rtt = this._bandRtt, loss = this._bandLoss;
-        const pathBad = (rtt >= 0 && rtt >= this.BAND_PATH_RTT_MS) ||
+        const infl = this._bandInfl, loss = this._bandLoss;
+        const pathBad = (infl >= 0 && infl >= this.BAND_PATH_INFL) ||
                         (loss >= 0 && loss >= this.BAND_PATH_LOSS_PCT);
-        const good = rtt >= 0 && rtt < this.BAND_GOOD_RTT_MS &&
+        const good = infl >= 0 && infl <= this.BAND_GOOD_INFL &&
                      (loss < 0 || loss < this.BAND_GOOD_LOSS_PCT);
         this._bandClass = pathBad ? 'path' : good ? 'perf' : 'degr';
     }
@@ -1003,6 +1046,7 @@ export class VideoRTC extends HTMLElement {
      *  classification window opens (phase -> negotiating) and `false` on leaving the probe. */
     _resetBandClassifier(arm) {
         this._bandClass = '';
+        this._bandInfl = -1;
         this._bandT0 = arm ? Date.now() : 0;
         this._bandRtt = -1;
         this._bandLoss = -1;
@@ -1080,7 +1124,8 @@ export class VideoRTC extends HTMLElement {
             `loss=${lossPct >= 0 ? lossPct.toFixed(1) : '?'}% gp=${gp >= 0 ? gp.toFixed(0) : '?'}kb/s ` +
             `jit=${jit >= 0 ? Math.round(jit * 1000) : '?'}ms cong=${this._congestion.toFixed(2)} ` +
             `jbuf=${jbufMs >= 0 ? jbufMs : '?'}ms nack=${dNack >= 0 ? dNack : '?'} ` +
-            `pkt=${pktB >= 0 ? pktB : '?'}B path=${path || '?'} band=${this._bandClass || '?'}`;
+            `pkt=${pktB >= 0 ? pktB : '?'}B path=${path || '?'} band=${this._bandClass || '?'} ` +
+            `infl=${this._bandInfl >= 0 ? this._bandInfl.toFixed(1) : '?'}`;
         if (this.onmessage && typeof this.onmessage['ui_sync'] === 'function') {
             this.onmessage['ui_sync']({ type: 'metrics', value: summary });
         }
