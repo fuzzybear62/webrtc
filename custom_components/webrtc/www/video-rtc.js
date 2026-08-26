@@ -4,6 +4,11 @@
  * Derived from AlexxIT/WebRTC. Licensed under the MIT License — see LICENSE.
  */
 /**
+ * VideoRTC v2.11.0 - [Alg.2 band-adaptive] the probe serializer now uses the FIRST probe as a canary:
+ *   it serializes ramps only until the canary's Alg.1 verdict lands (~2s). band=perf OPENS the gate
+ *   (fat pipe → no storm possible → drain the queue, ramp everyone in PARALLEL, zero serialization cost);
+ *   band=path keeps/returns to SERIAL (one ramp at a time). Kills the 8s/cam convergence penalty on
+ *   LAN/wideband while preserving the storm guard on constrained 4G. See webrtc-mobile-collapse memory.
  * VideoRTC v2.10.0 - [Alg.2] cross-grid RTC probe serializer: one module-level single-flight gate
  *   (_rtcProbeGate), shared by EVERY VideoRTC on the page (each card's main driver + its shadow), so at
  *   most ONE RTC ramp runs at a time. Bounds the collective double-load peak to MSE(all)+RTC(one) instead
@@ -301,41 +306,51 @@
 /**
  * [RTC PROBE SERIALIZER — Alg.2] One module-level, cross-instance single-flight gate for the
  * WebRTC bandwidth-hungry RAMP. EVERY VideoRTC on the page — each card's main driver AND its
- * background shadow — shares this one coordinator, so at most ONE RTC probe is ramping at any
- * instant. Why: N cameras promoting RTC ~simultaneously each fire an uncoordinated GCC bitrate
- * ramp; on one constrained 4G uplink the N ramps overshoot together → a grid-wide RTT balloon
- * (the "bufferbloat storm" seen in the direct-4G field logs). Serializing the ramps bounds the
- * collective peak to MSE(all)+RTC(one) instead of MSE(all)+RTC(N) and lets each GCC probe find
- * its ceiling alone.
+ * background shadow — shares this one coordinator. Why: N cameras promoting RTC ~simultaneously
+ * each fire an uncoordinated GCC bitrate ramp; on one constrained 4G uplink the N ramps overshoot
+ * together → a grid-wide RTT balloon (the "bufferbloat storm" seen in the direct-4G field logs).
  *
- * A holder keeps the token from the offer (onwebrtc) until the EARLIEST of:
+ * BUT serializing only earns its keep on a CONSTRAINED link — on a fat pipe (LAN / wideband) there
+ * is no storm to prevent, and holding cameras in a queue just delays their upgrade for nothing. So
+ * the gate is band-adaptive and uses the FIRST probe as a canary:
+ *   - SERIAL (default, safe): one probe ramps at a time; the rest queue on warm MSE at ZERO load.
+ *   - The canary's Alg.1 verdict (reportBand, ~2s into its ramp) decides the shared uplink:
+ *       band=perf  → OPEN the gate: the link is fat, no storm possible → drain the queue at once
+ *                    and let every current+future probe ramp in PARALLEL (no serialization cost).
+ *       band=path  → stay/return to SERIAL: the link is constrained, keep one ramp at a time.
+ *       band=degr/'' (ambiguous) → leave the mode unchanged (stay cautious).
+ * The band is a property of the shared uplink, not the individual camera, so one verdict
+ * generalizes; if the link later degrades, the next path report re-arms SERIAL.
+ *
+ * In SERIAL mode a holder keeps the token from the offer (onwebrtc) until the EARLIEST of:
  *   - promote settles  — RTC_GATE_SETTLE_MS gapless in 'promoted': GCC has plateaued, so the
  *                        next camera may ramp WITHOUT waiting the full RTC_COMMIT_MS to commit,
  *   - revert / reject  — _setPhase('warm')      (probe gone),
  *   - commit           — _setPhase('committed') (MSE released; path plateaued long ago),
  *   - a dying probe    — any failWebRTC path (fast ICE fail / offer rejected),
- *   - lease timeout    — LEASE_MS backstop, so a connected-but-frozen probe can't wedge the grid
- *                        until its 120s give-up fires.
+ *   - lease timeout    — LEASE_MS backstop, so a connected-but-frozen probe can't wedge the grid.
  * MSE (onmse) starts unblocked in onconnect and keeps flowing the whole time a camera waits, so a
  * queued camera adds ZERO extra load — it just keeps showing warm MSE until its turn to ramp.
  */
 const _rtcProbeGate = {
-    holder: null,       // the VideoRTC instance currently allowed to ramp, or null
-    queue: [],          // FIFO of { driver, resolve } waiting their turn
+    holder: null,       // the VideoRTC instance currently allowed to ramp (SERIAL mode), or null
+    queue: [],          // FIFO of { driver, resolve } waiting their turn (SERIAL mode)
     leaseTID: 0,        // force-release backstop for the current holder
+    open: false,        // true once the canary reports band=perf: fat pipe, ramp everyone in parallel
     LEASE_MS: 20000,    // hard cap on any single hold (comfortably above RTC_GATE_SETTLE_MS,
                         // far below the 120s FIRSTFRAME give-up so a frozen probe can't wedge us)
 
-    /** Await our turn to ramp. Resolves immediately when the gate is free. */
+    /** Await our turn to ramp. Resolves immediately when the gate is OPEN (fat pipe) or free. */
     acquire(driver) {
         return new Promise(resolve => {
-            if (!this.holder) this._grant(driver, resolve);
+            if (this.open) resolve();                          // fat pipe: no serialization
+            else if (!this.holder) this._grant(driver, resolve);
             else if (this.holder === driver) resolve();        // re-entrant: already ours
             else this.queue.push({ driver, resolve });
         });
     },
 
-    /** Give up the token, or leave the queue if not yet holder. Idempotent. */
+    /** Give up the token, or leave the queue if not yet holder. Idempotent. No-op while OPEN. */
     release(driver) {
         const qi = this.queue.findIndex(w => w.driver === driver);
         if (qi !== -1) this.queue.splice(qi, 1);               // torn down before its turn
@@ -344,6 +359,25 @@ const _rtcProbeGate = {
         this.holder = null;
         const next = this.queue.shift();
         if (next) this._grant(next.driver, next.resolve);
+    },
+
+    /**
+     * [Alg.2 band-adaptive] Fold the canary's live band verdict into the gate mode. Called from
+     * the RTC poll right after _classifyBand. band=perf opens the gate (fat pipe → parallel ramps);
+     * band=path re-arms serialization; degr/'' are left ambiguous and change nothing.
+     */
+    reportBand(driver, band) {
+        if (band === 'perf' && !this.open) {
+            console.debug(`[VideoRTC:${driver.clientId}] RTC probe gate OPEN — canary band=perf, fat pipe, parallel ramps allowed.`);
+            this.open = true;
+            if (this.leaseTID) { clearTimeout(this.leaseTID); this.leaseTID = 0; }
+            this.holder = null;
+            const waiters = this.queue.splice(0);              // drain the whole queue at once
+            for (const w of waiters) w.resolve();
+        } else if (band === 'path' && this.open) {
+            console.debug(`[VideoRTC:${driver.clientId}] RTC probe gate SERIAL — band=path, constrained link, re-serializing ramps.`);
+            this.open = false;
+        }
     },
 
     _grant(driver, resolve) {
@@ -1660,6 +1694,10 @@ export class VideoRTC extends HTMLElement {
                 // [RTC ABORT — Alg.3] Integrate the fresh verdict into the abort accumulator on the
                 // same 500ms cadence (a no-op outside negotiating/promoted).
                 this._evaluateBandAbort(500);
+                // [RTC SERIALIZER — Alg.2 band-adaptive] Report the canary's verdict to the gate:
+                // band=perf opens it (fat pipe → parallel ramps, no serialization cost), band=path
+                // re-arms serialization. Only the ramping probe(s) poll, so this stays cheap.
+                _rtcProbeGate.reportBand(this, this._bandClass);
                 if (fd < 0) return;
                 const advanced = lastDecoded >= 0 && fd > lastDecoded;
                 lastDecoded = fd;

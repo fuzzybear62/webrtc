@@ -25,6 +25,15 @@
  *
  * CHANGELOG
  * ---------
+ * v14.6.16 — [DRIVER CHANGE, pin ?v=2.10.0 → 2.11.0 — needs a PWA hard reload] Alg.2 goes band-adaptive.
+ *   The serializer no longer holds cameras in a queue on a fat pipe: it uses the FIRST probe as a canary and
+ *   serializes ramps only until that probe's Alg.1 band verdict lands (~2s). band=perf → OPEN the gate (no
+ *   storm possible on wideband/LAN → drain the queue, ramp every camera in PARALLEL, zero serialization
+ *   cost); band=path → stay/return to SERIAL (constrained link → one ramp at a time, storm prevented);
+ *   band=degr/'' → unchanged (cautious). Fixes the ~8s/camera convergence penalty the v14.6.15 LAN log
+ *   showed (only the first camera reached RTC in a 7s session) while keeping the 4G storm guard intact.
+ *   The band is a property of the shared uplink, so one canary verdict generalizes; a later path report
+ *   re-arms serialization. Purely driver-side (in _rtcProbeGate); no card wiring, no YAML knob.
  * v14.6.15 — [DRIVER CHANGE, pin ?v=2.9.0 → 2.10.0 — needs a PWA hard reload] Alg.2, cross-grid RTC probe
  *   serializer. One module-level single-flight gate in the driver (_rtcProbeGate), shared by every VideoRTC
  *   on the page — each card's main driver AND its background shadow — so at most ONE RTC probe is ramping at
@@ -358,7 +367,7 @@
  *   _promoteShadowToMain().
  */
 
-import {VideoRTC} from './video-rtc.js?v=2.10.0';
+import {VideoRTC} from './video-rtc.js?v=2.11.0';
 import {DigitalPTZ} from './digital-ptz.js?v=3.3.0';
 // [SIDECAR INTEGRATION] Import the Interaction module.
 // This module handles legacy features (Shortcuts, PTZ, Styles) to keep the core driver clean.
@@ -518,7 +527,7 @@ class WebRTCCamera extends HTMLElement {
         // (correlates stream loss with the mobile app backgrounding / 5G handoff).
         this._logVisAbort = null;
 
-        console.info('[WebRTC Camera] v14.6.15');
+        console.info('[WebRTC Camera] v14.6.16');
     }
 
     setConfig(config) {
