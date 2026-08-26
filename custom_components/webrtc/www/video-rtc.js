@@ -4,7 +4,23 @@
  * Derived from AlexxIT/WebRTC. Licensed under the MIT License — see LICENSE.
  */
 /**
- * VideoRTC v2.4.6 - MSE strand recovery + no-data watchdog always 5s
+ * VideoRTC v2.5.0 - Adaptive MSE no-data watchdog (Strato-1: self-adapting timeout)
+ * * Changelog v2.5.0:
+ * - ADAPTIVE WATCHDOG (Strato-1). The MSE no-data watchdog is no longer a fixed 5s: a tiny in-loop
+ *   controller (_updateCongestion / _effectiveDisconnectTimeout) turns the existing passive metrics
+ *   into a smoothed `congestion` score [0,1] and EXTENDS the effective timeout up to ADAPT_MAX_EXTEND×
+ *   the base (this.DISCONNECT_TIMEOUT / per-card `mse_timeout`) — never below it — but ONLY while an
+ *   un-committed RTC probe is live (negotiating/promoted), the one window where the MSE is starved by
+ *   additive RTC load. Signal = rttExcess (rtt - session-min-rtt, the bufferbloat leading indicator)
+ *   reinforced by loss% and a decaying `_rtcFutility` penalty bumped on every _revertToWarmMSE (a
+ *   doomed RTC promote). In 'warm'/'committed' the base is used unchanged, so a genuinely dead
+ *   MSE-only stream is still reaped on time. Field motivation: the 2026-08-26 mse_timeout:0 run
+ *   proved the socket SURVIVES a 21s-rttExcess congestion storm and all 4 cams converge to clean RTC
+ *   — the fixed 5s watchdog was the disease (the reconnect storm), not the cure. High/low-band paths
+ *   now diverge from identical code (the substream keeps the tight base; the main earns the
+ *   extension). All thresholds parametric (ADAPTIVE_WATCHDOG / ADAPT_RTT_EXCESS_MS / ADAPT_LOSS_PCT /
+ *   ADAPT_MAX_EXTEND / ADAPT_EWMA_ALPHA), overridable per-card. The `metrics` line now ends with
+ *   `cong=N.NN`. Reprobe-suppression on sustained futility (Strato-1 step 3) is a follow-up.
  * * Changelog v2.4.6:
  * - FIX (MSE strand → frozen stream, "press pause+play to start"): the 5s buffer eviction
  *   (sb.remove) can leave the element's currentTime BELOW the buffered window — initial autoplay
@@ -341,6 +357,29 @@ export class VideoRTC extends HTMLElement {
         this._mNextEmit = 0;      // Date.now() gate for the next emit
         this.METRICS_EMIT_MS = 3000; // sampling cadence; bypasses the card's 10s log throttle
 
+        // [ADAPTIVE WATCHDOG v2.5.0 / Strato-1] The MSE no-data watchdog timeout is no longer a
+        // fixed constant. A tiny in-loop controller turns the passive metrics above into a smoothed
+        // `congestion` score in [0,1] and EXTENDS the effective watchdog up to ADAPT_MAX_EXTEND× the
+        // base while a link is congested — it NEVER shortens below the base. Field-validated
+        // 2026-08-26 (mse_timeout:0 run): on a congested 4G multi-cam grid the RTC upgrade is
+        // ADDITIVE load that transiently starves the warm MSE (rttExcess ballooned to ~21s, loss to
+        // 40%+, yet the socket never died and all 4 cams converged to clean RTC once committed). A
+        // fixed 5s watchdog tears such a recoverable stream down (the reconnect storm). Extending
+        // ONLY while an un-committed RTC probe is live, then decaying back to the tight base, lets a
+        // real stall ride out while still reaping a genuinely dead warm MSE-only stream on time.
+        // The high/low-band paths thus diverge from IDENTICAL code: the substream rarely congests so
+        // it keeps the tight base; the main saturates the link and earns the extension automatically.
+        // Signal: rttExcess = rtt - session-min-rtt (bufferbloat, the leading indicator), reinforced
+        // by loss and by a decaying penalty for recent doomed RTC promotes (`_rtcFutility`). All
+        // thresholds are parametric (overridable per-card) even though the loop self-adapts.
+        this.ADAPTIVE_WATCHDOG = true;   // master switch (per-card `mse_adaptive`)
+        this.ADAPT_RTT_EXCESS_MS = 400;  // rttExcess (ms) that alone drives congestion -> 1
+        this.ADAPT_LOSS_PCT = 20;        // loss (%) that alone drives congestion -> 1
+        this.ADAPT_MAX_EXTEND = 6;       // hard cap on the timeout multiplier (5s base -> 30s)
+        this.ADAPT_EWMA_ALPHA = 0.3;     // congestion EWMA smoothing (higher = twitchier)
+        this._congestion = 0;            // smoothed congestion score [0,1]
+        this._rtcFutility = 0;           // decaying penalty for recent doomed RTC promotes [0,1]
+
         // List of supported codecs to announce to the server
         this.CODECS = [
             'avc1.640029', 'avc1.64002A', 'avc1.640033', 'hvc1.1.6.L153.B0',
@@ -623,10 +662,14 @@ export class VideoRTC extends HTMLElement {
         //       first, so A0 latches on the first bad death and 4xMSE settles.
         // Abandoning a doomed RTC probe fast is the job of the RTC give-up/first-frame watchdog +
         // the card's narrow-link suppression, NOT this MSE no-data watchdog.
-        const timeout = this.DISCONNECT_TIMEOUT;
+        // [ADAPTIVE WATCHDOG v2.5.0] Effective timeout = base, EXTENDED while an un-committed RTC
+        // probe is congesting the warm MSE (see _effectiveDisconnectTimeout). Re-armed on every MSE
+        // byte, so it tracks live congestion. v2.4.6's "always base" comment above still holds for
+        // the 'warm'/'committed' phases; the extension applies only to negotiating/promoted.
+        const timeout = this._effectiveDisconnectTimeout();
         this.reconnectTID = setTimeout(() => {
             this.reconnectTID = 0;
-            console.warn(`[VideoRTC:${this.clientId}] No-data watchdog fired (${timeout}ms silent, phase=${this._rtcPhase}). Forcing close.`);
+            console.warn(`[VideoRTC:${this.clientId}] No-data watchdog fired (${timeout}ms silent, phase=${this._rtcPhase}, cong=${this._congestion.toFixed(2)}). Forcing close.`);
             this.handoff = false; // a stall is a failure, not an intentional handover
             this._closeReason = 'no-data-watchdog';
             this.onclose();
@@ -638,6 +681,48 @@ export class VideoRTC extends HTMLElement {
             clearTimeout(this.reconnectTID);
             this.reconnectTID = 0;
         }
+    }
+
+    /**
+     * [ADAPTIVE WATCHDOG] Fold one metrics sample into the smoothed `congestion` score. The
+     * instantaneous congestion is the STRONGER of two independent, self-normalizing stressors
+     * (either alone is enough to be "congested"): queueing delay rttExcess = rtt - session-min-rtt
+     * (bufferbloat) scaled by ADAPT_RTT_EXCESS_MS, and loss% scaled by ADAPT_LOSS_PCT. A decaying
+     * `_rtcFutility` floor keeps it elevated for a few samples after a doomed RTC promote, so a
+     * quick re-probe re-arms the watchdog extension immediately instead of starting from zero. An
+     * EWMA damps the whole thing (no discrete flapping). All inputs in ms / percent; -1 = no sample.
+     */
+    _updateCongestion(rttMs, baseMs, lossPct) {
+        let inst = 0;
+        if (rttMs >= 0 && baseMs >= 0 && this.ADAPT_RTT_EXCESS_MS > 0) {
+            const excess = Math.max(0, rttMs - baseMs);
+            inst = Math.max(inst, Math.min(1, excess / this.ADAPT_RTT_EXCESS_MS));
+        }
+        if (lossPct >= 0 && this.ADAPT_LOSS_PCT > 0) {
+            inst = Math.max(inst, Math.min(1, lossPct / this.ADAPT_LOSS_PCT));
+        }
+        this._rtcFutility *= 0.9;                       // decay ~1 sample at a time
+        inst = Math.max(inst, this._rtcFutility);
+        const a = this.ADAPT_EWMA_ALPHA;
+        this._congestion = a * inst + (1 - a) * this._congestion;
+    }
+
+    /**
+     * [ADAPTIVE WATCHDOG] The live no-data timeout: the base (this.DISCONNECT_TIMEOUT, i.e. the
+     * per-card `mse_timeout` or the 5s default) EXTENDED by up to ADAPT_MAX_EXTEND× in proportion
+     * to smoothed congestion — but ONLY while an un-committed RTC probe is live (negotiating /
+     * promoted), the one window where the MSE is starved by additive RTC load. In 'warm' (MSE-only:
+     * the pc-less regime with no rtt samples — a stall there means the stream is genuinely dead) and
+     * 'committed' (MSE already released) it returns the base unchanged, so a dead stream is still
+     * reaped on time. Never returns less than base; 0 (disabled) is honored by the caller's guard.
+     */
+    _effectiveDisconnectTimeout() {
+        const base = this.DISCONNECT_TIMEOUT;
+        if (!base || !this.ADAPTIVE_WATCHDOG) return base;
+        const rtcProbing = this._rtcPhase === 'negotiating' || this._rtcPhase === 'promoted';
+        if (!rtcProbing) return base;
+        const mult = 1 + (this.ADAPT_MAX_EXTEND - 1) * Math.max(0, Math.min(1, this._congestion));
+        return Math.round(base * mult);
     }
 
     /**
@@ -674,10 +759,12 @@ export class VideoRTC extends HTMLElement {
 
         const rttMs = rtt >= 0 ? Math.round(rtt * 1000) : -1;
         const baseMs = this._mRttMin < Infinity ? Math.round(this._mRttMin * 1000) : -1;
+        // [ADAPTIVE WATCHDOG] Drive the congestion controller from this sample (rttExcess + loss).
+        this._updateCongestion(rttMs, baseMs, lossPct);
         const summary =
             `phase=${this._rtcPhase} rtt=${rttMs}ms(min ${baseMs}) ` +
             `loss=${lossPct >= 0 ? lossPct.toFixed(1) : '?'}% gp=${gp >= 0 ? gp.toFixed(0) : '?'}kb/s ` +
-            `jit=${jit >= 0 ? Math.round(jit * 1000) : '?'}ms`;
+            `jit=${jit >= 0 ? Math.round(jit * 1000) : '?'}ms cong=${this._congestion.toFixed(2)}`;
         if (this.onmessage && typeof this.onmessage['ui_sync'] === 'function') {
             this.onmessage['ui_sync']({ type: 'metrics', value: summary });
         }
@@ -1340,6 +1427,10 @@ export class VideoRTC extends HTMLElement {
     _revertToWarmMSE(why) {
         if (!this._rtcVideo && !this.pc) return;
         console.warn(`[VideoRTC:${this.clientId}] ${why}; reverting to warm MSE.`);
+        // [ADAPTIVE WATCHDOG] A revert = a doomed/abandoned RTC promote (the "futile RTC attempt is
+        // itself the additive load" case). Raise the decaying futility floor so that if the card
+        // re-probes quickly, the watchdog extension re-arms at once instead of from zero congestion.
+        this._rtcFutility = Math.min(1, this._rtcFutility + 0.5);
         this._clearRtcTimers();
         this._dropRtcOverlay();
         this.video.muted = this._mseWanted;

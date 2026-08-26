@@ -25,6 +25,19 @@
  *
  * CHANGELOG
  * ---------
+ * v14.6.9 — [DRIVER CHANGE, pin ?v=2.4.6 → 2.5.0 — needs a PWA hard reload] Strato-1: the MSE
+ *   no-data watchdog now SELF-ADAPTS. The driver derives a smoothed `congestion` score (rttExcess =
+ *   rtt − session-min-rtt, i.e. bufferbloat, reinforced by loss and by recent RTC-promote futility)
+ *   and EXTENDS the effective watchdog up to `mse_adapt_max_extend`× the base — never below it — but
+ *   only while an un-committed RTC probe is starving the warm MSE (negotiating/promoted). 'warm' /
+ *   'committed' keep the tight base, so a dead MSE-only stream is still reaped promptly. This makes
+ *   the high/low-band paths diverge from identical code (the substream keeps the base; the main
+ *   earns the extension) so the user no longer sets per-card timeouts by hand. Field-validated: the
+ *   mse_timeout:0 run proved the socket survives a 21s-rttExcess storm and converges to clean RTC —
+ *   the fixed 5s watchdog was the reconnect storm, not the cure. New per-card knobs (all optional,
+ *   defaults sane): `mse_adaptive` (false = classic fixed), `mse_adapt_rtt_excess`, `mse_adapt_loss`,
+ *   `mse_adapt_max_extend`, `mse_adapt_alpha`. `mse_timeout` remains the base/escape-hatch. The
+ *   driver `metrics` line now ends with `cong=N.NN`.
  * v14.6.8 — [card-only, no driver change] Lever B: `url_fullscreen` — a per-card hi-res stream
  *   shown ONLY in fullscreen, so the grid tile can run the light substream while fullscreen gets
  *   the full-resolution main. On the card-fullscreen path (desktop / Android PWA) entering
@@ -280,7 +293,7 @@
  *   _promoteShadowToMain().
  */
 
-import {VideoRTC} from './video-rtc.js?v=2.4.6';
+import {VideoRTC} from './video-rtc.js?v=2.5.0';
 import {DigitalPTZ} from './digital-ptz.js?v=3.3.0';
 // [SIDECAR INTEGRATION] Import the Interaction module.
 // This module handles legacy features (Shortcuts, PTZ, Styles) to keep the core driver clean.
@@ -440,7 +453,7 @@ class WebRTCCamera extends HTMLElement {
         // (correlates stream loss with the mobile app backgrounding / 5G handoff).
         this._logVisAbort = null;
 
-        console.info('[WebRTC Camera] v14.6.8');
+        console.info('[WebRTC Camera] v14.6.9');
     }
 
     setConfig(config) {
@@ -1602,6 +1615,22 @@ class WebRTCCamera extends HTMLElement {
         // takes effect on a card reload, no driver pin bump / service-worker hard reload needed.
         const mseTimeout = Number(effectiveConfig.mse_timeout);
         if (Number.isFinite(mseTimeout) && mseTimeout >= 0) newDriver.DISCONNECT_TIMEOUT = mseTimeout;
+        // [TUNABLE] Adaptive MSE watchdog (Strato-1, driver v2.5.0). The watchdog above self-adapts:
+        // it EXTENDS (never shortens) up to `mse_adapt_max_extend`× the base while an RTC probe is
+        // congesting the warm MSE, driven by rttExcess/loss. These knobs exist for tuning even
+        // though the loop auto-adapts; the driver defaults are sane. `mse_adaptive: false` pins the
+        // classic fixed watchdog. Driver change → served under the bumped ?v=2.5.0 pin.
+        if (effectiveConfig.mse_adaptive !== undefined) {
+            newDriver.ADAPTIVE_WATCHDOG = effectiveConfig.mse_adaptive !== false;
+        }
+        const adaptRttExcess = Number(effectiveConfig.mse_adapt_rtt_excess);
+        if (Number.isFinite(adaptRttExcess) && adaptRttExcess > 0) newDriver.ADAPT_RTT_EXCESS_MS = adaptRttExcess;
+        const adaptLoss = Number(effectiveConfig.mse_adapt_loss);
+        if (Number.isFinite(adaptLoss) && adaptLoss > 0) newDriver.ADAPT_LOSS_PCT = adaptLoss;
+        const adaptMaxExtend = Number(effectiveConfig.mse_adapt_max_extend);
+        if (Number.isFinite(adaptMaxExtend) && adaptMaxExtend >= 1) newDriver.ADAPT_MAX_EXTEND = adaptMaxExtend;
+        const adaptAlpha = Number(effectiveConfig.mse_adapt_alpha);
+        if (Number.isFinite(adaptAlpha) && adaptAlpha > 0 && adaptAlpha <= 1) newDriver.ADAPT_EWMA_ALPHA = adaptAlpha;
 
         // Network strict mode propagates directly to the driver.
         newDriver.strictMode =
