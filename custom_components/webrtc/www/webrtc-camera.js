@@ -25,6 +25,14 @@
  *
  * CHANGELOG
  * ---------
+ * v14.6.8 — [card-only, no driver change] Lever B: `url_fullscreen` — a per-card hi-res stream
+ *   shown ONLY in fullscreen, so the grid tile can run the light substream while fullscreen gets
+ *   the full-resolution main. On the card-fullscreen path (desktop / Android PWA) entering
+ *   fullscreen cold-restarts the driver onto `url_fullscreen` and exiting reverts to the configured
+ *   substream — fullscreen lives on the .card container, not the <video>, so the inner driver can
+ *   be swapped without leaving fullscreen. The iOS webkit path (fullscreen bound to the <video>)
+ *   keeps the substream upscaled — a swap there would drop out of fullscreen. Example:
+ *   `url: cam_sub` + `url_fullscreen: cam`. No driver change (pin stays ?v=2.4.6).
  * v14.6.7 — [card-only, no driver change] New per-card tunable `mse_timeout` (ms): exposes the
  *   driver's MSE no-data watchdog (`DISCONNECT_TIMEOUT`, default 5000) as YAML config. The watchdog
  *   is fed by binary WS bytes = MSE liveness only, so it governs how long a stalled MSE stream is
@@ -317,6 +325,10 @@ class WebRTCCamera extends HTMLElement {
         // without disturbing the active playback.
         this.shadowDriver = null;
 
+        // [B / url_fullscreen] When non-null ({url}), forces the high-res stream while the card
+        // is fullscreen. Merged over the effective config in startStream(); cleared on exit.
+        this._fsStreamOverride = null;
+
         // [SIDECAR INTEGRATION] Reference to the UI Sidecar.
         // This object manages buttons, styles and mechanical PTZ logic.
         this.interaction = null;
@@ -428,7 +440,7 @@ class WebRTCCamera extends HTMLElement {
         // (correlates stream loss with the mobile app backgrounding / 5G handoff).
         this._logVisAbort = null;
 
-        console.info('[WebRTC Camera] v14.6.7');
+        console.info('[WebRTC Camera] v14.6.8');
     }
 
     setConfig(config) {
@@ -1485,7 +1497,10 @@ class WebRTCCamera extends HTMLElement {
         // Resolve the effective stream configuration.
         // Stream-specific overrides are merged here only.
         const currentStream = this.config.streams[this.streamID] || {};
-        const effectiveConfig = {...this.config, ...currentStream};
+        // [B / url_fullscreen] While a fullscreen hi-res swap is active, `_fsStreamOverride`
+        // forces the high-res `url` on top of the normal stream so the SAME driver machinery
+        // (mode/RTC/tunables/adaptive watchdog) runs against the main stream. Cleared on exit.
+        const effectiveConfig = {...this.config, ...currentStream, ...(this._fsStreamOverride || {})};
 
         // [SEAMLESS HANDOVER] Decision Logic
         // If we already have a working driver (this.driver), we are initiating a "Shadow Upgrade".
@@ -2440,12 +2455,58 @@ class WebRTCCamera extends HTMLElement {
         // browser autoplay policy allows the unmute.
         if (this.config.unmute_in_fullscreen === true) this._unmuteWhileFullscreen(video);
         if (video.webkitEnterFullscreen) {
+            // [B / url_fullscreen] iOS binds fullscreen to THIS <video> element. Swapping the
+            // stream cold-restarts the driver, which tears the element down and drops out of
+            // fullscreen — so the hi-res swap is NOT applied on the webkit path; iOS shows the
+            // substream upscaled. (A gesture-preserving pre-swap is a possible follow-up.)
             video.webkitEnterFullscreen();
         } else {
             const card = this.shadowRoot.querySelector('.card');
-            if (card.requestFullscreen) card.requestFullscreen();
-            else if (video.requestFullscreen) video.requestFullscreen();
+            if (card.requestFullscreen) {
+                // Fullscreen lives on the .card CONTAINER, not the inner <video>, so we can
+                // cold-restart the driver onto the hi-res `url_fullscreen` and revert on exit
+                // without ever leaving fullscreen. This is the primary (desktop / Android PWA) path.
+                const p = card.requestFullscreen();
+                if (this.config.url_fullscreen) {
+                    Promise.resolve(p)
+                        .then(() => { this._applyFullscreenStream(true); this._watchFullscreenExit(); })
+                        .catch(() => { /* fullscreen denied — stay on the substream */ });
+                }
+            } else if (video.requestFullscreen) {
+                video.requestFullscreen();   // fullscreen bound to <video>; no swap (see webkit note)
+            }
         }
+    }
+
+    // [B / url_fullscreen] Swap the live stream to the high-res `url_fullscreen` (on=true) or back
+    // to the configured substream (on=false) by cold-restarting the driver with `_fsStreamOverride`
+    // applied in startStream(). No-op when `url_fullscreen` is unset or already in the target state.
+    _applyFullscreenStream(on) {
+        const hd = this.config.url_fullscreen;
+        if (!hd) return;
+        if (on) {
+            if (this._fsStreamOverride) return;             // already on hi-res
+            this._fsStreamOverride = {url: hd, entity: undefined};
+        } else {
+            if (!this._fsStreamOverride) return;            // already on the substream
+            this._fsStreamOverride = null;
+        }
+        // Cold restart (not a shadow upgrade) so the swap is a clean single negotiation.
+        this._isReconnecting = false;
+        this._cleanupDriver();
+        this.startStream();
+    }
+
+    // [B / url_fullscreen] One-shot listener: when fullscreen ends (no fullscreenElement) revert
+    // the stream to the substream. Paired with the swap in requestFullscreen (card path only).
+    _watchFullscreenExit() {
+        const onFsChange = () => {
+            if (!document.fullscreenElement) {
+                document.removeEventListener('fullscreenchange', onFsChange);
+                this._applyFullscreenStream(false);
+            }
+        };
+        document.addEventListener('fullscreenchange', onFsChange);
     }
 
     // #953: unmute the given video now and restore its previous (muted) state when
