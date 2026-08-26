@@ -25,6 +25,14 @@
  *
  * CHANGELOG
  * ---------
+ * v14.6.12 — [DRIVER CHANGE, pin ?v=2.7.0 → 2.7.1 — needs a PWA hard reload] Observability. The driver's
+ *   RTC revert now carries its REASON on the `rtc_failed` signal (`detail`); the card mirrors it to the HA
+ *   log as `rtc-revert: <why>`. Field logs previously showed every revert — a step-3 abort, a stall, a
+ *   firstframe timeout, an ICE drop — as an identical bare `mode: rtc -> mse`, so we could not confirm from
+ *   HA logs whether/why an abort fired (the reason was client-console only). Now `rtc-revert` self-identifies
+ *   (e.g. "RTC aborted: pathological path (rtt=…, jbuf=… sustained)"), on both the main and shadow paths.
+ *   Name-keyed throttle: first revert lands live, a burst collapses to "(repeated N×)" — flood-safe under
+ *   the red/green ping-pong storm. No behaviour change; diagnosis only.
  * v14.6.11 — [DRIVER CHANGE, pin ?v=2.6.0 → 2.7.0 — needs a PWA hard reload] Two changes.
  *   (1) [Strato-1 step 3] RTC ABORT propagation. The v2.7.0 driver gives up a non-committing RTC probe
  *   that holds a pathological jitter-buffer/RTT reading (measured cause of the direct-4G collapse =
@@ -318,7 +326,7 @@
  *   _promoteShadowToMain().
  */
 
-import {VideoRTC} from './video-rtc.js?v=2.7.0';
+import {VideoRTC} from './video-rtc.js?v=2.7.1';
 import {DigitalPTZ} from './digital-ptz.js?v=3.3.0';
 // [SIDECAR INTEGRATION] Import the Interaction module.
 // This module handles legacy features (Shortcuts, PTZ, Styles) to keep the core driver clean.
@@ -478,7 +486,7 @@ class WebRTCCamera extends HTMLElement {
         // (correlates stream loss with the mobile app backgrounding / 5G handoff).
         this._logVisAbort = null;
 
-        console.info('[WebRTC Camera] v14.6.11');
+        console.info('[WebRTC Camera] v14.6.12');
     }
 
     setConfig(config) {
@@ -1014,6 +1022,12 @@ class WebRTCCamera extends HTMLElement {
             // schedule the next attempt. rtc_rejected (a quality decision) is stable for this
             // connection, so stop reprobing; rtc_failed is a transient failure worth retrying.
             if (msg.value === 'rtc_failed' || msg.value === 'rtc_rejected') {
+                // [OBSERVABILITY, v14.6.12] Mirror the shadow probe's revert reason (abort/stall/
+                // ICE) to the HA log, same as the main path — otherwise a shadow step-3 abort is
+                // invisible (the shadow never touches the visible mode line).
+                if (msg.value === 'rtc_failed' && msg.detail) {
+                    this._logHA('warning', 'rtc-revert', msg.detail);
+                }
                 this._nukeDriver(newDriver, 'Unproven Shadow');
                 this.shadowDriver = null;
                 if (this._shadowTimeout) {
@@ -1064,6 +1078,13 @@ class WebRTCCamera extends HTMLElement {
                     : 'WebRTC upgrade discarded by driver (Quality < MSE)';
                 console.debug(`[WebRTC Camera] ${reason}. Cancelling upgrade.`);
                 this.setStatus(null, null, reason);
+
+                // [OBSERVABILITY, v14.6.12] Mirror the driver's revert REASON to the HA log. The
+                // `mode: rtc -> mse` line that follows says a revert happened but not why; the detail
+                // string self-identifies the cause — a step-3 abort ("RTC aborted: pathological
+                // path …"), a stall, a firstframe timeout or an ICE drop — so field logs are
+                // diagnosable without the client console. Throttled by event name in _logHA.
+                if (msg.detail) this._logHA('warning', 'rtc-revert', msg.detail);
 
                 // [RTC RE-PROBE / OPTION 3] rtc_failed means the main's own WebRTC attempt has
                 // actually given up: arm the backed-off loop here. rtc_rejected is a deliberate

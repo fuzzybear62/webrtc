@@ -4,6 +4,7 @@
  * Derived from AlexxIT/WebRTC. Licensed under the MIT License — see LICENSE.
  */
 /**
+ * VideoRTC v2.7.1 - carry the revert REASON on the rtc_failed signal so the card mirrors it to HA
  * VideoRTC v2.7.0 - Strato-1 step 3: abort a doomed RTC probe on absolute jbuf/RTT ceilings
  * * Changelog v2.7.0:
  * - STRATO-1 STEP 3 — RTC ABORT on a pathological path. The v2.5.0 adaptive watchdog EXTENDS
@@ -1258,11 +1259,13 @@ export class VideoRTC extends HTMLElement {
                 // Drop ONLY WebRTC and let MSE keep playing; a real MSE stall is caught
                 // by the no-data watchdog. Signal the card so it can retry the upgrade
                 // later with a freshly gathered ICE path.
-                console.debug(`[VideoRTC:${this.clientId}] WebRTC ${why}; keeping active MSE stream.`);
+                const reason = `WebRTC ${why}`;
+                console.debug(`[VideoRTC:${this.clientId}] ${reason}; keeping active MSE stream.`);
                 pc.close();
                 this.pc = null;
                 if (this.onmessage && typeof this.onmessage['ui_sync'] === 'function') {
-                    this.onmessage['ui_sync']({ type: 'signal', value: 'rtc_failed' });
+                    // v14.6.12: carry the reason (see _revertToWarmMSE) so the card mirrors it to HA.
+                    this.onmessage['ui_sync']({ type: 'signal', value: 'rtc_failed', detail: reason });
                 }
             } else {
                 // (b) No MSE fallback (e.g. pure RTC after a successful handover).
@@ -1591,7 +1594,11 @@ export class VideoRTC extends HTMLElement {
         if (this.pc) { this.pc.close(); this.pc = null; }
         this._setPhase('warm');
         if (this.onmessage && typeof this.onmessage['ui_sync'] === 'function') {
-            this.onmessage['ui_sync']({ type: 'signal', value: 'rtc_failed' });
+            // v14.6.12: carry the reason so the card can mirror it to the HA log. Without this a
+            // step-3 abort, a stall revert and an ICE-drop all showed as a bare `mode: rtc -> mse`
+            // — indistinguishable in a field log. `detail` self-identifies the abort ("RTC aborted:
+            // pathological path (rtt=…, jbuf=… sustained)") and every other revert cause.
+            this.onmessage['ui_sync']({ type: 'signal', value: 'rtc_failed', detail: why });
         }
     }
 
