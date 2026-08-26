@@ -25,6 +25,16 @@
  *
  * CHANGELOG
  * ---------
+ * v14.6.13 — [DRIVER CHANGE, pin ?v=2.7.1 → 2.8.0 — needs a PWA hard reload] Alg.1, early band classifier
+ *   (first step of the self-configuring rework: parameters like `mse_timeout` must NOT be a user's job, and
+ *   one card must work on both 4G and wide-band). Field analysis (2026-08-26) established that the driver's
+ *   instrumentation already tells a PERFORMANT link from a non-performant one within ~2s of a probe. The
+ *   driver now folds the per-poll RTT + short-window loss ALREADY harvested for the metrics line into a live
+ *   verdict — 'perf' | 'degr' | 'path' — surfaced as `band=` on the metrics line. OBSERVE-ONLY: no stream
+ *   decision keys on it yet — this ships the instrument so its thresholds can be validated against real
+ *   4G/LAN logs BEFORE Alg.2 (serialized ramp) and Alg.3 (class-driven commit) consume it; at that point the
+ *   blind step-3 abort it supersedes is removed. No new YAML knobs (thresholds stay internal, by design). No
+ *   card behaviour change.
  * v14.6.12 — [DRIVER CHANGE, pin ?v=2.7.0 → 2.7.1 — needs a PWA hard reload] Observability. The driver's
  *   RTC revert now carries its REASON on the `rtc_failed` signal (`detail`); the card mirrors it to the HA
  *   log as `rtc-revert: <why>`. Field logs previously showed every revert — a step-3 abort, a stall, a
@@ -326,7 +336,7 @@
  *   _promoteShadowToMain().
  */
 
-import {VideoRTC} from './video-rtc.js?v=2.7.1';
+import {VideoRTC} from './video-rtc.js?v=2.8.0';
 import {DigitalPTZ} from './digital-ptz.js?v=3.3.0';
 // [SIDECAR INTEGRATION] Import the Interaction module.
 // This module handles legacy features (Shortcuts, PTZ, Styles) to keep the core driver clean.
@@ -486,7 +496,7 @@ class WebRTCCamera extends HTMLElement {
         // (correlates stream loss with the mobile app backgrounding / 5G handoff).
         this._logVisAbort = null;
 
-        console.info('[WebRTC Camera] v14.6.12');
+        console.info('[WebRTC Camera] v14.6.13');
     }
 
     setConfig(config) {

@@ -4,6 +4,9 @@
  * Derived from AlexxIT/WebRTC. Licensed under the MIT License — see LICENSE.
  */
 /**
+ * VideoRTC v2.8.0 - [Alg.1] early band classifier: fold the per-poll RTT/loss already harvested for
+ *   the metrics line into a live 'perf'|'degr'|'path' verdict (~2s), surfaced as `band=` (OBSERVE-ONLY;
+ *   Alg.2/3 will consume _bandClass and retire the blind step-3 abort). See webrtc-mse-timeout-zero memory.
  * VideoRTC v2.7.1 - carry the revert REASON on the rtc_failed signal so the card mirrors it to HA
  * VideoRTC v2.7.0 - Strato-1 step 3: abort a doomed RTC probe on absolute jbuf/RTT ceilings
  * * Changelog v2.7.0:
@@ -453,6 +456,34 @@ export class VideoRTC extends HTMLElement {
         this.RTC_ABORT_FUTILITY_K = 0.5; // futility [0,1] shortens the hold toward HOLD*(1-K)
         this._abortSince = 0;            // Date.now() the pathological reading first went bad (0 = clear)
 
+        // [EARLY BAND CLASSIFIER — Alg.1, v2.8.0] The self-configuring rework's foundation. The
+        // reactive levers above (adaptive-watchdog EXTEND, step-3 ABORT) treat SYMPTOMS after a doomed
+        // promote has already loaded the link; field analysis (2026-08-26, see
+        // webrtc-mse-timeout-zero-validation memory) showed the instrumentation already tells a
+        // PERFORMANT link from a non-performant one within ~2s of a probe. This classifier folds the
+        // per-poll signals ALREADY harvested for the metrics line (instantaneous candidate-pair RTT,
+        // rttExcess over session-min, short-window loss%) into a live verdict — 'perf' | 'degr' | 'path'
+        // — after BAND_CLASSIFY_MS of samples, then keeps it updated every poll. It runs ONLY while an
+        // un-committed probe is live (negotiating/promoted); '' otherwise. OBSERVE-FIRST: for now it only
+        // surfaces `band=` on the metrics line so we can validate the thresholds against real 4G/LAN logs
+        // BEFORE any decision keys on it. Alg.2 (serialized ramp) and Alg.3 (class-driven commit) will
+        // consume `this._bandClass` next, at which point the blind step-3 abort it supersedes is removed.
+        // Thresholds are seeded from the field logs (pathological direct-4G: RTT→seconds and/or loss
+        // 16-24%; performant LAN/CF-tunnel: RTT 2-130ms, loss 0%) — NOT user knobs (the goal is to
+        // eliminate YAML tuning, so these stay internal and will become path-percentile-derived in Alg.4).
+        this.BAND_CLASSIFY_MS = 2000;    // min observation before the first verdict (the user's "~2s")
+        this.BAND_GOOD_RTT_MS = 200;     // RTT (ms) at/below which, with low loss, the link is 'perf'
+        this.BAND_GOOD_LOSS_PCT = 3;     // loss (%) below which, with low RTT, the link is 'perf'
+        this.BAND_PATH_RTT_MS = 1500;    // RTT (ms) at/above which the link is 'path' (bufferbloat)
+        this.BAND_PATH_LOSS_PCT = 15;    // loss (%) at/above which the link is 'path' (lossy path)
+        this.BAND_EWMA_ALPHA = 0.4;      // rtt/loss EWMA smoothing (twitchy enough to converge by ~2s)
+        this._bandClass = '';            // '' (not probing) | 'perf' | 'degr' | 'path'
+        this._bandT0 = 0;                // Date.now() the current probe's classification window opened
+        this._bandRtt = -1;              // EWMA of instantaneous RTT (ms); -1 = no sample yet
+        this._bandLoss = -1;             // EWMA of short-window loss (%); -1 = no sample yet
+        this._bandLastLost = -1;         // previous packetsLost  (per-poll delta -> short-window loss%)
+        this._bandLastRecv = -1;         // previous packetsReceived (per-poll delta -> short-window loss%)
+
         // List of supported codecs to announce to the server
         this.CODECS = [
             'avc1.640029', 'avc1.64002A', 'avc1.640033', 'hvc1.1.6.L153.B0',
@@ -831,6 +862,51 @@ export class VideoRTC extends HTMLElement {
     }
 
     /**
+     * [EARLY BAND CLASSIFIER — Alg.1] Fold one 500ms poll sample into the live band verdict. Runs
+     * only while an un-committed probe is live (negotiating/promoted); the caller resets state via
+     * `_resetBandClassifier()` at probe start and on leaving the probe. RTT is the instantaneous
+     * candidate-pair value (no delta); loss is a per-poll delta over packetsLost/packetsReceived.
+     * Both feed a fast EWMA so a verdict lands by ~BAND_CLASSIFY_MS and then tracks the link live as
+     * a promote loads it. Verdict precedence: 'path' (either signal past its pathological ceiling)
+     * dominates, else 'perf' (both signals healthy), else 'degr'. Before the window elapses the class
+     * stays '' (not yet decided). rttMs/lostCount/recvCount: -1 = no sample. Pure classification —
+     * OBSERVE-ONLY for now (surfaced on the metrics line); no stream decision keys on it yet.
+     */
+    _classifyBand(rttMs, lostCount, recvCount) {
+        const a = this.BAND_EWMA_ALPHA;
+        if (rttMs >= 0) this._bandRtt = this._bandRtt < 0 ? rttMs : a * rttMs + (1 - a) * this._bandRtt;
+        if (lostCount >= 0 && recvCount >= 0 && this._bandLastLost >= 0 && this._bandLastRecv >= 0) {
+            const dLost = Math.max(0, lostCount - this._bandLastLost);
+            const dRecv = Math.max(0, recvCount - this._bandLastRecv);
+            if (dLost + dRecv > 0) {
+                const lp = 100 * dLost / (dLost + dRecv);
+                this._bandLoss = this._bandLoss < 0 ? lp : a * lp + (1 - a) * this._bandLoss;
+            }
+        }
+        if (lostCount >= 0) this._bandLastLost = lostCount;
+        if (recvCount >= 0) this._bandLastRecv = recvCount;
+        // Hold the verdict until we have both a starting timestamp and BAND_CLASSIFY_MS of samples.
+        if (!this._bandT0 || Date.now() - this._bandT0 < this.BAND_CLASSIFY_MS) return;
+        const rtt = this._bandRtt, loss = this._bandLoss;
+        const pathBad = (rtt >= 0 && rtt >= this.BAND_PATH_RTT_MS) ||
+                        (loss >= 0 && loss >= this.BAND_PATH_LOSS_PCT);
+        const good = rtt >= 0 && rtt < this.BAND_GOOD_RTT_MS &&
+                     (loss < 0 || loss < this.BAND_GOOD_LOSS_PCT);
+        this._bandClass = pathBad ? 'path' : good ? 'perf' : 'degr';
+    }
+
+    /** [EARLY BAND CLASSIFIER — Alg.1] Arm/clear the classifier. Called with `true` when a probe's
+     *  classification window opens (phase -> negotiating) and `false` on leaving the probe. */
+    _resetBandClassifier(arm) {
+        this._bandClass = '';
+        this._bandT0 = arm ? Date.now() : 0;
+        this._bandRtt = -1;
+        this._bandLoss = -1;
+        this._bandLastLost = -1;
+        this._bandLastRecv = -1;
+    }
+
+    /**
      * [ADAPTIVE WATCHDOG] The live no-data timeout: the base (this.DISCONNECT_TIMEOUT, i.e. the
      * per-card `mse_timeout` or the 5s default) EXTENDED by up to ADAPT_MAX_EXTEND× in proportion
      * to smoothed congestion — but ONLY while an un-committed RTC probe is live (negotiating /
@@ -901,7 +977,7 @@ export class VideoRTC extends HTMLElement {
             `loss=${lossPct >= 0 ? lossPct.toFixed(1) : '?'}% gp=${gp >= 0 ? gp.toFixed(0) : '?'}kb/s ` +
             `jit=${jit >= 0 ? Math.round(jit * 1000) : '?'}ms cong=${this._congestion.toFixed(2)} ` +
             `jbuf=${jbufMs >= 0 ? jbufMs : '?'}ms nack=${dNack >= 0 ? dNack : '?'} ` +
-            `pkt=${pktB >= 0 ? pktB : '?'}B path=${path || '?'}`;
+            `pkt=${pktB >= 0 ? pktB : '?'}B path=${path || '?'} band=${this._bandClass || '?'}`;
         if (this.onmessage && typeof this.onmessage['ui_sync'] === 'function') {
             this.onmessage['ui_sync']({ type: 'metrics', value: summary });
         }
@@ -1484,6 +1560,10 @@ export class VideoRTC extends HTMLElement {
                     mPath = `${lc ? lc.t : '?'}/${rc ? rc.t : '?'}/${proto}`;
                 }
                 this._sampleMetrics(mBytes, mRecv, mLost, mJit, mRtt, mJbDelay, mJbEmit, mNack, mPath);
+                // [EARLY BAND CLASSIFIER — Alg.1] Runs on the full 500ms poll cadence (not the 3s
+                // metrics emit) so the verdict converges by ~BAND_CLASSIFY_MS; _setPhase gates its
+                // lifetime, so a no-op outside negotiating/promoted is a stale-but-harmless '' class.
+                this._classifyBand(mRtt >= 0 ? Math.round(mRtt * 1000) : -1, mLost, mRecv);
                 if (fd < 0) return;
                 const advanced = lastDecoded >= 0 && fd > lastDecoded;
                 lastDecoded = fd;
@@ -1556,6 +1636,12 @@ export class VideoRTC extends HTMLElement {
         if (this._rtcPhase === next) return;
         console.debug(`[VideoRTC:${this.clientId}] RTC phase ${this._rtcPhase} -> ${next}`);
         this._rtcPhase = next;
+        // [EARLY BAND CLASSIFIER — Alg.1] The classification window spans the un-committed probe:
+        // arm it as negotiating opens, keep it running through promoted, clear it once the probe
+        // leaves (warm = reverted/rejected, committed = MSE released). Central here so every edge
+        // routes through one place.
+        if (next === 'negotiating') this._resetBandClassifier(true);
+        else if (next === 'warm' || next === 'committed') this._resetBandClassifier(false);
     }
 
     /** [REVERSIBLE HANDOFF] Clear the promotion/liveness/commit timers. */
