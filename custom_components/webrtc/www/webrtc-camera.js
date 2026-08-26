@@ -25,6 +25,14 @@
  *
  * CHANGELOG
  * ---------
+ * v14.6.19 — [CARD-ONLY, driver pin unchanged at ?v=2.12.1] network dot: paint RED while the narrow-link
+ *   RTC-suppression latch is engaged. The band verdict only exists while an RTC probe polls; on a genuinely
+ *   bad link the probe dies ~6s and the camera sits in MSE-only, so band samples stop and the dot decayed to
+ *   WHITE exactly when the network was worst (observed on the bad-4G log: "il pallino è quasi sempre bianco").
+ *   `_paintNetDot` now gives the `_rtcSuppressed` latch precedence over the (absent) band signal → RED = link
+ *   too narrow for RTC, MSE-only. Painted at latch engage / release / manual-refresh reset; the staleness
+ *   sweep already routes through the same helper, so RED survives band going stale. Dot legend now: green =
+ *   RTC in form, yellow = degraded, RED = path OR MSE-only-suppressed, white = startup/idle only.
  * v14.6.18 — [DRIVER CHANGE, pin ?v=2.12.0 → 2.12.1 — needs a PWA hard reload] Alg.4.1: fix the LAN
  *   regression. The v2.12.0 band primitive (bufferbloat INFLATION = rttEwma / session-min RTT) is scale-
  *   free and EXPLODES at a tiny LAN baseline (min 2-3ms): a few ms of harmless jitter (2ms→7ms) fabricated
@@ -554,7 +562,7 @@ class WebRTCCamera extends HTMLElement {
         // (correlates stream loss with the mobile app backgrounding / 5G handoff).
         this._logVisAbort = null;
 
-        console.info('[WebRTC Camera] v14.6.18');
+        console.info('[WebRTC Camera] v14.6.19');
     }
 
     setConfig(config) {
@@ -1498,6 +1506,7 @@ class WebRTCCamera extends HTMLElement {
             const why = severe ? `loss ${this._lastLossPct.toFixed(0)}%` : `${this._flapScore.toFixed(1)} flaps`;
             this._logHA('warning', 'rtc-suppressed',
                 `link narrow (${why}) — MSE-only, re-test in ${Math.round(this.RTC_RETEST_MS / 1000)}s`);
+            this._paintNetDot();       // MSE-only forced → dot RED even with no live band signal
         }
     }
 
@@ -1513,6 +1522,7 @@ class WebRTCCamera extends HTMLElement {
         this._flapScore = 0;
         this._flapLast = 0;
         this._logHA('debug', 'rtc-retest', 'suppression window elapsed — re-testing full mode');
+        this._paintNetDot();           // latch cleared → drop RED, fall back to live band/white
     }
 
     // [A0] Remove 'webrtc' from a mode list, never yielding an empty mode.
@@ -1583,6 +1593,7 @@ class WebRTCCamera extends HTMLElement {
         this._flapLast = 0;
         this._lastLossPct = 0;
         this._lastLossAt = 0;
+        this._paintNetDot();           // latch cleared on manual refresh → drop RED
 
         // 5. Force UI Feedback
         const spinner = this.shadowRoot.querySelector('.spinner');
@@ -2512,13 +2523,17 @@ class WebRTCCamera extends HTMLElement {
         }
     }
 
-    // Paint the opt-in network-state dot from `_lastBand` ('' | perf | degr | path). White (no class)
-    // = no fresh band sample. Safe to call when the dot is absent (indicator off / not yet rendered).
+    // Paint the opt-in network-state dot. Precedence: a narrow-link SUPPRESSION latch forces RED
+    // (`path`) — MSE-only is a strong "network bad" verdict and it is exactly the window where the
+    // band signal falls silent (no RTC probe → no metrics), so without this the dot would decay to
+    // white precisely when the link is worst. Otherwise a fresh band verdict paints its colour, and
+    // white (no class) means genuinely no reading (startup/idle). Safe when the dot is absent.
     _paintNetDot() {
         const dot = this.shadowRoot && this.shadowRoot.querySelector('.net-dot');
         if (!dot) return;
         dot.classList.remove('perf', 'degr', 'path');
-        if (this._lastBand) dot.classList.add(this._lastBand);
+        const cls = this._rtcSuppressed ? 'path' : this._lastBand;
+        if (cls) dot.classList.add(cls);
     }
 
     // Normalize a user-supplied `ice_servers` config. Returns:
