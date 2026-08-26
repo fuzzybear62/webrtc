@@ -4,6 +4,13 @@
  * Derived from AlexxIT/WebRTC. Licensed under the MIT License — see LICENSE.
  */
 /**
+ * VideoRTC v2.10.0 - [Alg.2] cross-grid RTC probe serializer: one module-level single-flight gate
+ *   (_rtcProbeGate), shared by EVERY VideoRTC on the page (each card's main driver + its shadow), so at
+ *   most ONE RTC ramp runs at a time. Bounds the collective double-load peak to MSE(all)+RTC(one) instead
+ *   of MSE(all)+RTC(N), killing the simultaneous-GCC-ramp "bufferbloat storm" seen in the direct-4G logs.
+ *   The token is held from offer (onwebrtc) until the earliest of: promote-settle (RTC_GATE_SETTLE_MS
+ *   gapless — ramp plateaued), warm/committed, any failWebRTC path, or a LEASE_MS backstop. MSE stays
+ *   flowing while a camera waits, so queueing adds ZERO load. See webrtc-mobile-collapse memory.
  * VideoRTC v2.9.0 - [Alg.3] class-driven RTC abort: a leaky asymmetric accumulator (_bandBadMs) integrates
  *   the Alg.1 band verdict (+poll on 'path', hold on 'degr', bleed on 'perf') and aborts once it crosses the
  *   futility-shortened hold. RETIRES the blind jbuf/RTT-ceiling abort (loss-blind) and its dead mse_abort_*
@@ -290,6 +297,66 @@
  * * Changelog v2.2.9:
  * - FIX: Renamed 'this.id' to 'this.clientId' to avoid DOM conflict.
  */
+
+/**
+ * [RTC PROBE SERIALIZER — Alg.2] One module-level, cross-instance single-flight gate for the
+ * WebRTC bandwidth-hungry RAMP. EVERY VideoRTC on the page — each card's main driver AND its
+ * background shadow — shares this one coordinator, so at most ONE RTC probe is ramping at any
+ * instant. Why: N cameras promoting RTC ~simultaneously each fire an uncoordinated GCC bitrate
+ * ramp; on one constrained 4G uplink the N ramps overshoot together → a grid-wide RTT balloon
+ * (the "bufferbloat storm" seen in the direct-4G field logs). Serializing the ramps bounds the
+ * collective peak to MSE(all)+RTC(one) instead of MSE(all)+RTC(N) and lets each GCC probe find
+ * its ceiling alone.
+ *
+ * A holder keeps the token from the offer (onwebrtc) until the EARLIEST of:
+ *   - promote settles  — RTC_GATE_SETTLE_MS gapless in 'promoted': GCC has plateaued, so the
+ *                        next camera may ramp WITHOUT waiting the full RTC_COMMIT_MS to commit,
+ *   - revert / reject  — _setPhase('warm')      (probe gone),
+ *   - commit           — _setPhase('committed') (MSE released; path plateaued long ago),
+ *   - a dying probe    — any failWebRTC path (fast ICE fail / offer rejected),
+ *   - lease timeout    — LEASE_MS backstop, so a connected-but-frozen probe can't wedge the grid
+ *                        until its 120s give-up fires.
+ * MSE (onmse) starts unblocked in onconnect and keeps flowing the whole time a camera waits, so a
+ * queued camera adds ZERO extra load — it just keeps showing warm MSE until its turn to ramp.
+ */
+const _rtcProbeGate = {
+    holder: null,       // the VideoRTC instance currently allowed to ramp, or null
+    queue: [],          // FIFO of { driver, resolve } waiting their turn
+    leaseTID: 0,        // force-release backstop for the current holder
+    LEASE_MS: 20000,    // hard cap on any single hold (comfortably above RTC_GATE_SETTLE_MS,
+                        // far below the 120s FIRSTFRAME give-up so a frozen probe can't wedge us)
+
+    /** Await our turn to ramp. Resolves immediately when the gate is free. */
+    acquire(driver) {
+        return new Promise(resolve => {
+            if (!this.holder) this._grant(driver, resolve);
+            else if (this.holder === driver) resolve();        // re-entrant: already ours
+            else this.queue.push({ driver, resolve });
+        });
+    },
+
+    /** Give up the token, or leave the queue if not yet holder. Idempotent. */
+    release(driver) {
+        const qi = this.queue.findIndex(w => w.driver === driver);
+        if (qi !== -1) this.queue.splice(qi, 1);               // torn down before its turn
+        if (this.holder !== driver) return;
+        if (this.leaseTID) { clearTimeout(this.leaseTID); this.leaseTID = 0; }
+        this.holder = null;
+        const next = this.queue.shift();
+        if (next) this._grant(next.driver, next.resolve);
+    },
+
+    _grant(driver, resolve) {
+        this.holder = driver;
+        this.leaseTID = setTimeout(() => {
+            console.warn(`[VideoRTC:${driver.clientId}] RTC probe gate lease expired (${this.LEASE_MS}ms) — releasing to unblock the grid.`);
+            this.leaseTID = 0;
+            this.release(driver);
+        }, this.LEASE_MS);
+        resolve();
+    },
+};
+
 export class VideoRTC extends HTMLElement {
     constructor() {
         super();
@@ -388,6 +455,12 @@ export class VideoRTC extends HTMLElement {
         // only to fall back seconds later; 30s doubles the evidence window (zero effect on good
         // nets, which never use the swap). Overridable per-card via `rtc_swap_prove_ms` (ms).
         this.RTC_SWAP_PROVE_MS = 30000;
+        // [RTC SERIALIZER — Alg.2] GAPLESS time in 'promoted' after which the probe's GCC ramp has
+        // plateaued, so the cross-instance _rtcProbeGate token is handed to the NEXT camera — we do
+        // NOT hold it for the full 180s commit, which would serialize a good wideband grid at
+        // 180s/camera. ~8s covers a typical GCC ramp-to-plateau; on a bad path Alg.3 aborts in ~6s
+        // and releases even sooner. Tunable.
+        this.RTC_GATE_SETTLE_MS = 8000;
 
         this._lastLiveness = 0;    // Date.now() of the last framesDecoded advance
         this._stableSince = 0;     // start of the current gapless run (drives the commit clock)
@@ -983,6 +1056,9 @@ export class VideoRTC extends HTMLElement {
      * The Destructor. Clean up ALL resources.
      */
     ondisconnect() {
+        // [RTC SERIALIZER — Alg.2] Leave the probe gate on teardown: drop from the queue if we
+        // were still waiting our turn, or release the token if we were the active ramp.
+        _rtcProbeGate.release(this);
         this._clearWatchdog();
         if (this._firstFrameTID) {
             clearTimeout(this._firstFrameTID);
@@ -1288,6 +1364,21 @@ export class VideoRTC extends HTMLElement {
      * Logic for WebRTC (UDP/TCP P2P Video)
      */
     onwebrtc() {
+        // [RTC PROBE SERIALIZER — Alg.2] Wait our turn before opening the pc or sending the offer,
+        // so at most one RTC ramp runs across the whole page. MSE already started unblocked in
+        // onconnect and keeps flowing while we wait, so a queued camera adds ZERO extra load. Only
+        // serialize when MSE is the parallel fallback: a webrtc-only stream has no double-load to
+        // prevent and must not wait behind other cameras' ramps for its ONLY video. If this driver
+        // is torn down while still queued, ondisconnect()/_revertToWarmMSE drop it from the queue.
+        if (!this.mode.includes('mse')) { this._openWebRTC(); return; }
+        _rtcProbeGate.acquire(this).then(() => {
+            if (!this.ws) { _rtcProbeGate.release(this); return; }  // torn down while queued
+            this._openWebRTC();
+        });
+    }
+
+    /** Open the WebRTC PeerConnection and send the offer. Gated by onwebrtc() via _rtcProbeGate. */
+    _openWebRTC() {
         const pc = new RTCPeerConnection(this.pcConfig);
 
         // [DIAGNOSTIC] When did this pc start negotiating? Lets the state log below
@@ -1306,6 +1397,12 @@ export class VideoRTC extends HTMLElement {
         // Tear down a WebRTC pc that could not deliver a usable stream. Two very
         // different situations, plus the shared first-frame-watchdog cleanup.
         const failWebRTC = (why) => {
+            // [RTC SERIALIZER — Alg.2] The probe is dying on EVERY failWebRTC path (pc failed,
+            // disconnected, offer rejected) — including a fast ICE failure that never reached the
+            // 'negotiating' phase, so no _setPhase('warm') would release it. Hand the token on now
+            // so it can't wedge the grid until the lease timeout. Idempotent with the release inside
+            // _revertToWarmMSE's _setPhase('warm') below.
+            _rtcProbeGate.release(this);
             // [REVERSIBLE HANDOFF] While the RTC overlay is live and MSE has not yet been
             // released, ANY failure (pc failed/disconnected, offer rejected) must snap back
             // to the warm MSE — dropping the overlay and restoring MSE audio — not just
@@ -1575,6 +1672,13 @@ export class VideoRTC extends HTMLElement {
                 } else if (advanced) {
                     this._lastLiveness = Date.now();
                     const gapless = Date.now() - this._stableSince;
+                    // [RTC SERIALIZER — Alg.2] Once promoted RTC has held gaplessly past the settle
+                    // window its GCC ramp has plateaued: hand the probe gate to the NEXT camera now,
+                    // rather than holding it the full RTC_COMMIT_MS. Guarded on holder===this so it's
+                    // a single cheap release, not a per-poll queue scan.
+                    if (_rtcProbeGate.holder === this && this._rtcPhase === 'promoted' && gapless >= this.RTC_GATE_SETTLE_MS) {
+                        _rtcProbeGate.release(this);
+                    }
                     // [SHADOW-SWAP GATE] Once RTC has held gaplessly for RTC_SWAP_PROVE_MS, emit
                     // a one-shot rtc_sustained. For a background shadow the card swaps it in here
                     // (never at the 2s promote) so the working MSE main is only replaced by a
@@ -1640,7 +1744,12 @@ export class VideoRTC extends HTMLElement {
         // leaves (warm = reverted/rejected, committed = MSE released). Central here so every edge
         // routes through one place.
         if (next === 'negotiating') this._resetBandClassifier(true);
-        else if (next === 'warm' || next === 'committed') this._resetBandClassifier(false);
+        else if (next === 'warm' || next === 'committed') {
+            this._resetBandClassifier(false);
+            // [RTC SERIALIZER — Alg.2] The probe has left the ramp (warm = reverted/rejected,
+            // committed = MSE released): release the gate so the next queued camera can ramp.
+            _rtcProbeGate.release(this);
+        }
     }
 
     /** [REVERSIBLE HANDOFF] Clear the promotion/liveness/commit timers. */

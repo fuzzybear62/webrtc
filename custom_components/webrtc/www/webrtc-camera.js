@@ -25,6 +25,17 @@
  *
  * CHANGELOG
  * ---------
+ * v14.6.15 — [DRIVER CHANGE, pin ?v=2.9.0 → 2.10.0 — needs a PWA hard reload] Alg.2, cross-grid RTC probe
+ *   serializer. One module-level single-flight gate in the driver (_rtcProbeGate), shared by every VideoRTC
+ *   on the page — each card's main driver AND its background shadow — so at most ONE RTC probe is ramping at
+ *   a time. This is the fix for the simultaneous-ramp "bufferbloat storm": N cameras promoting RTC at once
+ *   each fire an uncoordinated GCC bitrate ramp, and on one constrained 4G uplink the N ramps overshoot
+ *   together → a grid-wide RTT balloon (Alg.3 then aborts them all in a cascade). Serializing bounds the
+ *   double-load peak to MSE(all)+RTC(one) instead of MSE(all)+RTC(N). The token is held from the offer until
+ *   the earliest of: promote-settle (~8s gapless, GCC plateaued — the next camera ramps without waiting the
+ *   full 180s commit), warm/committed, any failWebRTC path, or a 20s lease backstop. MSE keeps flowing while
+ *   a camera waits its turn, so queueing adds ZERO extra load. Purely in the driver — no card wiring — but
+ *   the pin bump forces the new driver to load. See webrtc-mobile-collapse-is-rtc-additive memory.
  * v14.6.14 — [DRIVER CHANGE, pin ?v=2.8.0 → 2.9.0 — needs a PWA hard reload] Alg.3, class-driven RTC abort
  *   (the first DECISION to consume the Alg.1 band verdict). The driver retires the v2.7.0 blind abort, which
  *   keyed on absolute jbuf/RTT ceilings and was therefore blind to the pure-LOSS pathology the 2026-08-26
@@ -347,7 +358,7 @@
  *   _promoteShadowToMain().
  */
 
-import {VideoRTC} from './video-rtc.js?v=2.9.0';
+import {VideoRTC} from './video-rtc.js?v=2.10.0';
 import {DigitalPTZ} from './digital-ptz.js?v=3.3.0';
 // [SIDECAR INTEGRATION] Import the Interaction module.
 // This module handles legacy features (Shortcuts, PTZ, Styles) to keep the core driver clean.
@@ -507,7 +518,7 @@ class WebRTCCamera extends HTMLElement {
         // (correlates stream loss with the mobile app backgrounding / 5G handoff).
         this._logVisAbort = null;
 
-        console.info('[WebRTC Camera] v14.6.14');
+        console.info('[WebRTC Camera] v14.6.15');
     }
 
     setConfig(config) {
