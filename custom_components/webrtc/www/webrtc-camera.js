@@ -25,6 +25,15 @@
  *
  * CHANGELOG
  * ---------
+ * v14.6.10 — [DRIVER CHANGE, pin ?v=2.5.0 → 2.6.0 — needs a PWA hard reload] Transport diagnostics.
+ *   No behaviour change: the driver `metrics` line now also carries `jbuf`/`nack`/`pkt`/`path` from
+ *   the same getStats poll, to settle bufferbloat-vs-fragmentation on the direct-4G path (the
+ *   2026-08-26 direct run collapsed to 20s RTT and dropped HA; the SAME grid over a Cloudflare tunnel
+ *   rode a transient storm and converged). `path` = selected candidate-pair type+protocol
+ *   (srflx/relay/host, udp/tcp) — tests "UDP-to-TURN vs TCP-over-CF" directly; `jbuf` = avg
+ *   jitter-buffer delay (bufferbloat tell); `nack` = retransmit requests (loss/frag tell); `pkt` =
+ *   avg received packet size (MTU tell). This lands BEFORE Strato-1 step 3 so the abort trigger is
+ *   tuned on measured cause, not on the saturating `cong`.
  * v14.6.9 — [DRIVER CHANGE, pin ?v=2.4.6 → 2.5.0 — needs a PWA hard reload] Strato-1: the MSE
  *   no-data watchdog now SELF-ADAPTS. The driver derives a smoothed `congestion` score (rttExcess =
  *   rtt − session-min-rtt, i.e. bufferbloat, reinforced by loss and by recent RTC-promote futility)
@@ -293,7 +302,7 @@
  *   _promoteShadowToMain().
  */
 
-import {VideoRTC} from './video-rtc.js?v=2.5.0';
+import {VideoRTC} from './video-rtc.js?v=2.6.0';
 import {DigitalPTZ} from './digital-ptz.js?v=3.3.0';
 // [SIDECAR INTEGRATION] Import the Interaction module.
 // This module handles legacy features (Shortcuts, PTZ, Styles) to keep the core driver clean.
@@ -453,7 +462,7 @@ class WebRTCCamera extends HTMLElement {
         // (correlates stream loss with the mobile app backgrounding / 5G handoff).
         this._logVisAbort = null;
 
-        console.info('[WebRTC Camera] v14.6.9');
+        console.info('[WebRTC Camera] v14.6.10');
     }
 
     setConfig(config) {

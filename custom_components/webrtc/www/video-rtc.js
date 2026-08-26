@@ -4,7 +4,24 @@
  * Derived from AlexxIT/WebRTC. Licensed under the MIT License — see LICENSE.
  */
 /**
- * VideoRTC v2.5.0 - Adaptive MSE no-data watchdog (Strato-1: self-adapting timeout)
+ * VideoRTC v2.6.0 - Transport diagnostics on the metrics line (bufferbloat vs fragmentation)
+ * * Changelog v2.6.0:
+ * - TRANSPORT DIAGNOSTICS (no behaviour change — purely observational). The `metrics` line now also
+ *   carries `jbuf`/`nack`/`pkt`/`path`, harvested from the SAME getStats poll, to settle a field
+ *   question the 2026-08-26 runs raised: the direct-4G (ha-native/TURN) path collapsed to 20s RTT
+ *   and killed HA, while the SAME grid over a Cloudflare tunnel rode a transient storm and converged
+ *   — is the direct path dying of bufferbloat or of IP fragmentation? The new fields discriminate:
+ *     • `path=local/remote/proto` — selected candidate-pair candidateType + protocol
+ *       (e.g. srflx/host/udp, relay/relay/udp, host/host/tcp). Tests the "UDP-to-TURN vs TCP-over-CF"
+ *       hypothesis directly instead of guessing the transport.
+ *     • `jbuf=Nms` — avg jitter-buffer delay over the window (Δ jitterBufferDelay / Δ emittedCount).
+ *       The receiver-side BUFFERBLOAT tell: grows as packets queue.
+ *     • `nack=N` — retransmit requests over the window (Δ nackCount). The LOSS/fragmentation tell.
+ *     • `pkt=NB` — avg received packet size (Δ bytesReceived / Δ packetsReceived). The MTU tell:
+ *       sustained near/over ~1200B with high loss ⇒ suspect IP fragmentation.
+ *   Reading: RTT↑ + jbuf↑ + nack/loss low ⇒ bufferbloat. loss/nack high + pkt near MTU + RTT bounded
+ *   ⇒ fragmentation. This lands BEFORE Strato-1 step 3 so the abort trigger (RTT-ceiling vs a
+ *   loss-based one) is tuned on measured cause, not on the saturating `cong` signal.
  * * Changelog v2.5.0:
  * - ADAPTIVE WATCHDOG (Strato-1). The MSE no-data watchdog is no longer a fixed 5s: a tiny in-loop
  *   controller (_updateCongestion / _effectiveDisconnectTimeout) turns the existing passive metrics
@@ -356,6 +373,16 @@ export class VideoRTC extends HTMLElement {
         this._mRttMin = Infinity; // session-min candidate-pair RTT (bufferbloat baseline)
         this._mNextEmit = 0;      // Date.now() gate for the next emit
         this.METRICS_EMIT_MS = 3000; // sampling cadence; bypasses the card's 10s log throttle
+        // [TRANSPORT DIAGNOSTICS v2.6.0] Extra getStats fields to settle bufferbloat-vs-fragmentation
+        // on the direct-4G path (see the CF-tunnel control run 2026-08-26). `path` = selected
+        // candidate-pair local/remote candidateType + protocol (relay/srflx/host, udp/tcp) — tests the
+        // "UDP-to-TURN vs TCP-over-CF" hypothesis directly. `jbuf` = avg jitter-buffer delay (ms),
+        // the receiver-side bufferbloat tell (grows when packets queue). `nack` = retransmit requests
+        // over the window, the loss/fragmentation tell. `pkt` = avg received packet size (B), the MTU
+        // tell (near/over ~1200 sustained -> suspect IP fragmentation). All diagnostic ONLY.
+        this._mLastJbDelay = -1;  // previous inbound-rtp jitterBufferDelay (cumulative s)
+        this._mLastJbEmit = -1;   // previous inbound-rtp jitterBufferEmittedCount
+        this._mLastNack = -1;     // previous inbound-rtp nackCount
 
         // [ADAPTIVE WATCHDOG v2.5.0 / Strato-1] The MSE no-data watchdog timeout is no longer a
         // fixed constant. A tiny in-loop controller turns the passive metrics above into a smoothed
@@ -732,13 +759,14 @@ export class VideoRTC extends HTMLElement {
      * every path (fat LAN included: same numbers, just now visible). Goal: see on real links
      * whether RTT bufferbloat / rising loss PRECEDES the reverts that collapse mobile sessions.
      */
-    _sampleMetrics(bytes, recv, lost, jit, rtt) {
+    _sampleMetrics(bytes, recv, lost, jit, rtt, jbDelay = -1, jbEmit = -1, nack = -1, path = '') {
         const now = Date.now();
         if (rtt >= 0 && rtt < this._mRttMin) this._mRttMin = rtt;
         if (now < this._mNextEmit) return;
         // Prime the deltas on the first tick so the first emitted goodput isn't a bogus spike.
         if (this._mLastBytes < 0) {
             this._mLastBytes = bytes; this._mLastRecv = recv; this._mLastLost = lost;
+            this._mLastJbDelay = jbDelay; this._mLastJbEmit = jbEmit; this._mLastNack = nack;
             this._mNextEmit = now + this.METRICS_EMIT_MS;
             return;
         }
@@ -746,15 +774,24 @@ export class VideoRTC extends HTMLElement {
         if (rtt < 0 && bytes < 0) { this._mNextEmit = now + this.METRICS_EMIT_MS; return; }
 
         const dtSec = this.METRICS_EMIT_MS / 1000;
-        const gp = bytes >= 0 && this._mLastBytes >= 0
-            ? Math.max(0, bytes - this._mLastBytes) / 1024 / dtSec : -1;        // KB/s over the window
+        const dBytes = bytes >= 0 && this._mLastBytes >= 0 ? Math.max(0, bytes - this._mLastBytes) : -1;
+        const gp = dBytes >= 0 ? dBytes / 1024 / dtSec : -1;                    // KB/s over the window
         const dLost = lost >= 0 && this._mLastLost >= 0 ? Math.max(0, lost - this._mLastLost) : -1;
         const dRecv = recv >= 0 && this._mLastRecv >= 0 ? Math.max(0, recv - this._mLastRecv) : -1;
         const lossPct = dLost >= 0 && dRecv >= 0 && (dLost + dRecv) > 0
             ? (100 * dLost / (dLost + dRecv)) : -1;
+        // [TRANSPORT DIAGNOSTICS v2.6.0] windowed deltas for the bufferbloat-vs-fragmentation call.
+        const dJbDelay = jbDelay >= 0 && this._mLastJbDelay >= 0 ? Math.max(0, jbDelay - this._mLastJbDelay) : -1;
+        const dJbEmit = jbEmit >= 0 && this._mLastJbEmit >= 0 ? Math.max(0, jbEmit - this._mLastJbEmit) : -1;
+        const jbufMs = dJbDelay >= 0 && dJbEmit > 0 ? Math.round(1000 * dJbDelay / dJbEmit) : -1;
+        const dNack = nack >= 0 && this._mLastNack >= 0 ? Math.max(0, nack - this._mLastNack) : -1;
+        const pktB = dBytes >= 0 && dRecv > 0 ? Math.round(dBytes / dRecv) : -1; // avg received packet size
         if (bytes >= 0) this._mLastBytes = bytes;
         if (recv >= 0) this._mLastRecv = recv;
         if (lost >= 0) this._mLastLost = lost;
+        if (jbDelay >= 0) this._mLastJbDelay = jbDelay;
+        if (jbEmit >= 0) this._mLastJbEmit = jbEmit;
+        if (nack >= 0) this._mLastNack = nack;
         this._mNextEmit = now + this.METRICS_EMIT_MS;
 
         const rttMs = rtt >= 0 ? Math.round(rtt * 1000) : -1;
@@ -764,7 +801,9 @@ export class VideoRTC extends HTMLElement {
         const summary =
             `phase=${this._rtcPhase} rtt=${rttMs}ms(min ${baseMs}) ` +
             `loss=${lossPct >= 0 ? lossPct.toFixed(1) : '?'}% gp=${gp >= 0 ? gp.toFixed(0) : '?'}kb/s ` +
-            `jit=${jit >= 0 ? Math.round(jit * 1000) : '?'}ms cong=${this._congestion.toFixed(2)}`;
+            `jit=${jit >= 0 ? Math.round(jit * 1000) : '?'}ms cong=${this._congestion.toFixed(2)} ` +
+            `jbuf=${jbufMs >= 0 ? jbufMs : '?'}ms nack=${dNack >= 0 ? dNack : '?'} ` +
+            `pkt=${pktB >= 0 ? pktB : '?'}B path=${path || '?'}`;
         if (this.onmessage && typeof this.onmessage['ui_sync'] === 'function') {
             this.onmessage['ui_sync']({ type: 'metrics', value: summary });
         }
@@ -1315,6 +1354,10 @@ export class VideoRTC extends HTMLElement {
                 // (goodput/loss/jitter) + selected candidate-pair RTT. Pure observation — the values
                 // below never feed the promote/commit/revert logic (that stays framesDecoded-only).
                 let mBytes = -1, mRecv = -1, mLost = -1, mJit = -1, mRtt = -1;
+                // [TRANSPORT DIAGNOSTICS v2.6.0] harvested from the SAME poll (diagnostic only).
+                let mJbDelay = -1, mJbEmit = -1, mNack = -1;
+                let mLocalCandId = '', mRemoteCandId = '';
+                const candMap = {}; // id -> {t: candidateType, p: protocol}
                 for (const r of stats.values()) {
                     if (r.type === 'inbound-rtp' && r.kind === 'video') {
                         fd = r.framesDecoded || 0;
@@ -1322,12 +1365,25 @@ export class VideoRTC extends HTMLElement {
                         if (r.packetsReceived != null) mRecv = r.packetsReceived;
                         if (r.packetsLost != null) mLost = r.packetsLost;
                         if (r.jitter != null) mJit = r.jitter;
-                    } else if (r.type === 'candidate-pair' && (r.nominated || r.selected) &&
-                               r.currentRoundTripTime != null) {
-                        mRtt = r.currentRoundTripTime;
+                        if (r.jitterBufferDelay != null) mJbDelay = r.jitterBufferDelay;
+                        if (r.jitterBufferEmittedCount != null) mJbEmit = r.jitterBufferEmittedCount;
+                        if (r.nackCount != null) mNack = r.nackCount;
+                    } else if (r.type === 'candidate-pair' && (r.nominated || r.selected)) {
+                        if (r.currentRoundTripTime != null) mRtt = r.currentRoundTripTime;
+                        if (r.localCandidateId) mLocalCandId = r.localCandidateId;
+                        if (r.remoteCandidateId) mRemoteCandId = r.remoteCandidateId;
+                    } else if (r.type === 'local-candidate' || r.type === 'remote-candidate') {
+                        candMap[r.id] = { t: r.candidateType, p: r.protocol };
                     }
                 }
-                this._sampleMetrics(mBytes, mRecv, mLost, mJit, mRtt);
+                // Resolve the selected pair's candidate types + protocol (order-independent).
+                let mPath = '';
+                const lc = candMap[mLocalCandId], rc = candMap[mRemoteCandId];
+                if (lc || rc) {
+                    const proto = (lc && lc.p) || (rc && rc.p) || '?';
+                    mPath = `${lc ? lc.t : '?'}/${rc ? rc.t : '?'}/${proto}`;
+                }
+                this._sampleMetrics(mBytes, mRecv, mLost, mJit, mRtt, mJbDelay, mJbEmit, mNack, mPath);
                 if (fd < 0) return;
                 const advanced = lastDecoded >= 0 && fd > lastDecoded;
                 lastDecoded = fd;
