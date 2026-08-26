@@ -25,6 +25,17 @@
  *
  * CHANGELOG
  * ---------
+ * v14.6.14 — [DRIVER CHANGE, pin ?v=2.8.0 → 2.9.0 — needs a PWA hard reload] Alg.3, class-driven RTC abort
+ *   (the first DECISION to consume the Alg.1 band verdict). The driver retires the v2.7.0 blind abort, which
+ *   keyed on absolute jbuf/RTT ceilings and was therefore blind to the pure-LOSS pathology the 2026-08-26
+ *   direct-4G logs exposed (esternacancello: RTT pinned 107ms, loss 10-29% — healthy by every ceiling, stream
+ *   unusable). Abort now integrates the loss-aware band verdict through a leaky ASYMMETRIC accumulator: each
+ *   500ms poll adds time while `band=path`, HOLDS on `band=degr`, and bleeds (slower) while `band=perf`;
+ *   reverting to the warm MSE once the integral crosses `mse_abort_hold` (shortened by futility). The
+ *   accumulator gives an intrinsic stability window that absorbs verdict flapping and the optimistic opening
+ *   verdict. NO-DEAD-CODE: the retired ceilings and their knobs (`mse_abort_jbuf`/`mse_abort_rtt`) are deleted
+ *   here and in the driver; surviving knobs `mse_abort` (false = extend-only) and `mse_abort_hold`/
+ *   `mse_abort_futility_k`. No card-UI behaviour change.
  * v14.6.13 — [DRIVER CHANGE, pin ?v=2.7.1 → 2.8.0 — needs a PWA hard reload] Alg.1, early band classifier
  *   (first step of the self-configuring rework: parameters like `mse_timeout` must NOT be a user's job, and
  *   one card must work on both 4G and wide-band). Field analysis (2026-08-26) established that the driver's
@@ -336,7 +347,7 @@
  *   _promoteShadowToMain().
  */
 
-import {VideoRTC} from './video-rtc.js?v=2.8.0';
+import {VideoRTC} from './video-rtc.js?v=2.9.0';
 import {DigitalPTZ} from './digital-ptz.js?v=3.3.0';
 // [SIDECAR INTEGRATION] Import the Interaction module.
 // This module handles legacy features (Shortcuts, PTZ, Styles) to keep the core driver clean.
@@ -496,7 +507,7 @@ class WebRTCCamera extends HTMLElement {
         // (correlates stream loss with the mobile app backgrounding / 5G handoff).
         this._logVisAbort = null;
 
-        console.info('[WebRTC Camera] v14.6.13');
+        console.info('[WebRTC Camera] v14.6.14');
     }
 
     setConfig(config) {
@@ -1687,19 +1698,15 @@ class WebRTCCamera extends HTMLElement {
         if (Number.isFinite(adaptMaxExtend) && adaptMaxExtend >= 1) newDriver.ADAPT_MAX_EXTEND = adaptMaxExtend;
         const adaptAlpha = Number(effectiveConfig.mse_adapt_alpha);
         if (Number.isFinite(adaptAlpha) && adaptAlpha > 0 && adaptAlpha <= 1) newDriver.ADAPT_EWMA_ALPHA = adaptAlpha;
-        // [TUNABLE] RTC abort (Strato-1 step 3, driver v2.7.0). Gives up a non-committing RTC probe
-        // that holds a pathological jitter-buffer/RTT reading for `mse_abort_hold` ms (deterministic
-        // teardown instead of babying it via the adaptive extend). Absolute ceilings — NOT `cong`,
-        // which saturates and can't tell recoverable bufferbloat from pathological. Parametric even
-        // though futility self-adapts the hold. `mse_abort: false` pins the classic (extend-only)
-        // behaviour; set a ceiling to 0 to disable just that limb.
+        // [TUNABLE] RTC abort (Alg.3, driver v2.9.0). Gives up a non-committing RTC probe once the
+        // band verdict (Alg.1) integrates enough sustained-bad time (`mse_abort_hold` ms, shortened by
+        // futility) — a deterministic teardown instead of babying it via the adaptive extend. The band
+        // verdict already folds BOTH rttExcess and loss, so the former blind jbuf/RTT ceiling knobs
+        // (`mse_abort_jbuf`/`mse_abort_rtt`) are RETIRED — the internal band thresholds are the tuning
+        // surface now. `mse_abort: false` pins the classic (extend-only) behaviour.
         if (effectiveConfig.mse_abort !== undefined) {
             newDriver.RTC_ABORT_ENABLED = effectiveConfig.mse_abort !== false;
         }
-        const abortJbuf = Number(effectiveConfig.mse_abort_jbuf);
-        if (Number.isFinite(abortJbuf) && abortJbuf >= 0) newDriver.RTC_ABORT_JBUF_MS = abortJbuf;
-        const abortRtt = Number(effectiveConfig.mse_abort_rtt);
-        if (Number.isFinite(abortRtt) && abortRtt >= 0) newDriver.RTC_ABORT_RTT_MS = abortRtt;
         const abortHold = Number(effectiveConfig.mse_abort_hold);
         if (Number.isFinite(abortHold) && abortHold > 0) newDriver.RTC_ABORT_HOLD_MS = abortHold;
         const abortFutilityK = Number(effectiveConfig.mse_abort_futility_k);

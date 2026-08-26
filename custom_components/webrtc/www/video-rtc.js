@@ -4,6 +4,10 @@
  * Derived from AlexxIT/WebRTC. Licensed under the MIT License — see LICENSE.
  */
 /**
+ * VideoRTC v2.9.0 - [Alg.3] class-driven RTC abort: a leaky asymmetric accumulator (_bandBadMs) integrates
+ *   the Alg.1 band verdict (+poll on 'path', hold on 'degr', bleed on 'perf') and aborts once it crosses the
+ *   futility-shortened hold. RETIRES the blind jbuf/RTT-ceiling abort (loss-blind) and its dead mse_abort_*
+ *   knobs — the loss-aware band verdict is now the sole abort signal. See webrtc-mse-timeout-zero memory.
  * VideoRTC v2.8.0 - [Alg.1] early band classifier: fold the per-poll RTT/loss already harvested for
  *   the metrics line into a live 'perf'|'degr'|'path' verdict (~2s), surfaced as `band=` (OBSERVE-ONLY;
  *   Alg.2/3 will consume _bandClass and retire the blind step-3 abort). See webrtc-mse-timeout-zero memory.
@@ -432,29 +436,30 @@ export class VideoRTC extends HTMLElement {
         this._congestion = 0;            // smoothed congestion score [0,1]
         this._rtcFutility = 0;           // decaying penalty for recent doomed RTC promotes [0,1]
 
-        // [STRATO-1 STEP 3 — RTC ABORT, v2.7.0] The adaptive watchdog above EXTENDS tolerance while a
-        // link is congested — correct on a RECOVERABLE path (CF-tunnel field run: transient ~2s RTT,
-        // converges), but on a PATHOLOGICAL path (direct-4G field run 2026-08-26) it PROLONGS a doomed
-        // RTC storm: 4 uncoordinated GCC flows overshoot one 4G uplink into a deep carrier buffer, the
-        // jitter-buffer balloons to ~2s and RTT plateaus at a standing 1.5s that never drains — classic
-        // bufferbloat (confirmed by the v2.6.0 diagnostics: jbuf 1500-2100ms, RTT standing plateau, pkt
-        // NOT MTU-pinned, loss moderate → not fragmentation; path=srflx/…/udp → direct UDP, not TURN).
-        // `cong` CANNOT gate the abort: it SATURATES (~1.0 for both 800ms and 20s RTT past
-        // ADAPT_RTT_EXCESS_MS), so it can't tell recoverable bufferbloat from pathological — a cong-based
-        // abort would have killed the CF run that converged. The abort therefore keys on UNSATURATED
-        // ABSOLUTE ceilings: jitter-buffer delay (jbuf) OR RTT above a hard limit, sustained. When an
-        // un-committed RTC probe holds a pathological reading for RTC_ABORT_HOLD_MS we revert to the warm
-        // MSE at once (deterministic ~6-9s teardown) instead of letting the extend balloon to 30×. The
-        // revert bumps `_rtcFutility`, which now SHORTENS the next probe's abort hold (a repeatedly-doomed
-        // path gives up faster) — futility drives SUPPRESSION, no longer the extend (that inversion is
-        // fixed in _updateCongestion). rtc_failed then arms the card's backed-off re-probe loop. All
-        // thresholds parametric (per-card mse_abort* knobs); set mse_abort:false to disable.
+        // [RTC ABORT — Alg.3, v2.9.0] Give up a doomed un-committed RTC probe and snap back to the warm
+        // MSE. This SUPERSEDES the v2.7.0 blind-ceiling abort (jbuf/RTT over a hard limit), which was
+        // structurally blind to the pure-LOSS pathology the field logs exposed (direct-4G 2026-08-26:
+        // esternacancello RTT pinned at 107ms with 10-29% loss — healthy by any RTT/jbuf ceiling, yet the
+        // stream was unusable). The decision now consumes the Alg.1 band classifier (`_bandClass`), which
+        // already folds BOTH stressors (rttExcess bufferbloat AND short-window loss) into one verdict, so
+        // the abort inherits loss-awareness for free and the ceilings are deleted (no dead code).
+        //
+        // The verdict flaps on bursty links (loss spikes + a fast EWMA oscillate perf↔degr↔path), so a raw
+        // `band=='path'` MUST NOT abort on sight. Instead a LEAKY ASYMMETRIC ACCUMULATOR integrates the
+        // verdict over time (worsen fast, recover slow — field finding A): each poll adds POLL_MS while the
+        // band is 'path', HOLDS on the ambiguous 'degr', and bleeds POLL_MS*RECOVER_K (<1, so recovery is
+        // slower than accrual) while 'perf'. We abort only once the integral `_bandBadMs` crosses
+        // RTC_ABORT_HOLD_MS — an intrinsic stability window (~12 net 'path' polls at 500ms) that also
+        // absorbs the optimistic opening verdict (finding B: the classifier holds '' until BAND_CLASSIFY_MS,
+        // and '' neither accrues nor bleeds). The revert bumps `_rtcFutility`, which SHORTENS the next
+        // probe's hold toward HOLD*(1-K) so a repeatedly-doomed path gives up faster; rtc_failed then arms
+        // the card's backed-off re-probe loop. Master switch only (per-card `mse_abort`); the former
+        // jbuf/rtt ceiling knobs are gone — the band thresholds (internal, Alg.1) are the tuning surface.
         this.RTC_ABORT_ENABLED = true;   // master switch (per-card `mse_abort`)
-        this.RTC_ABORT_JBUF_MS = 1200;   // jitter-buffer delay (ms) that flags a pathological path
-        this.RTC_ABORT_RTT_MS = 5000;    // candidate-pair RTT (ms) that flags a pathological path
-        this.RTC_ABORT_HOLD_MS = 6000;   // both above sustained this long (at futility 0) -> abort
+        this.RTC_ABORT_HOLD_MS = 6000;   // integrated bad-band time (ms, at futility 0) that -> abort
         this.RTC_ABORT_FUTILITY_K = 0.5; // futility [0,1] shortens the hold toward HOLD*(1-K)
-        this._abortSince = 0;            // Date.now() the pathological reading first went bad (0 = clear)
+        this.RTC_ABORT_RECOVER_K = 0.5;  // 'perf' bleeds _bandBadMs at POLL_MS*K (<1 -> recover slower than accrue)
+        this._bandBadMs = 0;             // leaky integral of bad-band time (ms); 0 = clear
 
         // [EARLY BAND CLASSIFIER — Alg.1, v2.8.0] The self-configuring rework's foundation. The
         // reactive levers above (adaptive-watchdog EXTEND, step-3 ABORT) treat SYMPTOMS after a doomed
@@ -797,8 +802,8 @@ export class VideoRTC extends HTMLElement {
      * v2.7.0 FIXES THE FUTILITY INVERSION: `_rtcFutility` no longer feeds `inst` here. Folding it in
      * RAISED congestion after a doomed promote, which under _effectiveDisconnectTimeout EXTENDED the
      * watchdog — i.e. it babied the very RTC probe that just failed (backwards). Futility now drives
-     * SUPPRESSION only: it shortens the abort hold in _evaluateAbort. Its decay lives here (per emit)
-     * so a good stretch bleeds the penalty off.
+     * SUPPRESSION only: it shortens the abort hold in _evaluateBandAbort. Its decay lives here (per
+     * emit) so a good stretch bleeds the penalty off.
      */
     _updateCongestion(rttMs, baseMs, lossPct) {
         let inst = 0;
@@ -809,56 +814,48 @@ export class VideoRTC extends HTMLElement {
         if (lossPct >= 0 && this.ADAPT_LOSS_PCT > 0) {
             inst = Math.max(inst, Math.min(1, lossPct / this.ADAPT_LOSS_PCT));
         }
-        this._rtcFutility *= 0.9;                       // decay ~1 sample; consumed by _evaluateAbort
+        this._rtcFutility *= 0.9;                       // decay ~1 sample; consumed by _evaluateBandAbort
         const a = this.ADAPT_EWMA_ALPHA;
         this._congestion = a * inst + (1 - a) * this._congestion;
     }
 
     /**
-     * [STRATO-1 STEP 3] Abort a non-committing RTC probe stuck on a pathological (bufferbloat)
-     * path. Called once per metrics emit (3s) with the freshest instantaneous RTT and windowed
-     * jitter-buffer delay — both UNSATURATED absolute signals, unlike `cong`. A reading is
-     * "pathological" when jbuf OR RTT is at/over its hard ceiling; only while an un-committed RTC
-     * probe is live (negotiating/promoted) and once it has HELD that long do we give up. `_rtcFutility`
-     * shortens the hold toward HOLD*(1-K), so a path that keeps failing gives up progressively faster.
-     * A definitively healthy sample clears the pending abort; a sample with no usable signal neither
-     * arms nor disarms (avoids the jbuf=? gaps resetting the timer). ms in; -1 = no sample.
+     * [RTC ABORT — Alg.3] Integrate the Alg.1 band verdict into the abort decision, once per poll
+     * (`pollMs` cadence) while an un-committed RTC probe is live (negotiating/promoted). Leaky
+     * ASYMMETRIC accumulator: 'path' accrues `_bandBadMs += pollMs` (worsen fast), 'degr' HOLDS
+     * (ambiguous — neither condemns nor forgives), 'perf' bleeds `_bandBadMs -= pollMs*RECOVER_K`
+     * floored at 0 (recover slow, K<1), and '' (verdict not yet decided) is a no-op. Aborting only
+     * when the integral crosses the futility-shortened hold gives an intrinsic stability window that
+     * absorbs verdict flapping (finding A) and the optimistic opening verdict (finding B). Outside the
+     * probe the accumulator is held at 0 by `_resetBandClassifier`.
      */
-    _evaluateAbort(rttMs, jbufMs) {
+    _evaluateBandAbort(pollMs) {
         if (!this.RTC_ABORT_ENABLED) return;
-        const probing = this._rtcPhase === 'negotiating' || this._rtcPhase === 'promoted';
-        if (!probing) { this._abortSince = 0; return; }
-        const rttBad = this.RTC_ABORT_RTT_MS > 0 && rttMs >= 0 && rttMs >= this.RTC_ABORT_RTT_MS;
-        const jbufBad = this.RTC_ABORT_JBUF_MS > 0 && jbufMs >= 0 && jbufMs >= this.RTC_ABORT_JBUF_MS;
-        if (rttBad || jbufBad) {
-            const now = Date.now();
-            if (!this._abortSince) { this._abortSince = now; return; }
-            const k = Math.max(0, Math.min(1, this.RTC_ABORT_FUTILITY_K));
-            const hold = this.RTC_ABORT_HOLD_MS * (1 - k * Math.max(0, Math.min(1, this._rtcFutility)));
-            if (now - this._abortSince >= hold) {
-                const held = now - this._abortSince;
-                this._abortSince = 0;
-                this._abortRtcProbe(rttMs, jbufMs, Math.round(hold), held);
-            }
-            return;
+        if (this._rtcPhase !== 'negotiating' && this._rtcPhase !== 'promoted') return;
+        if (this._bandClass === 'path') {
+            this._bandBadMs += pollMs;
+        } else if (this._bandClass === 'perf') {
+            this._bandBadMs = Math.max(0, this._bandBadMs - pollMs * this.RTC_ABORT_RECOVER_K);
+        } // 'degr' and '' hold the integral
+        const k = Math.max(0, Math.min(1, this.RTC_ABORT_FUTILITY_K));
+        const hold = this.RTC_ABORT_HOLD_MS * (1 - k * Math.max(0, Math.min(1, this._rtcFutility)));
+        if (this._bandBadMs >= hold) {
+            const held = Math.round(this._bandBadMs);
+            this._bandBadMs = 0;
+            this._abortRtcProbe(Math.round(hold), held);
         }
-        // Not bad this sample. Clear the pending abort only on a DEFINITIVELY healthy reading;
-        // a window with no usable signal leaves the timer running.
-        const rttGood = rttMs >= 0 && (this.RTC_ABORT_RTT_MS <= 0 || rttMs < this.RTC_ABORT_RTT_MS);
-        const jbufGood = jbufMs >= 0 && (this.RTC_ABORT_JBUF_MS <= 0 || jbufMs < this.RTC_ABORT_JBUF_MS);
-        if (rttGood || jbufGood) this._abortSince = 0;
     }
 
     /**
-     * [STRATO-1 STEP 3] Give up on the current pathological RTC probe: snap back to the warm MSE
+     * [RTC ABORT — Alg.3] Give up on the current pathological RTC probe: snap back to the warm MSE
      * (one-frame recovery, MSE never stopped). _revertToWarmMSE bumps `_rtcFutility` (shorter next
      * hold) and emits `rtc_failed`, which arms the card's backed-off re-probe loop (the suppression).
      */
-    _abortRtcProbe(rttMs, jbufMs, hold, held) {
-        console.warn(`[VideoRTC:${this.clientId}] RTC probe ABORTED — pathological path ` +
-            `(rtt=${rttMs}ms jbuf=${jbufMs}ms held ${held}ms >= ${hold}ms, phase=${this._rtcPhase}, ` +
+    _abortRtcProbe(hold, held) {
+        console.warn(`[VideoRTC:${this.clientId}] RTC probe ABORTED — sustained bad band ` +
+            `(band=${this._bandClass || '?'} integral ${held}ms >= ${hold}ms, phase=${this._rtcPhase}, ` +
             `futility=${this._rtcFutility.toFixed(2)}).`);
-        this._revertToWarmMSE(`RTC aborted: pathological path (rtt=${rttMs}ms, jbuf=${jbufMs}ms sustained)`);
+        this._revertToWarmMSE(`RTC aborted: sustained bad band (band=${this._bandClass || '?'}, ${held}ms)`);
     }
 
     /**
@@ -904,6 +901,7 @@ export class VideoRTC extends HTMLElement {
         this._bandLoss = -1;
         this._bandLastLost = -1;
         this._bandLastRecv = -1;
+        this._bandBadMs = 0;             // [Alg.3] clear the abort integral with the classifier
     }
 
     /**
@@ -970,8 +968,6 @@ export class VideoRTC extends HTMLElement {
         const baseMs = this._mRttMin < Infinity ? Math.round(this._mRttMin * 1000) : -1;
         // [ADAPTIVE WATCHDOG] Drive the congestion controller from this sample (rttExcess + loss).
         this._updateCongestion(rttMs, baseMs, lossPct);
-        // [STRATO-1 STEP 3] Give up a doomed RTC probe on absolute (unsaturated) jbuf/RTT ceilings.
-        this._evaluateAbort(rttMs, jbufMs);
         const summary =
             `phase=${this._rtcPhase} rtt=${rttMs}ms(min ${baseMs}) ` +
             `loss=${lossPct >= 0 ? lossPct.toFixed(1) : '?'}% gp=${gp >= 0 ? gp.toFixed(0) : '?'}kb/s ` +
@@ -1564,6 +1560,9 @@ export class VideoRTC extends HTMLElement {
                 // metrics emit) so the verdict converges by ~BAND_CLASSIFY_MS; _setPhase gates its
                 // lifetime, so a no-op outside negotiating/promoted is a stale-but-harmless '' class.
                 this._classifyBand(mRtt >= 0 ? Math.round(mRtt * 1000) : -1, mLost, mRecv);
+                // [RTC ABORT — Alg.3] Integrate the fresh verdict into the abort accumulator on the
+                // same 500ms cadence (a no-op outside negotiating/promoted).
+                this._evaluateBandAbort(500);
                 if (fd < 0) return;
                 const advanced = lastDecoded >= 0 && fd > lastDecoded;
                 lastDecoded = fd;
@@ -1669,10 +1668,10 @@ export class VideoRTC extends HTMLElement {
     _revertToWarmMSE(why) {
         if (!this._rtcVideo && !this.pc) return;
         console.warn(`[VideoRTC:${this.clientId}] ${why}; reverting to warm MSE.`);
-        // [ADAPTIVE WATCHDOG / STRATO-1 STEP 3] A revert = a doomed/abandoned RTC promote. Raise the
-        // decaying futility floor. v2.7.0: futility now SHORTENS the next probe's abort hold
-        // (_evaluateAbort) so a repeatedly-doomed path gives up faster — it no longer lengthens the
-        // watchdog extension (that inversion is fixed in _updateCongestion).
+        // [ADAPTIVE WATCHDOG / RTC ABORT] A revert = a doomed/abandoned RTC promote. Raise the
+        // decaying futility floor. Futility SHORTENS the next probe's abort hold (_evaluateBandAbort)
+        // so a repeatedly-doomed path gives up faster — it no longer lengthens the watchdog extension
+        // (that inversion is fixed in _updateCongestion).
         this._rtcFutility = Math.min(1, this._rtcFutility + 0.5);
         this._clearRtcTimers();
         this._dropRtcOverlay();
@@ -1681,9 +1680,9 @@ export class VideoRTC extends HTMLElement {
         this._setPhase('warm');
         if (this.onmessage && typeof this.onmessage['ui_sync'] === 'function') {
             // v14.6.12: carry the reason so the card can mirror it to the HA log. Without this a
-            // step-3 abort, a stall revert and an ICE-drop all showed as a bare `mode: rtc -> mse`
+            // band abort, a stall revert and an ICE-drop all showed as a bare `mode: rtc -> mse`
             // — indistinguishable in a field log. `detail` self-identifies the abort ("RTC aborted:
-            // pathological path (rtt=…, jbuf=… sustained)") and every other revert cause.
+            // sustained bad band (band=…, …ms)") and every other revert cause.
             this.onmessage['ui_sync']({ type: 'signal', value: 'rtc_failed', detail: why });
         }
     }
