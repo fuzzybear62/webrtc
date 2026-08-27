@@ -25,6 +25,17 @@
  *
  * CHANGELOG
  * ---------
+ * v14.8.1 — [card-only, no driver/pin change — still needs a PWA hard reload to fetch the new card JS]
+ *   A0 suppression now sees rtc-revert CHURN, not just socket deaths. Two 4G field logs (2026-08-27) crashed
+ *   HA the same way: a single canary cam kept probing→aborting (band=path)→re-probing→committing→stalling
+ *   over TURN, driving bufferbloat (rtt 299ms→7549ms, exc=2900ms) that saturated the shared uplink and
+ *   dropped the HA connection — while suppression NEVER latched, because `_noteRtcFlap` only fired on a socket
+ *   DEATH within probation and every one of those reverts kept the MSE alive. Fix: `rtc_failed` reverts (the
+ *   band=path abort and the pre/post-commit media stalls — NOT the deliberate rtc_rejected quality decision)
+ *   now feed the SAME decaying flap score via a shared `_accrueFlap`; a revert with a fresh loss ≥ FLAP_LOSS_PCT
+ *   latches MSE-only on the FIRST strike and `_scheduleReprobe` then bails on the latch → the uplink-saturating
+ *   re-probe loop stops. Wired on both the main and the shadow rtc_failed paths. In the field trace this would
+ *   latch at the 09:41:12 abort (fresh loss 21.3%), killing the re-probe→commit→stall that crashed HA ~20s later.
  * v14.8.0 — [DRIVER CHANGE, pin ?v=2.13.1 → 2.14.0 — needs a PWA hard reload] MSE ride-out (work item B,
  *   first ACTING step). The v14.7.x sensor proved a sustained MSE freeze is detectable while the socket stays
  *   alive (bursty 4G: bytes trickle in, the no-data watchdog never fires, but the <video> is frozen). Until
@@ -594,7 +605,7 @@ class WebRTCCamera extends HTMLElement {
         // (correlates stream loss with the mobile app backgrounding / 5G handoff).
         this._logVisAbort = null;
 
-        console.info('[WebRTC Camera] v14.8.0');
+        console.info('[WebRTC Camera] v14.8.1');
     }
 
     setConfig(config) {
@@ -1143,6 +1154,7 @@ class WebRTCCamera extends HTMLElement {
                     this._shadowTimeout = null;
                 }
                 if (msg.value === 'rtc_failed') {
+                    this._noteRtcRevert();   // [A0] shadow probe reverted → same churn accrual
                     this._scheduleReprobe();
                 } else {
                     this._stopReprobe();
@@ -1200,7 +1212,8 @@ class WebRTCCamera extends HTMLElement {
                 // rejected again, so stop instead.
                 if (msg.value === 'rtc_failed') {
                     this._setActiveMode('mse');
-                    this._scheduleReprobe();
+                    this._noteRtcRevert();   // [A0] count the revert churn → may latch MSE-only …
+                    this._scheduleReprobe(); // … which _scheduleReprobe honours (bails if suppressed)
                 } else {
                     this._stopReprobe();
                 }
@@ -1519,18 +1532,37 @@ class WebRTCCamera extends HTMLElement {
     // once the decaying score crosses FLAP_SUPPRESS_AT. Latching stops the re-probe loop so no
     // shadow RTC probe launches; the mode strip in startStream() handles the main driver.
     _noteRtcFlap() {
+        this._accrueFlap('death');
+    }
+
+    // [A0 — revert churn] A doomed RTC probe that REVERTS to warm MSE (band=path abort, or a pre/
+    // post-commit media stall) keeps the MSE stream alive, so it never reached _noteRtcFlap (which
+    // only fires on a socket DEATH). Field logs (2026-08-27, 4G) proved this is the exact hole that
+    // crashes HA: a single canary that keeps probing→aborting→re-probing→committing→stalling burns
+    // the shared uplink (RTC-over-TURN, bufferbloat rtt→7.5s) unchecked because nothing counted the
+    // churn. Feed those reverts into the SAME decaying score so a link that can't hold RTC latches
+    // MSE-only and stops re-probing. rtc_rejected (a deliberate quality<MSE decision, link is fine)
+    // does NOT come here — only rtc_failed (RTC could not deliver). The freshness/loss severity gate
+    // in _accrueFlap keeps a healthy link that fails RTC for a non-bandwidth reason (ICE/firstframe)
+    // from latching on one strike.
+    _noteRtcRevert() {
+        this._accrueFlap('rtc-revert');
+    }
+
+    // [A0] Shared scoring core for both a within-probation death and an rtc_failed revert. Ages the
+    // decaying score to now, adds this event (a full threshold when a FRESH metrics sample reads high
+    // loss — the link is provably narrow, so latch on the first such event; else +1, needing ~3), and
+    // latches MSE-only + stops the re-probe loop once the score crosses FLAP_SUPPRESS_AT.
+    _accrueFlap(source) {
         if (this.config && this.config.rtc_adaptive === false) return; // opt-out: never suppress
         this._decayFlap(0);            // age to now …
-        // Severity: if a FRESH metrics sample just before this death read high loss, the link is
-        // provably narrow — weigh the flap a full threshold so it latches on the first such death
-        // instead of waiting for 3 to accumulate (which they never do, one-per-burst per camera).
         const lossFresh = this._lastLossAt && (Date.now() - this._lastLossAt) <= this.LOSS_FRESH_MS;
         const severe = lossFresh && this._lastLossPct >= this.FLAP_LOSS_PCT;
         this._flapScore += severe ? this.FLAP_SUPPRESS_AT : 1;
         this._flapLast = Date.now();
         this._logHA('debug', 'rtc-flap',
-            `score=${this._flapScore.toFixed(1)}/${this.FLAP_SUPPRESS_AT}` +
-            (severe ? ` (loss ${this._lastLossPct.toFixed(0)}%)` : ''));
+            `score=${this._flapScore.toFixed(1)}/${this.FLAP_SUPPRESS_AT} (${source}` +
+            (severe ? `, loss ${this._lastLossPct.toFixed(0)}%` : '') + ')');
         if (!this._rtcSuppressed && this._flapScore >= this.FLAP_SUPPRESS_AT) {
             this._rtcSuppressed = true;
             this._rtcSuppressedAt = Date.now();
