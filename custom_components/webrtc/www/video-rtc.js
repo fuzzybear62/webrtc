@@ -4,6 +4,17 @@
  * Derived from AlexxIT/WebRTC. Licensed under the MIT License — see LICENSE.
  */
 /**
+ * VideoRTC v2.13.0 - [MSE playback-health sensor] a new always-on sampler measures whether the ON-SCREEN
+ *   picture is actually MOVING: onscreenVideo.currentTime advance vs wall-clock, sampled every 2s, EWMA'd,
+ *   classified flow/stutter/frozen (ratio >=0.7 / <=0.15 / between). Fills the blind spot behind the "log
+ *   said healthy, video was pessima" case: the no-data watchdog (DISCONNECT_TIMEOUT) only asks "did bytes
+ *   arrive in 5s", and on bursty 4G the bytes trickle in within each window so the socket stays alive while
+ *   the buffer-starved <video> is frozen. Sampling onscreenVideo (not this.video) means a hidden warm MSE
+ *   can't paint a false freeze while an RTC overlay is promoted. Emitted as ui_sync {type:'playback'} every
+ *   judged sample (heartbeat, so a steady freeze keeps the verdict fresh); the card feeds the network dot
+ *   (worst-wins with the RTC band verdict — the ONLY signal on an MSE-only session) and mirrors transitions
+ *   to the HA log (`mse-playback: frozen/stutter/flow`), which was previously invisible. Observe-only: does
+ *   not yet drive suppression or a reseek (work item B). No card-visible knob.
  * VideoRTC v2.12.1 - [Alg.4.1 excess not ratio] the self-calibrating band primitive becomes the ABSOLUTE
  *   standing-queue EXCESS = rttEwma - session-min-RTT (_mRttMin, queue-empty baseline), in ms — replacing
  *   v2.12's rttEwma/rttMin RATIO. The ratio was scale-free and EXPLODED at a tiny LAN baseline (min 2-3ms):
@@ -442,6 +453,22 @@ export class VideoRTC extends HTMLElement {
         this.FIRSTFRAME_TIMEOUT = 120000;
         this._firstFrameTID = 0;   // first-frame watchdog timer handle
         this._firstFramePoll = 0;  // getStats() poll interval handle (framesDecoded)
+        // [MSE PLAYBACK HEALTH] Always-on "is the picture actually moving?" sampler. The no-data
+        // watchdog (DISCONNECT_TIMEOUT) only asks "did bytes arrive in the last 5s"; on bursty 4G
+        // the bytes trickle in within each window so the socket looks alive while the on-screen
+        // <video> is buffer-starved and frozen/stuttering. This samples the ON-SCREEN element's
+        // currentTime advance vs wall-clock — the truth the viewer actually sees — and reports
+        // flow/stutter/frozen to the card, independent of RTC. Fills the gap where MSE-only sessions
+        // produced no signal (no RTC band verdict, socket never died) so the network dot stayed
+        // white and the freeze was invisible in the HA log.
+        this._pbTimer = 0;         // playback-health interval handle
+        this._pbLastAt = 0;        // wall-clock ms at last sample (0 = needs re-priming)
+        this._pbLastCT = -1;       // onscreen currentTime (s) at last sample (-1 = unset)
+        this._pbRatio = 1;         // EWMA of media-advance / wall-advance (1 = realtime)
+        this._pbClass = '';        // last emitted verdict: '' | 'flow' | 'stutter' | 'frozen'
+        this.PB_SAMPLE_MS = 2000;  // sampler cadence
+        this.PB_FLOW_RATIO = 0.7;  // EWMA >= this → flowing (green)
+        this.PB_FROZEN_RATIO = 0.15; // EWMA <= this → frozen (red); in between → stutter (yellow)
         // After handoff the RTC media flows P2P off the ws, so the MSE no-data
         // watchdog can never see it stall. This is the liveness deadline for the
         // *promoted* RTC stream: if framesDecoded stops advancing for this long the
@@ -882,7 +909,56 @@ export class VideoRTC extends HTMLElement {
             }
         });
 
+        this._startPlaybackSampler();
         return true;
+    }
+
+    // [MSE PLAYBACK HEALTH] Arm the always-on currentTime-advance sampler (idempotent). Cleared in
+    // ondisconnect(). Cheap: one timer, a subtraction, no getStats().
+    _startPlaybackSampler() {
+        if (this._pbTimer) return;
+        this._pbLastAt = 0; this._pbLastCT = -1; this._pbRatio = 1; this._pbClass = '';
+        this._pbTimer = setInterval(() => this._samplePlayback(), this.PB_SAMPLE_MS);
+    }
+
+    _stopPlaybackSampler() {
+        if (this._pbTimer) { clearInterval(this._pbTimer); this._pbTimer = 0; }
+    }
+
+    // [MSE PLAYBACK HEALTH] One sample: how far did the ON-SCREEN picture advance vs wall clock? A
+    // live stream advances currentTime at ~1x when healthy; a buffer-starved MSE freezes it while
+    // the socket (and the no-data watchdog) stay happy. Judged only while we SHOULD be playing —
+    // attached, not paused/held, not mid-seek, and playback actually started (ct>0) — so initial
+    // buffering and pauses never read as 'frozen'. We sample onscreenVideo (the overlay while an RTC
+    // probe is promoted, else this.video) so a hidden warm MSE can't paint a false freeze. Emits to
+    // the card on class change only; a light EWMA rejects single-sample noise.
+    _samplePlayback() {
+        const v = this.onscreenVideo;
+        const now = Date.now();
+        if (!v || v.paused || this._manualHold || v.seeking || v.currentTime <= 0) {
+            this._pbLastAt = 0; this._pbLastCT = -1;   // not a judgeable state → re-prime
+            return;
+        }
+        const ct = v.currentTime;
+        if (this._pbLastAt <= 0 || this._pbLastCT < 0) { this._pbLastAt = now; this._pbLastCT = ct; return; }
+        const dtWall = (now - this._pbLastAt) / 1000;
+        const dtMedia = ct - this._pbLastCT;
+        this._pbLastAt = now; this._pbLastCT = ct;
+        if (dtWall <= 0) return;
+        // Clamp: a live-edge reseek jumps currentTime forward (huge ratio) — treat as flowing, not a spike.
+        const ratio = Math.max(0, Math.min(2, dtMedia / dtWall));
+        this._pbRatio = 0.5 * this._pbRatio + 0.5 * ratio;
+        this._pbClass = this._pbRatio >= this.PB_FLOW_RATIO ? 'flow'
+            : this._pbRatio <= this.PB_FROZEN_RATIO ? 'frozen' : 'stutter';
+        // Emit EVERY judged sample (~2s), not just on change: a steadily-frozen picture must keep
+        // refreshing the verdict or the card's staleness sweep would drop it and the dot would go
+        // white again while the freeze persists. The card de-dupes for logging (transitions only).
+        if (this.onmessage && typeof this.onmessage['ui_sync'] === 'function') {
+            this.onmessage['ui_sync']({
+                type: 'playback', value: this._pbClass,
+                detail: `advanced ${dtMedia.toFixed(2)}s / ${dtWall.toFixed(1)}s wall (ewma ${this._pbRatio.toFixed(2)})`,
+            });
+        }
     }
 
     /**
@@ -1149,6 +1225,7 @@ export class VideoRTC extends HTMLElement {
         // were still waiting our turn, or release the token if we were the active ramp.
         _rtcProbeGate.release(this);
         this._clearWatchdog();
+        this._stopPlaybackSampler();
         if (this._firstFrameTID) {
             clearTimeout(this._firstFrameTID);
             this._firstFrameTID = 0;

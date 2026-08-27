@@ -25,6 +25,18 @@
  *
  * CHANGELOG
  * ---------
+ * v14.7.0 — [DRIVER CHANGE, pin ?v=2.12.1 → 2.13.0 — needs a PWA hard reload] MSE playback-health sensor.
+ *   The bad-4G field log looked "healthy" (stream-stable 20s, ~30 KB/s, clean) but the picture was "pessima"
+ *   and the network dot stayed WHITE the whole time. Root cause: the only health signal was the no-data
+ *   watchdog ("did bytes arrive in 5s"), which bursty 4G satisfies while the buffer-starved <video> is
+ *   frozen — and the dot's colour came only from the RTC band verdict, which never exists on an MSE-only
+ *   session (no probe). Driver v2.13.0 adds an always-on sampler of the ON-SCREEN currentTime advance vs
+ *   wall-clock → flow/stutter/frozen, emitted as ui_sync {type:'playback'}. Card side: the dot now paints
+ *   the WORST of {suppression latch, RTC band, MSE playback} so a frozen MSE-only stream goes RED (was
+ *   white); the playback transitions are mirrored to the HA log (`mse-playback: …`) so the freeze is finally
+ *   visible in the logs you collect. Observe-only for now — does NOT yet drive suppression/reseek (work
+ *   item B); this is the missing SENSOR those will read. Net dot legend: green = picture flowing (RTC perf
+ *   or MSE flow), yellow = stutter/degraded, RED = frozen / path / MSE-only-suppressed, white = idle only.
  * v14.6.19 — [CARD-ONLY, driver pin unchanged at ?v=2.12.1] network dot: paint RED while the narrow-link
  *   RTC-suppression latch is engaged. The band verdict only exists while an RTC probe polls; on a genuinely
  *   bad link the probe dies ~6s and the camera sits in MSE-only, so band samples stop and the dot decayed to
@@ -398,7 +410,7 @@
  *   _promoteShadowToMain().
  */
 
-import {VideoRTC} from './video-rtc.js?v=2.12.1';
+import {VideoRTC} from './video-rtc.js?v=2.13.0';
 import {DigitalPTZ} from './digital-ptz.js?v=3.3.0';
 // [SIDECAR INTEGRATION] Import the Interaction module.
 // This module handles legacy features (Shortcuts, PTZ, Styles) to keep the core driver clean.
@@ -529,6 +541,8 @@ class WebRTCCamera extends HTMLElement {
         this._lastLossAt = 0;        // when that sample arrived, for the freshness gate
         this._lastBand = '';         // most recent band verdict parsed from the metrics line (net dot)
         this._lastBandAt = 0;        // when that band sample arrived (staleness -> white)
+        this._lastPlayback = '';     // most recent MSE playback verdict (flow|stutter|frozen) — net dot
+        this._lastPlaybackAt = 0;    // when that playback sample arrived (staleness -> drop it)
         this._netTimer = null;       // network-indicator staleness interval handle
         this.NET_DOT_STALE_MS = 5000; // no band sample for this long -> net dot back to white (emit ~3s)
         this._rtcSuppressed = false; // [A0] latch: build MSE-only, no re-probe
@@ -562,7 +576,7 @@ class WebRTCCamera extends HTMLElement {
         // (correlates stream loss with the mobile app backgrounding / 5G handoff).
         this._logVisAbort = null;
 
-        console.info('[WebRTC Camera] v14.6.19');
+        console.info('[WebRTC Camera] v14.7.0');
     }
 
     setConfig(config) {
@@ -1813,6 +1827,25 @@ class WebRTCCamera extends HTMLElement {
                     this._logHA('debug', 'metrics', msg.value);
                     return;
                 }
+                // [MSE PLAYBACK HEALTH] The driver reports whether the ON-SCREEN picture is actually
+                // advancing (flow/stutter/frozen) — the truth the viewer sees, independent of RTC.
+                // MAIN driver only: a shadow's video is hidden, so its playback is not what's shown.
+                // Feeds the network dot (fills the MSE-only gap where the dot used to stay white) and
+                // the HA log (a freeze was previously invisible — socket alive, no band verdict).
+                if (msg.type === 'playback') {
+                    if (this.shadowDriver === newDriver) return;
+                    // Driver heartbeats the verdict every ~2s (keeps the dot fresh); log only when it
+                    // actually changes, so a steady state doesn't flood the HA log.
+                    const changed = msg.value !== this._lastPlayback;
+                    this._lastPlayback = msg.value;
+                    this._lastPlaybackAt = Date.now();
+                    this._paintNetDot();
+                    if (changed) {
+                        this._logHA(msg.value === 'frozen' ? 'warning' : 'debug', 'mse-playback',
+                            `${msg.value}${msg.detail ? ' — ' + msg.detail : ''}`);
+                    }
+                    return;
+                }
                 return this.shadowDriver === newDriver
                     ? this._onPreSwapShadowMessage(newDriver, msg)
                     : this._onMainMessage(newDriver, msg);
@@ -2504,18 +2537,24 @@ class WebRTCCamera extends HTMLElement {
         }
 
         // --- network-state indicator (opt-in) ---------------------------------
-        // Paints the .net-dot from the driver's band verdict (parsed off the metrics line in the
-        // message router). A staleness sweep returns it to white once band samples stop arriving —
-        // metrics only emit while an un-committed probe polls, so "no fresh sample" is the honest
-        // MSE-only/idle state. The paint helper is a no-op when the dot isn't in the DOM.
+        // Paints the .net-dot from the driver's band verdict (RTC probe) AND the MSE playback verdict
+        // (on-screen currentTime advance), worst-wins. A staleness sweep ages each signal out once its
+        // samples stop arriving — band metrics only emit while a probe polls, and a playback verdict is
+        // only re-sent on change — so a signal that has gone quiet for NET_DOT_STALE_MS is dropped and
+        // the dot falls back to the remaining sources (or white). The paint helper no-ops when absent.
         if (this._netTimer) { clearInterval(this._netTimer); this._netTimer = null; }
         if (this.config.network_indicator === true) {
             this._paintNetDot();
             this._netTimer = setInterval(() => {
-                if (this._lastBand && Date.now() - this._lastBandAt > this.NET_DOT_STALE_MS) {
-                    this._lastBand = '';
-                    this._paintNetDot();
+                const now = Date.now();
+                let changed = false;
+                if (this._lastBand && now - this._lastBandAt > this.NET_DOT_STALE_MS) {
+                    this._lastBand = ''; changed = true;
                 }
+                if (this._lastPlayback && now - this._lastPlaybackAt > this.NET_DOT_STALE_MS) {
+                    this._lastPlayback = ''; changed = true;
+                }
+                if (changed) this._paintNetDot();
             }, 1000);
             signal.addEventListener('abort', () => {
                 if (this._netTimer) { clearInterval(this._netTimer); this._netTimer = null; }
@@ -2523,16 +2562,23 @@ class WebRTCCamera extends HTMLElement {
         }
     }
 
-    // Paint the opt-in network-state dot. Precedence: a narrow-link SUPPRESSION latch forces RED
-    // (`path`) — MSE-only is a strong "network bad" verdict and it is exactly the window where the
-    // band signal falls silent (no RTC probe → no metrics), so without this the dot would decay to
-    // white precisely when the link is worst. Otherwise a fresh band verdict paints its colour, and
-    // white (no class) means genuinely no reading (startup/idle). Safe when the dot is absent.
+    // Paint the opt-in network-state dot as the WORST of every fresh health signal — the dot answers
+    // "how bad is it right now", so any red source wins. Three sources feed it:
+    //   • the narrow-link SUPPRESSION latch → red (MSE-only forced; strong "network bad");
+    //   • the RTC band verdict (perf/degr/path) parsed off the metrics line — only while a probe polls;
+    //   • the MSE PLAYBACK verdict (flow/stutter/frozen) — the on-screen currentTime-advance, which is
+    //     the ONLY signal on an MSE-only session (no probe → no band) and the one that caught the
+    //     "socket alive but picture frozen" case that used to leave the dot white when it was worst.
+    // Severity: white(0) < green(1) < yellow(2) < red(3). No class → white. No-op if the dot is absent.
     _paintNetDot() {
         const dot = this.shadowRoot && this.shadowRoot.querySelector('.net-dot');
         if (!dot) return;
+        const SEV = { perf: 1, degr: 2, path: 3, flow: 1, stutter: 2, frozen: 3 };
+        let sev = this._rtcSuppressed ? 3 : 0;
+        if (this._lastBand) sev = Math.max(sev, SEV[this._lastBand] || 0);
+        if (this._lastPlayback) sev = Math.max(sev, SEV[this._lastPlayback] || 0);
         dot.classList.remove('perf', 'degr', 'path');
-        const cls = this._rtcSuppressed ? 'path' : this._lastBand;
+        const cls = sev >= 3 ? 'path' : sev === 2 ? 'degr' : sev === 1 ? 'perf' : '';
         if (cls) dot.classList.add(cls);
     }
 
