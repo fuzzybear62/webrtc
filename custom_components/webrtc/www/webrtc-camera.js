@@ -25,6 +25,16 @@
  *
  * CHANGELOG
  * ---------
+ * v14.11.0 — [card-only, no driver change] Retires the per-card `mse_timeout` knob. It was the sole YAML
+ *   override of the driver's `DISCONNECT_TIMEOUT` (the MSE no-data watchdog base). The watchdog is now
+ *   self-configuring: the driver default (5000ms) is EXTENDED up to 6× while an un-committed RTC probe
+ *   starves the warm MSE (_effectiveDisconnectTimeout) and held at base for warm/committed so a dead
+ *   MSE stream is still reaped on time — so a fixed per-card number is no longer anyone's job. Field-
+ *   validated across a good-4G (all 4 cams promoted to RTC, stable) and a saturated-4G-path session
+ *   (2026-08-27): the in-flight-drain grid blackout (v14.10.0) and MSE ride-out both fired correctly with
+ *   the watchdog left at its self-adapting default, no reconnect storms. `mse_timeout: 0` (fully disable)
+ *   is intentionally NOT preserved — it was unsafe for warm MSE-only (a dead stream never reaped). No
+ *   fleet card set the knob, so removal is behaviour-neutral. Driver pin unchanged (?v=2.16.0).
  * v14.10.0 — [DRIVER CHANGE, pin ?v=2.15.0 → 2.16.0 — needs a PWA hard reload] the grid blackout now wins
  *   the RACE. v14.9.0's suppression fired correctly (field 2026-08-27, both `rtc-suppressed` lines seen) but
  *   TOO LATE: 3 cams promoted after it and the streams still collapsed. Two driver gaps, both fixed in
@@ -627,7 +637,7 @@ class WebRTCCamera extends HTMLElement {
         // (correlates stream loss with the mobile app backgrounding / 5G handoff).
         this._logVisAbort = null;
 
-        console.info('[WebRTC Camera] v14.10.0');
+        console.info('[WebRTC Camera] v14.11.0');
     }
 
     setConfig(config) {
@@ -1836,16 +1846,10 @@ class WebRTCCamera extends HTMLElement {
         if (Number.isFinite(proveMs) && proveMs > 0) newDriver.RTC_SWAP_PROVE_MS = proveMs;
         const firstFrameMs = Number(effectiveConfig.firstframe_timeout);
         if (Number.isFinite(firstFrameMs) && firstFrameMs > 0) newDriver.FIRSTFRAME_TIMEOUT = firstFrameMs;
-        // [TUNABLE] MSE no-data watchdog (ms). Fed by binary WS bytes = MSE liveness ONLY, so this
-        // is how long a stalled MSE stream is tolerated before a teardown+cold-restart. Default 5s
-        // is aggressive on lossy 4G — a transient TCP stall self-recovers, but the watchdog kills
-        // it first, turning a recoverable pause into a reconnect storm. Raise it (e.g. 12000) so
-        // mobile links ride out stalls. Unlike the knobs above, 0 is meaningful here: it EXPLICITLY
-        // disables the watchdog (never tear down on silence — the driver guards `if (!DISCONNECT_
-        // TIMEOUT) return`), so accept >= 0. Read live in `_feedWatchdog`; changing per-card YAML
-        // takes effect on a card reload, no driver pin bump / service-worker hard reload needed.
-        const mseTimeout = Number(effectiveConfig.mse_timeout);
-        if (Number.isFinite(mseTimeout) && mseTimeout >= 0) newDriver.DISCONNECT_TIMEOUT = mseTimeout;
+        // [MSE no-data watchdog] No longer per-card tunable (was `mse_timeout`, retired v14.11.0). The
+        // driver's `DISCONNECT_TIMEOUT` base (5s) is self-configuring — the adaptive block below and
+        // `_effectiveDisconnectTimeout` in the driver extend it during RTC probing and hold it at base
+        // for warm/committed, so a fixed per-card number is no longer anyone's job.
         // [TUNABLE] Adaptive MSE watchdog (Strato-1, driver v2.5.0). The watchdog above self-adapts:
         // it EXTENDS (never shortens) up to `mse_adapt_max_extend`× the base while an RTC probe is
         // congesting the warm MSE, driven by rttExcess/loss. These knobs exist for tuning even

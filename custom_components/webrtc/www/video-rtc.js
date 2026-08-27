@@ -126,7 +126,7 @@
  * - ADAPTIVE WATCHDOG (Strato-1). The MSE no-data watchdog is no longer a fixed 5s: a tiny in-loop
  *   controller (_updateCongestion / _effectiveDisconnectTimeout) turns the existing passive metrics
  *   into a smoothed `congestion` score [0,1] and EXTENDS the effective timeout up to ADAPT_MAX_EXTEND×
- *   the base (this.DISCONNECT_TIMEOUT / per-card `mse_timeout`) — never below it — but ONLY while an
+ *   the base (this.DISCONNECT_TIMEOUT, 5s default) — never below it — but ONLY while an
  *   un-committed RTC probe is live (negotiating/promoted), the one window where the MSE is starved by
  *   additive RTC load. Signal = rttExcess (rtt - session-min-rtt, the bufferbloat leading indicator)
  *   reinforced by loss% and a decaying `_rtcFutility` penalty bumped on every _revertToWarmMSE (a
@@ -1294,8 +1294,8 @@ export class VideoRTC extends HTMLElement {
     }
 
     /**
-     * [ADAPTIVE WATCHDOG] The live no-data timeout: the base (this.DISCONNECT_TIMEOUT, i.e. the
-     * per-card `mse_timeout` or the 5s default) EXTENDED by up to ADAPT_MAX_EXTEND× in proportion
+     * [ADAPTIVE WATCHDOG] The live no-data timeout: the base (this.DISCONNECT_TIMEOUT, the 5s
+     * default) EXTENDED by up to ADAPT_MAX_EXTEND× in proportion
      * to smoothed congestion — but ONLY while an un-committed RTC probe is live (negotiating /
      * promoted), the one window where the MSE is starved by additive RTC load. In 'warm' (MSE-only:
      * the pc-less regime with no rtt samples — a stall there means the stream is genuinely dead) and
