@@ -25,6 +25,17 @@
  *
  * CHANGELOG
  * ---------
+ * v14.13.0 — [DRIVER CHANGE, pin ?v=2.17.0 → 2.18.0 — needs a PWA hard reload] two field-driven refinements to
+ *   the v14.12.0 warm ride-out (grid 2026-08-27 14:28-14:30, new card+driver — Alg.2 serial + 30s ride both
+ *   validated on hardware). (1) BLACK-SCREEN GUARD: some cameras went to a BLACK element instead of holding the
+ *   last frame ("alcune camere vanno in black screen"). Cause: a terminal MediaError (code 3, corrupt fMP4 on
+ *   the saturated uplink) blacks the element and never self-recovers, but the byte trickle keeps feeding the
+ *   watchdog → held 30s black. Driver `_effectiveDisconnectTimeout` now reaps at base when `video.error` is set
+ *   (a benign underrun, which DOES self-recover, has no error → still held+ridden). (2) RETROACTIVE RE-ARM: the
+ *   3 MSE deaths at the blackout-latch boundary (field 49.58/50.40/53.22) were NOT Alg.2 churn — Alg.2 ran one
+ *   serial probe and denied the other 3 correctly. They were warm streams whose base(5s) watchdog was armed
+ *   just before the latch; `suppress()` now pushes the extend to every live warm stream the instant the
+ *   blackout latches (module-level `liveDrivers`). Both are driver-side; card change is only the pin + version.
  * v14.12.0 — [DRIVER CHANGE, pin ?v=2.16.0 → 2.17.0 — needs a PWA hard reload] closes the gap the v14.11.0
  *   retirement left open. That retirement made the watchdog self-configuring ONLY in the RTC-probe phases;
  *   'warm' MSE-only still reaped at a FIXED 5s. Field 2026-08-27 14:04-14:06 — the SAME saturated-4G grid,
@@ -483,7 +494,7 @@
  *   _promoteShadowToMain().
  */
 
-import {VideoRTC} from './video-rtc.js?v=2.17.0';
+import {VideoRTC} from './video-rtc.js?v=2.18.0';
 import {DigitalPTZ} from './digital-ptz.js?v=3.3.0';
 // [SIDECAR INTEGRATION] Import the Interaction module.
 // This module handles legacy features (Shortcuts, PTZ, Styles) to keep the core driver clean.
@@ -649,7 +660,7 @@ class WebRTCCamera extends HTMLElement {
         // (correlates stream loss with the mobile app backgrounding / 5G handoff).
         this._logVisAbort = null;
 
-        console.info('[WebRTC Camera] v14.12.0');
+        console.info('[WebRTC Camera] v14.13.0');
     }
 
     setConfig(config) {

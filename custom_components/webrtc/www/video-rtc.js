@@ -4,6 +4,20 @@
  * Derived from AlexxIT/WebRTC. Licensed under the MIT License — see LICENSE.
  */
 /**
+ * VideoRTC v2.18.0 - [black-screen guard + retroactive blackout re-arm] two field-driven refinements to the
+ *   v2.17.0 warm ride-out (grid 2026-08-27 14:28-14:30, new card+driver, validated Alg.2 serial + 30s ride).
+ *   (1) BLACK-SCREEN GUARD: the ride-out only pays off while the element HOLDS its last frame (a benign MSE
+ *   underrun, which self-recovers when the burst lands — the 21.95s/28.66s advances in the log). A terminal
+ *   MediaError (code 3, corrupt/keyframe-gapped fMP4 on the saturated uplink) BLACKS the element and never
+ *   self-recovers, yet the byte trickle keeps feeding the watchdog → we'd hold 30s of BLACK ("alcune camere
+ *   vanno in black screen"). _effectiveDisconnectTimeout now returns base when video.error is set → reap fast,
+ *   card reconnects to a clean keyframe. video.error is set only on real errors, never on an underrun → the
+ *   held-frame case is untouched. (2) RETROACTIVE RE-ARM: a warm stream that fell silent JUST BEFORE the
+ *   blackout latched still held a base(5s) timer from its last byte and reaped at the latch boundary (3 cams
+ *   at 49.58/50.40/53.22) before a byte could extend it — NOT Alg.2 churn (Alg.2 correctly ran one serial
+ *   probe, denied the other 3). suppress() now pushes the extend to every live warm stream (module-level
+ *   liveDrivers Set) the instant the blackout latches. Both reuse _effectiveDisconnectTimeout, so the black
+ *   guard also governs the retroactive path (a black element re-arms at base, not the extend).
  * VideoRTC v2.17.0 - [warm-blackout watchdog extend] the no-data watchdog was self-configuring ONLY in the
  *   RTC-probe phases; 'warm' MSE-only reaped at a FIXED 5s. Field 2026-08-27 14:04-14:06 (same saturated-4G
  *   grid as the good session, now WITHOUT the retired mse_timeout:0): warm MSE arrived frozen-but-fed
@@ -418,6 +432,9 @@ const _rtcProbeGate = {
     suppressedAt: 0,    // when the blackout began (diagnostics)
     SUPPRESS_MS: 300000,// grid RTC blackout after a band=path abort — matches the card's RTC_RETEST_MS
     reprobeTID: 0,      // re-arm backstop that lifts the blackout
+    liveDrivers: new Set(), // [v2.18.0] every connected VideoRTC on the page (main + shadow). On a
+                        // FRESH blackout latch we push the warm-extend to each so a watchdog already
+                        // armed at base(5s) can't reap a rideable stream at the latch boundary.
 
     /**
      * Await our turn to ramp. Resolves TRUE to proceed (gate OPEN/fat-pipe, or our serial turn) and
@@ -459,7 +476,17 @@ const _rtcProbeGate = {
             this.suppressed = false;
             console.debug(`[VideoRTC] RTC probe gate re-armed — ${Math.round(this.SUPPRESS_MS / 1000)}s band=path blackout elapsed.`);
         }, this.SUPPRESS_MS);
-        if (fresh) console.warn(`[VideoRTC:${driver.clientId}] RTC probe gate SUPPRESSED grid-wide (band=path) — no RTC probes for ${Math.round(this.SUPPRESS_MS / 1000)}s.`);
+        if (fresh) {
+            console.warn(`[VideoRTC:${driver.clientId}] RTC probe gate SUPPRESSED grid-wide (band=path) — no RTC probes for ${Math.round(this.SUPPRESS_MS / 1000)}s.`);
+            // [v2.18.0 retroactive re-arm] suppressed is set above, so every warm stream's effective
+            // no-data timeout is now the extend (30s). But a stream that fell silent JUST BEFORE this
+            // latch still holds a base(5s) timer from its last byte and would reap mid-blackout (field
+            // 2026-08-27: 3 cams reaped at 49.58/50.40/53.22, the latch boundary) before a byte could
+            // extend it. Push the extend to every live warm stream NOW so it rides the blackout out.
+            for (const d of this.liveDrivers) {
+                try { d._rearmWatchdogForBlackout(); } catch (e) { /* one driver must not block the grid */ }
+            }
+        }
         return fresh;
     },
 
@@ -1015,6 +1042,7 @@ export class VideoRTC extends HTMLElement {
         });
 
         this._startPlaybackSampler();
+        _rtcProbeGate.liveDrivers.add(this);   // [v2.18.0] join the grid so a blackout latch can re-arm our warm watchdog
         return true;
     }
 
@@ -1163,6 +1191,20 @@ export class VideoRTC extends HTMLElement {
             clearTimeout(this.reconnectTID);
             this.reconnectTID = 0;
         }
+    }
+
+    /**
+     * [v2.18.0 retroactive blackout re-arm] Called by _rtcProbeGate.suppress() on a FRESH grid
+     * blackout latch. The no-data watchdog re-arms at the effective timeout on every MSE byte, but a
+     * warm stream that fell silent JUST BEFORE the latch still holds a base(5s) timer from its last
+     * byte and would reap mid-blackout before any byte could extend it. Re-arm from NOW at the (now
+     * extended) effective timeout so a frozen-but-fed stream rides the blackout out. No-op unless we
+     * have a live socket AND an already-armed watchdog: we never CREATE one here (a torn-down or
+     * RTC-only driver stays untouched), and _feedWatchdog reads _effectiveDisconnectTimeout, so a
+     * video.error (black) or still-RTC-probing element correctly re-arms at base, not the extend.
+     */
+    _rearmWatchdogForBlackout() {
+        if (this.ws && this.reconnectTID) this._feedWatchdog();
     }
 
     /**
@@ -1320,13 +1362,26 @@ export class VideoRTC extends HTMLElement {
      * stream rides the blackout out; a TRULY dead stream is still reaped within 30s (BOUNDED — not
      * the ∞ of a global mse_timeout:0), and self-heals when the 300s blackout re-arms. Good/LAN paths
      * never suppress, so their warm reap stays at the base 5s — zero regression on healthy links.
+     * [v2.18.0] The extend is further gated on video.error == null: a decode-errored (BLACK) element
+     * never self-recovers, so it is reaped at base rather than held black for the whole blackout.
      * Never returns less than base; 0 (disabled) is honored by the caller's guard.
      */
     _effectiveDisconnectTimeout() {
         const base = this.DISCONNECT_TIMEOUT;
         if (!base || !this.ADAPTIVE_WATCHDOG) return base;
         const rtcProbing = this._rtcPhase === 'negotiating' || this._rtcPhase === 'promoted';
-        if (!rtcProbing) return _rtcProbeGate.suppressed ? base * this.ADAPT_MAX_EXTEND : base;
+        if (!rtcProbing) {
+            // [v2.18.0 black-screen guard] The warm-blackout ride-out only pays off while the
+            // element is HOLDING its last frame (a benign MSE underrun, video.error == null, which
+            // self-recovers when the burst lands — the 21.95s advance in the field log). A terminal
+            // MediaError (code 3 MEDIA_ERR_DECODE from a corrupt/keyframe-gapped fMP4 fragment on the
+            // saturated uplink) BLACKS the element and is unrecoverable without a fresh source: the
+            // byte trickle keeps feeding the watchdog, so without this we'd hold 30s of BLACK. Reap at
+            // base instead → the card reconnects to a clean keyframe. video.error is unambiguous (set
+            // only on real terminal errors, never on an underrun), so this can't reap a held frame.
+            if (this.video && this.video.error) return base;
+            return _rtcProbeGate.suppressed ? base * this.ADAPT_MAX_EXTEND : base;
+        }
         const mult = 1 + (this.ADAPT_MAX_EXTEND - 1) * Math.max(0, Math.min(1, this._congestion));
         return Math.round(base * mult);
     }
@@ -1396,6 +1451,7 @@ export class VideoRTC extends HTMLElement {
         // [RTC SERIALIZER — Alg.2] Leave the probe gate on teardown: drop from the queue if we
         // were still waiting our turn, or release the token if we were the active ramp.
         _rtcProbeGate.release(this);
+        _rtcProbeGate.liveDrivers.delete(this);  // [v2.18.0] leave the grid registry
         this._clearWatchdog();
         this._stopPlaybackSampler();
         if (this._firstFrameTID) {
