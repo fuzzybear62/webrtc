@@ -25,6 +25,13 @@
  *
  * CHANGELOG
  * ---------
+ * v14.15.0 — [DRIVER CHANGE, pin ?v=2.19.0 → 2.20.0 — needs a PWA hard reload] byte-aware watchdog (#1)
+ *   TELEMETRY. #1 was invisible in the field: the 2026-08-27 15:13 log could not confirm it fired, because
+ *   grid suppression latched at +15s and covered every warm ride-out. Now the driver mirrors two diagnostic-
+ *   only signals to the HA debug log under distinct keys: `ws-bursty` (a >=2.5s inter-chunk gap ARMED the
+ *   frozen-but-fed hold — edge-triggered) and `ws-reap` (a no-data-watchdog reap self-identifying its regime:
+ *   base / bursty-hold / suppressed-hold / black). An arm with NO following `base`-regime reap = #1 rode the
+ *   burst out. Debug level (needs `logger: logs: custom_components.webrtc.card: debug`). Zero behaviour change.
  * v14.14.0 — [DRIVER CHANGE, pin ?v=2.18.0 → 2.19.0 — needs a PWA hard reload] byte-aware watchdog (#1). The
  *   warm ride-out used to arm ONLY after a prior RTC probe latched a grid-wide blackout. Field 2026-08-27
  *   14:50-14:52 showed the gap: on a link so narrow the RTC probe itself is reaped at 5s (before it can latch
@@ -503,7 +510,7 @@
  *   _promoteShadowToMain().
  */
 
-import {VideoRTC} from './video-rtc.js?v=2.19.0';
+import {VideoRTC} from './video-rtc.js?v=2.20.0';
 import {DigitalPTZ} from './digital-ptz.js?v=3.3.0';
 // [SIDECAR INTEGRATION] Import the Interaction module.
 // This module handles legacy features (Shortcuts, PTZ, Styles) to keep the core driver clean.
@@ -669,7 +676,7 @@ class WebRTCCamera extends HTMLElement {
         // (correlates stream loss with the mobile app backgrounding / 5G handoff).
         this._logVisAbort = null;
 
-        console.info('[WebRTC Camera] v14.14.0');
+        console.info('[WebRTC Camera] v14.15.0');
     }
 
     setConfig(config) {
@@ -1252,6 +1259,12 @@ class WebRTCCamera extends HTMLElement {
             // [A0-grid] Shared probe gate blacked out RTC grid-wide after a band=path abort (this
             // camera's own abort, or a denied acquire because another camera tripped it). MSE-only.
             if (msg.value === 'rtc_suppressed') { this._enterGridSuppression(msg.detail); return; }
+            // [#1 TELEMETRY, v14.15.0] Byte-aware-watchdog milestones from the driver. Diagnostic
+            // only — mirror to the HA log under distinct event keys (they must NOT share _logHA's
+            // 10s name-throttle: an arm and a reap seconds apart must both land). Debug level:
+            // needs `logger: logs: custom_components.webrtc.card: debug`, like the metrics samples.
+            if (msg.value === 'ws_bursty_armed') { this._logHA('debug', 'ws-bursty', msg.detail); return; }
+            if (msg.value === 'ws_reap') { this._logHA('debug', 'ws-reap', msg.detail); return; }
             if (msg.value === 'rtc_sustained') return; // main already committed via its own flow
             if (msg.value === 'rtc_rejected' || msg.value === 'rtc_failed') {
                 // rtc_rejected: WebRTC negotiated but discarded (quality < MSE).

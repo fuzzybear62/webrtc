@@ -4,6 +4,13 @@
  * Derived from AlexxIT/WebRTC. Licensed under the MIT License — see LICENSE.
  */
 /**
+ * VideoRTC v2.20.0 - [byte-aware watchdog #1 — TELEMETRY] make #1 observable in the HA log (it was invisible:
+ *   the 2026-08-27 15:13 field log could not confirm #1 fired, because grid suppression latched at +15s and
+ *   covered every warm ride-out). Two diagnostic-only ui_sync signals, mirrored to the card's HA debug log
+ *   under distinct keys: `ws-bursty` = a >=2.5s inter-chunk gap ARMED the frozen-but-fed hold (edge-triggered,
+ *   no flood); `ws-reap` = a no-data-watchdog reap self-identifying its regime (base / bursty-hold /
+ *   suppressed-hold / black) + the base timeout. An arm with NO following base-regime reap = #1 rode the burst
+ *   out. Zero stream side effects — no change to _closeReason (the flap classifier keys on it) or the reap.
  * VideoRTC v2.19.0 - [byte-aware watchdog #1] the warm ride-out used to arm ONLY when a prior RTC probe had
  *   latched a grid-wide blackout (_rtcProbeGate.suppressed). Field 2026-08-27 14:50-14:52 exposed the gap: on
  *   a link so narrow that even the RTC probe is collateral-reaped at 5s (< the ~6s band-abort threshold),
@@ -1207,6 +1214,17 @@ export class VideoRTC extends HTMLElement {
         this.reconnectTID = setTimeout(() => {
             this.reconnectTID = 0;
             console.warn(`[VideoRTC:${this.clientId}] No-data watchdog fired (${timeout}ms silent, phase=${this._rtcPhase}, cong=${this._congestion.toFixed(2)}). Forcing close.`);
+            // [#1 TELEMETRY, v2.20.0] Self-identify WHICH regime set this reap timeout, so field
+            // logs show whether #1 (or suppression) was engaged at the death. base = neither held
+            // (the residual first-stall gap); bursty-hold = #1 extended; suppressed-hold = grid
+            // blackout extended; black = video.error fast-reap. No effect on _closeReason (the flap
+            // classifier keys on it) or the reap itself.
+            const base = this.DISCONNECT_TIMEOUT;
+            const regime = (this.video && this.video.error) ? 'black'
+                : _rtcProbeGate.suppressed ? 'suppressed-hold'
+                : this._wsBurstyFed() ? 'bursty-hold'
+                : 'base';
+            this._emitByteAwareDiag('ws_reap', `${timeout}ms (${regime}, base ${base}ms)`);
             this.handoff = false; // a stall is a failure, not an intentional handover
             this._closeReason = 'no-data-watchdog';
             this.onclose();
@@ -1229,9 +1247,30 @@ export class VideoRTC extends HTMLElement {
     _noteWsByte() {
         const now = Date.now();
         if (this._wsLastByteAt > 0 && (now - this._wsLastByteAt) >= this.WS_BURSTY_GAP_MS) {
+            const gap = now - this._wsLastByteAt;
+            const wasBursty = now < this._wsBurstyUntil;   // already inside a hold window?
             this._wsBurstyUntil = now + this.WS_BURSTY_MEMORY_MS;
+            // [#1 TELEMETRY, v2.20.0] One debug line per bursty ARM edge (not per byte): a
+            // >= WS_BURSTY_GAP_MS inter-chunk gap just primed/extended the frozen-but-fed hold.
+            // The absence of a subsequent ~base 'ws-reap' after this line = #1 rode the burst
+            // out (the win case, which otherwise leaves no trace). Edge-triggered to avoid flood.
+            if (!wasBursty) {
+                this._emitByteAwareDiag('ws_bursty_armed',
+                    `gap ${gap}ms → hold ${Math.round(this.WS_BURSTY_MEMORY_MS / 1000)}s`);
+            }
         }
         this._wsLastByteAt = now;
+    }
+
+    /**
+     * [#1 TELEMETRY, v2.20.0] Mirror one byte-aware-watchdog milestone to the card's HA log via
+     * the ui_sync signal channel (same path as rtc_suppressed/rtc_failed). Diagnostic ONLY — no
+     * stream side effects. The card routes it to a throttled _logHA('debug', 'ws-bursty' | 'ws-reap').
+     */
+    _emitByteAwareDiag(value, detail) {
+        if (this.onmessage && typeof this.onmessage['ui_sync'] === 'function') {
+            this.onmessage['ui_sync']({ type: 'signal', value, detail });
+        }
     }
 
     /**
