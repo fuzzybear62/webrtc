@@ -25,6 +25,17 @@
  *
  * CHANGELOG
  * ---------
+ * v14.9.0 — [DRIVER CHANGE, pin ?v=2.14.0 → 2.15.0 — needs a PWA hard reload] band=path RTC suppression
+ *   goes GRID-WIDE. v14.8.1 fed rtc-revert churn into the per-card flap score, but a third 4G field log
+ *   (2026-08-27) crashed HA anyway with every camera showing `rtc-flap: score=1.0/3` and no `rtc-suppressed`:
+ *   the crash was NOT re-probe churn but the INITIAL round — 4 cameras each doing ONE ~7s RTC-over-TURN probe
+ *   on a band=path uplink (exc 651→1011ms, rtt 826→1305ms; loss only ~15%, so the loss≥20% severity gate never
+ *   fired). The per-card score is structurally blind to that 4-camera aggregate. Fix lives in the driver's
+ *   shared gate (video-rtc.js 2.15.0): a band=path abort on ANY camera blacks out RTC probing for the WHOLE
+ *   page for 300s. The driver signals `rtc_suppressed`; the new `_enterGridSuppression` reflects it via the
+ *   EXISTING A0 latch (`_rtcSuppressed`) — MSE-only, `_stopReprobe`, RED net dot, one throttled `rtc-suppressed`
+ *   HA line — self-releasing through `_maybeExpireSuppression` (RTC_RETEST_MS 300s, aligned with the gate). On
+ *   LAN band=path never fires (exc≈0), so LAN is untouched. Wired on both the main and shadow signal paths.
  * v14.8.1 — [card-only, no driver/pin change — still needs a PWA hard reload to fetch the new card JS]
  *   A0 suppression now sees rtc-revert CHURN, not just socket deaths. Two 4G field logs (2026-08-27) crashed
  *   HA the same way: a single canary cam kept probing→aborting (band=path)→re-probing→committing→stalling
@@ -439,7 +450,7 @@
  *   _promoteShadowToMain().
  */
 
-import {VideoRTC} from './video-rtc.js?v=2.14.0';
+import {VideoRTC} from './video-rtc.js?v=2.15.0';
 import {DigitalPTZ} from './digital-ptz.js?v=3.3.0';
 // [SIDECAR INTEGRATION] Import the Interaction module.
 // This module handles legacy features (Shortcuts, PTZ, Styles) to keep the core driver clean.
@@ -605,7 +616,7 @@ class WebRTCCamera extends HTMLElement {
         // (correlates stream loss with the mobile app backgrounding / 5G handoff).
         this._logVisAbort = null;
 
-        console.info('[WebRTC Camera] v14.8.1');
+        console.info('[WebRTC Camera] v14.9.0');
     }
 
     setConfig(config) {
@@ -1128,6 +1139,9 @@ class WebRTCCamera extends HTMLElement {
      */
     _onPreSwapShadowMessage(newDriver, msg) {
         if (msg.type === 'signal') {
+            // [A0-grid] The driver's shared probe gate blacked out RTC after a band=path abort. A
+            // shadow probe that was denied (or aborted band=path) reports it here; reflect it and stop.
+            if (msg.value === 'rtc_suppressed') { this._enterGridSuppression(msg.detail); return; }
             // [SHADOW-SWAP GATE] The shadow's RTC has now held gaplessly for RTC_SWAP_PROVE_MS —
             // PROVEN durable. THIS is where we swap it in to replace the MSE main (never at the
             // 2s promote in onpcvideo). On a throttled path the shadow stalls before this fires,
@@ -1182,6 +1196,9 @@ class WebRTCCamera extends HTMLElement {
      */
     _onMainMessage(newDriver, msg) {
         if (msg.type === 'signal') {
+            // [A0-grid] Shared probe gate blacked out RTC grid-wide after a band=path abort (this
+            // camera's own abort, or a denied acquire because another camera tripped it). MSE-only.
+            if (msg.value === 'rtc_suppressed') { this._enterGridSuppression(msg.detail); return; }
             if (msg.value === 'rtc_sustained') return; // main already committed via its own flow
             if (msg.value === 'rtc_rejected' || msg.value === 'rtc_failed') {
                 // rtc_rejected: WebRTC negotiated but discarded (quality < MSE).
@@ -1579,6 +1596,20 @@ class WebRTCCamera extends HTMLElement {
     // happy MSE-only stream that never reconnects is deliberately left undisturbed (MSE-only is
     // fully watchable — the whole point of the latch — so RTC is re-tested opportunistically on
     // the next cold start rather than by tearing down a working picture).
+    // [A0-grid] The driver's shared probe gate blacked out RTC across the WHOLE grid after a band=path
+    // abort (see video-rtc.js _rtcProbeGate.suppress) — the cross-card signal the per-card flap score
+    // (_accrueFlap) is structurally blind to. Reflect it in this card exactly like the per-card A0
+    // latch: MSE-only, stop re-probing, RED net dot, one throttled HA line. Self-releases via
+    // _maybeExpireSuppression (RTC_RETEST_MS), aligned with the gate's own SUPPRESS_MS.
+    _enterGridSuppression(detail) {
+        if (this._rtcSuppressed) return;                       // already latched (per-card or grid)
+        this._rtcSuppressed = true;
+        this._rtcSuppressedAt = Date.now();
+        this._stopReprobe();
+        this._logHA('warning', 'rtc-suppressed', detail || 'grid blackout (band=path) — MSE-only');
+        this._paintNetDot();
+    }
+
     _maybeExpireSuppression() {
         if (!this._rtcSuppressed) return;
         if (Date.now() - this._rtcSuppressedAt < this.RTC_RETEST_MS) return;

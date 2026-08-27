@@ -4,6 +4,16 @@
  * Derived from AlexxIT/WebRTC. Licensed under the MIT License — see LICENSE.
  */
 /**
+ * VideoRTC v2.15.0 - [A0-grid: band=path blackout is grid-wide] the shared RTC probe gate (_rtcProbeGate)
+ *   gains a SUPPRESSED state. When ANY camera aborts a probe with band=path (the constrained-uplink
+ *   verdict), the gate blacks out RTC probing across the WHOLE page for SUPPRESS_MS (300s): acquire()
+ *   now resolves a boolean and returns FALSE while suppressed → every camera abstains and stays on the
+ *   already-flowing MSE. This closes the crash the per-card flap score (webrtc-camera.js _accrueFlap)
+ *   is structurally blind to: on band=path 4G, each of 4 cards reverts exactly ONCE (score 1.0, never
+ *   latches) yet the AGGREGATE of 4 one-shot ~7s RTC-over-TURN probes saturates the shared uplink and
+ *   drops the HA socket (field 2026-08-27, two crashes; a third under v14.8.1 confirmed the per-card
+ *   score maxes at 1.0/3). The aborting camera emits one rtc_suppressed to its card (MSE-only + RED
+ *   dot); the others learn at their next denied acquire. degr/'' still only re-serialize, as before.
  * VideoRTC v2.14.0 - [MSE ride-out — work item B, first ACTING step] the playback sampler now DOES
  *   something with a sustained freeze instead of only reporting it: `_maybeRideOut` counts consecutive
  *   'frozen' samples on the MSE element and, past PB_FROZEN_SAMPLES (~6s), nudges currentTime to the live
@@ -379,15 +389,52 @@ const _rtcProbeGate = {
     open: false,        // true once the canary reports band=perf: fat pipe, ramp everyone in parallel
     LEASE_MS: 20000,    // hard cap on any single hold (comfortably above RTC_GATE_SETTLE_MS,
                         // far below the 120s FIRSTFRAME give-up so a frozen probe can't wedge us)
+    suppressed: false,  // [A0-grid] true = a band=path abort has blacked out RTC probing GRID-WIDE
+    suppressedAt: 0,    // when the blackout began (diagnostics)
+    SUPPRESS_MS: 300000,// grid RTC blackout after a band=path abort — matches the card's RTC_RETEST_MS
+    reprobeTID: 0,      // re-arm backstop that lifts the blackout
 
-    /** Await our turn to ramp. Resolves immediately when the gate is OPEN (fat pipe) or free. */
+    /**
+     * Await our turn to ramp. Resolves TRUE to proceed (gate OPEN/fat-pipe, or our serial turn) and
+     * FALSE to abstain (a band=path grid blackout is in effect — the caller stays on MSE).
+     */
     acquire(driver) {
         return new Promise(resolve => {
-            if (this.open) resolve();                          // fat pipe: no serialization
+            if (this.suppressed) resolve(false);               // [A0-grid] blackout: abstain, stay MSE
+            else if (this.open) resolve(true);                 // fat pipe: no serialization
             else if (!this.holder) this._grant(driver, resolve);
-            else if (this.holder === driver) resolve();        // re-entrant: already ours
+            else if (this.holder === driver) resolve(true);    // re-entrant: already ours
             else this.queue.push({ driver, resolve });
         });
+    },
+
+    /**
+     * [A0-grid] A band=path RTC abort on ANY camera means the SHARED uplink cannot carry RTC — not
+     * just for the camera that aborted. The per-card flap score (webrtc-camera.js) can't see this:
+     * each card reverts once (score 1.0), and 4 independent cards each burning one ~7s RTC-over-TURN
+     * probe together saturate the uplink and drop the HA socket (field 2026-08-27, two crashes). So
+     * black out RTC probing GRID-WIDE for SUPPRESS_MS: deny every acquire, drop any serial holder and
+     * queue, and let MSE (already flowing, zero extra load) carry every camera. Self-releasing. Returns
+     * TRUE on the FRESH transition so the caller emits one rtc_suppressed to its card; a repeat hit
+     * just refreshes the window.
+     */
+    suppress(driver) {
+        const fresh = !this.suppressed;
+        this.suppressed = true;
+        this.suppressedAt = Date.now();
+        this.open = false;
+        if (this.leaseTID) { clearTimeout(this.leaseTID); this.leaseTID = 0; }
+        this.holder = null;
+        const waiters = this.queue.splice(0);
+        for (const w of waiters) w.resolve(false);             // deny everyone already queued to ramp
+        if (this.reprobeTID) clearTimeout(this.reprobeTID);
+        this.reprobeTID = setTimeout(() => {
+            this.reprobeTID = 0;
+            this.suppressed = false;
+            console.debug(`[VideoRTC] RTC probe gate re-armed — ${Math.round(this.SUPPRESS_MS / 1000)}s band=path blackout elapsed.`);
+        }, this.SUPPRESS_MS);
+        if (fresh) console.warn(`[VideoRTC:${driver.clientId}] RTC probe gate SUPPRESSED grid-wide (band=path) — no RTC probes for ${Math.round(this.SUPPRESS_MS / 1000)}s.`);
+        return fresh;
     },
 
     /** Give up the token, or leave the queue if not yet holder. Idempotent. No-op while OPEN. */
@@ -407,13 +454,14 @@ const _rtcProbeGate = {
      * band=path re-arms serialization; degr/'' are left ambiguous and change nothing.
      */
     reportBand(driver, band) {
+        if (this.suppressed) return;                           // [A0-grid] blackout wins over a stale perf sample
         if (band === 'perf' && !this.open) {
             console.debug(`[VideoRTC:${driver.clientId}] RTC probe gate OPEN — canary band=perf, fat pipe, parallel ramps allowed.`);
             this.open = true;
             if (this.leaseTID) { clearTimeout(this.leaseTID); this.leaseTID = 0; }
             this.holder = null;
             const waiters = this.queue.splice(0);              // drain the whole queue at once
-            for (const w of waiters) w.resolve();
+            for (const w of waiters) w.resolve(true);
         } else if (band === 'path' && this.open) {
             console.debug(`[VideoRTC:${driver.clientId}] RTC probe gate SERIAL — band=path, constrained link, re-serializing ramps.`);
             this.open = false;
@@ -427,7 +475,7 @@ const _rtcProbeGate = {
             this.leaseTID = 0;
             this.release(driver);
         }, this.LEASE_MS);
-        resolve();
+        resolve(true);
     },
 };
 
@@ -1161,6 +1209,16 @@ export class VideoRTC extends HTMLElement {
             `(band=${this._bandClass || '?'} exc=${this._bandExcess >= 0 ? Math.round(this._bandExcess) + 'ms' : '?'} ` +
             `integral ${held}ms >= ${hold}ms, phase=${this._rtcPhase}, ` +
             `futility=${this._rtcFutility.toFixed(2)}).`);
+        // [A0-grid] band=path = the SHARED uplink is constrained, so black out RTC for the WHOLE grid,
+        // not just this camera. The per-card flap score can't see the 4-camera aggregate that crashes
+        // HA (each card only reverts once → score 1.0, never latches). One fresh transition → one
+        // rtc_suppressed to this card so it goes MSE-only + RED; other cameras learn at their next
+        // (denied) acquire. degr/'' stay ambiguous and only re-serialize (reportBand), as before.
+        if (this._bandClass === 'path' && _rtcProbeGate.suppress(this)
+            && this.onmessage && typeof this.onmessage['ui_sync'] === 'function') {
+            this.onmessage['ui_sync']({ type: 'signal', value: 'rtc_suppressed',
+                detail: `grid blackout (band=path) — RTC paused ${Math.round(_rtcProbeGate.SUPPRESS_MS / 1000)}s` });
+        }
         this._revertToWarmMSE(`RTC aborted: sustained bad band (band=${this._bandClass || '?'}, ${held}ms)`);
     }
 
@@ -1612,7 +1670,14 @@ export class VideoRTC extends HTMLElement {
         // prevent and must not wait behind other cameras' ramps for its ONLY video. If this driver
         // is torn down while still queued, ondisconnect()/_revertToWarmMSE drop it from the queue.
         if (!this.mode.includes('mse')) { this._openWebRTC(); return; }
-        _rtcProbeGate.acquire(this).then(() => {
+        _rtcProbeGate.acquire(this).then((go) => {
+            if (!go) {   // [A0-grid] a band=path grid blackout is in effect — abstain, stay on MSE, tell the card
+                if (this.onmessage && typeof this.onmessage['ui_sync'] === 'function') {
+                    this.onmessage['ui_sync']({ type: 'signal', value: 'rtc_suppressed',
+                        detail: 'grid blackout (band=path) — RTC probe denied' });
+                }
+                return;
+            }
             if (!this.ws) { _rtcProbeGate.release(this); return; }  // torn down while queued
             this._openWebRTC();
         });
