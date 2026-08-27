@@ -25,6 +25,16 @@
  *
  * CHANGELOG
  * ---------
+ * v14.8.0 — [DRIVER CHANGE, pin ?v=2.13.1 → 2.14.0 — needs a PWA hard reload] MSE ride-out (work item B,
+ *   first ACTING step). The v14.7.x sensor proved a sustained MSE freeze is detectable while the socket stays
+ *   alive (bursty 4G: bytes trickle in, the no-data watchdog never fires, but the <video> is frozen). Until
+ *   now the ONLY recovery on that path was the watchdog eventually forcing onclose() → mode:mse->none →
+ *   escalating retry storm (attempts #1-#6, backoff 15-21s) — cams never settle. The driver now nudges a
+ *   sustained-frozen MSE (~6s of frozen samples) to the live edge non-destructively — recovering the picture
+ *   WITHOUT dropping the socket — and only falls back to the watchdog for a genuine underrun (no buffer
+ *   ahead). Card side: mirrors the driver's {type:'rideout'} to HA as `mse-rideout` so field logs show the
+ *   recovery firing. The `mse_timeout` knob (→ watchdog) stays as the fallback for now; it retires once
+ *   ride-out is field-proven to carry lossy 4G on its own. Driver pin ?v=2.14.0.
  * v14.7.1 — [DRIVER CHANGE, pin ?v=2.13.0 → 2.13.1 — needs a PWA hard reload] Playback sampler element-swap
  *   guard. First v14.7.0 field log validated the sensor (it logged `mse-playback: frozen` on esternacancello
  *   / extgate exactly where the log otherwise claimed "stream-stable healthy 20s" — the blind spot is
@@ -418,7 +428,7 @@
  *   _promoteShadowToMain().
  */
 
-import {VideoRTC} from './video-rtc.js?v=2.13.1';
+import {VideoRTC} from './video-rtc.js?v=2.14.0';
 import {DigitalPTZ} from './digital-ptz.js?v=3.3.0';
 // [SIDECAR INTEGRATION] Import the Interaction module.
 // This module handles legacy features (Shortcuts, PTZ, Styles) to keep the core driver clean.
@@ -584,7 +594,7 @@ class WebRTCCamera extends HTMLElement {
         // (correlates stream loss with the mobile app backgrounding / 5G handoff).
         this._logVisAbort = null;
 
-        console.info('[WebRTC Camera] v14.7.1');
+        console.info('[WebRTC Camera] v14.8.0');
     }
 
     setConfig(config) {
@@ -1852,6 +1862,15 @@ class WebRTCCamera extends HTMLElement {
                         this._logHA(msg.value === 'frozen' ? 'warning' : 'debug', 'mse-playback',
                             `${msg.value}${msg.detail ? ' — ' + msg.detail : ''}`);
                     }
+                    return;
+                }
+                // [MSE RIDE-OUT] The driver nudged a sustained-frozen MSE to the live edge instead of
+                // tearing the socket down. Mirror to HA so a field log shows the non-destructive recovery
+                // firing (and, by its ABSENCE-then-recovery pattern, whether it beat the watchdog storm).
+                // MAIN driver only — a shadow's hidden MSE is never what the viewer sees.
+                if (msg.type === 'rideout') {
+                    if (this.shadowDriver === newDriver) return;
+                    this._logHA('warning', 'mse-rideout', msg.detail || msg.value);
                     return;
                 }
                 return this.shadowDriver === newDriver

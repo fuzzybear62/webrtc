@@ -4,6 +4,16 @@
  * Derived from AlexxIT/WebRTC. Licensed under the MIT License — see LICENSE.
  */
 /**
+ * VideoRTC v2.14.0 - [MSE ride-out — work item B, first ACTING step] the playback sampler now DOES
+ *   something with a sustained freeze instead of only reporting it: `_maybeRideOut` counts consecutive
+ *   'frozen' samples on the MSE element and, past PB_FROZEN_SAMPLES (~6s), nudges currentTime to the live
+ *   edge (a non-destructive reseek) — recovering the picture WITHOUT the no-data watchdog's onclose() that
+ *   tore the socket into the escalating retry storm on lossy 4G. MSE element only (the promoted RTC overlay
+ *   has empty seekable + its own liveness); acts only when there is unplayed buffer AHEAD of currentTime
+ *   (else it's a true underrun — nothing to jump to — and the watchdog fallback is correct); cooldown-gated
+ *   (RIDEOUT_COOLDOWN_MS) so it nudges at most once per window and gives the nudge a fresh window to prove
+ *   it worked. Emits ui_sync {type:'rideout'} → card logs `mse-rideout` in HA. The no-data watchdog still
+ *   exists as the fallback for a genuine underrun; this just handles the recoverable stall first.
  * VideoRTC v2.13.1 - [playback sampler: element-swap guard] the sampler now tracks the identity of the
  *   element it measured last tick; when onscreenVideo flips (MSE this.video <-> promoted RTC overlay
  *   _rtcVideo) the baseline belongs to the other element, so the cross-element delta is discarded and the
@@ -476,6 +486,15 @@ export class VideoRTC extends HTMLElement {
         this.PB_SAMPLE_MS = 2000;  // sampler cadence
         this.PB_FLOW_RATIO = 0.7;  // EWMA >= this → flowing (green)
         this.PB_FROZEN_RATIO = 0.15; // EWMA <= this → frozen (red); in between → stutter (yellow)
+        // [MSE RIDE-OUT — work item B] When the sampler sees a SUSTAINED freeze on the MSE element,
+        // nudge the picture to the live edge (a non-destructive reseek) instead of letting the no-data
+        // watchdog tear the socket down into a retry storm. Complements the updateend strand-recovery,
+        // which only fires when currentTime fell BELOW buffered.start (evicted region); this covers the
+        // bursty-4G freeze where the element stalls with data still buffered ahead of it.
+        this._pbFrozenRun = 0;       // consecutive 'frozen' samples on the MSE element
+        this._rideoutAt = 0;         // wall-clock ms of the last ride-out reseek (cooldown gate)
+        this.PB_FROZEN_SAMPLES = 3;  // sustained frozen (~6s) before a nudge — below the 5s watchdog's storm
+        this.RIDEOUT_COOLDOWN_MS = 10000; // don't reseek more than once per this window
         // After handoff the RTC media flows P2P off the ws, so the MSE no-data
         // watchdog can never see it stall. This is the liveness deadline for the
         // *promoted* RTC stream: if framesDecoded stops advancing for this long the
@@ -925,6 +944,7 @@ export class VideoRTC extends HTMLElement {
     _startPlaybackSampler() {
         if (this._pbTimer) return;
         this._pbLastAt = 0; this._pbLastCT = -1; this._pbLastEl = null; this._pbRatio = 1; this._pbClass = '';
+        this._pbFrozenRun = 0;
         this._pbTimer = setInterval(() => this._samplePlayback(), this.PB_SAMPLE_MS);
     }
 
@@ -969,6 +989,49 @@ export class VideoRTC extends HTMLElement {
             this.onmessage['ui_sync']({
                 type: 'playback', value: this._pbClass,
                 detail: `advanced ${dtMedia.toFixed(2)}s / ${dtWall.toFixed(1)}s wall (ewma ${this._pbRatio.toFixed(2)})`,
+            });
+        }
+        // [RIDE-OUT — B] Count sustained frozen samples on THIS element and, past the threshold, try a
+        // non-destructive live-edge nudge. Counter is per-element: the swap re-prime above `return`s
+        // before here, so a promote/revert can't inflate the run across two elements.
+        if (this._pbClass === 'frozen') this._pbFrozenRun++; else this._pbFrozenRun = 0;
+        this._maybeRideOut(v);
+    }
+
+    /**
+     * [MSE RIDE-OUT — work item B] A sustained MSE freeze: nudge the on-screen picture to the live
+     * edge instead of waiting for the no-data watchdog to force onclose() (which tears the socket down
+     * into the escalating retry storm seen on lossy 4G). MSE element ONLY — the promoted RTC overlay
+     * has empty seekable and its own liveness (first-frame poll + band). Only acts when there is unplayed
+     * buffer AHEAD of currentTime: if the element is at the buffered end it's a true underrun (nothing
+     * to jump to), the reseek would be a no-op, and the watchdog fallback is the correct response.
+     * Cooldown-gated so we nudge at most once per RIDEOUT_COOLDOWN_MS and give it a fresh window to work.
+     */
+    _maybeRideOut(v) {
+        if (this._pbFrozenRun < this.PB_FROZEN_SAMPLES) return;
+        if (this._manualHold) return;
+        if (v !== this.video || this._rtcPhase === 'promoted') return;  // MSE on screen only
+        const now = Date.now();
+        if (now - this._rideoutAt < this.RIDEOUT_COOLDOWN_MS) return;
+        let bEnd = -1;
+        const ct = v.currentTime;
+        try {
+            const b = v.buffered;
+            if (b && b.length) bEnd = b.end(b.length - 1);
+        } catch (e) { return; }
+        if (bEnd <= ct + 0.3) return;   // no buffer ahead → true underrun, let the watchdog handle it
+        this._rideoutAt = now;
+        this._pbFrozenRun = 0;          // give the nudge a fresh window to prove it un-froze the picture
+        const ahead = bEnd - ct;
+        try {
+            v.currentTime = bEnd;
+            if (v.paused) v.play().catch(() => {});
+        } catch (e) { return; }
+        console.warn(`[VideoRTC:${this.clientId}] MSE ride-out reseek: +${ahead.toFixed(1)}s to live edge (was frozen).`);
+        if (this.onmessage && typeof this.onmessage['ui_sync'] === 'function') {
+            this.onmessage['ui_sync']({
+                type: 'rideout', value: 'reseek',
+                detail: `live-edge nudge +${ahead.toFixed(1)}s (sustained frozen)`,
             });
         }
     }
