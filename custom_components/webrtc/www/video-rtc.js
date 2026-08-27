@@ -4,6 +4,18 @@
  * Derived from AlexxIT/WebRTC. Licensed under the MIT License — see LICENSE.
  */
 /**
+ * VideoRTC v2.17.0 - [warm-blackout watchdog extend] the no-data watchdog was self-configuring ONLY in the
+ *   RTC-probe phases; 'warm' MSE-only reaped at a FIXED 5s. Field 2026-08-27 14:04-14:06 (same saturated-4G
+ *   grid as the good session, now WITHOUT the retired mse_timeout:0): warm MSE arrived frozen-but-fed
+ *   (30-60 KB/s per the BENCHMARKs, frames not advancing) → reaped at 5s → reconnect storm (6 deaths/cam,
+ *   backoff climbing to 23s, flap 8.5/3), each reconnect burning the scarce uplink and CONVERTING a
+ *   frozen-but-fed stream into 23s of dead air (flow windows at 14:05:33 / 14:06:26 were thrown away).
+ *   Fix: _effectiveDisconnectTimeout now extends WARM to base×ADAPT_MAX_EXTEND (30s) too, but ONLY while
+ *   the grid-wide band=path blackout is latched (_rtcProbeGate.suppressed) — the known-saturated window.
+ *   This is the self-configuring successor to the old per-card mse_timeout:0 ride-out: bounded (30s, not ∞
+ *   → a truly-dead cam is still reaped), conditional (good/LAN never suppress → warm reap stays 5s, zero
+ *   regression), and keyed on a signal already shipped+field-validated (v2.15.0's suppressed gate). ~4 LOC,
+ *   one function; the churn in the first ~33s (pre-suppression promote ramp) stays Alg.2's job. No knob.
  * VideoRTC v2.16.0 - [A0-grid, race fix] two gaps let the grid blackout fire too LATE to stop the crash
  *   (field 2026-08-27, v14.9.0: suppression fired at 10:36:55 yet 3 cams promoted after and the streams
  *   collapsed). (1) The gate used to OPEN on a single band=perf sample from the canary — but at the promote
@@ -1297,16 +1309,24 @@ export class VideoRTC extends HTMLElement {
      * [ADAPTIVE WATCHDOG] The live no-data timeout: the base (this.DISCONNECT_TIMEOUT, the 5s
      * default) EXTENDED by up to ADAPT_MAX_EXTEND× in proportion
      * to smoothed congestion — but ONLY while an un-committed RTC probe is live (negotiating /
-     * promoted), the one window where the MSE is starved by additive RTC load. In 'warm' (MSE-only:
-     * the pc-less regime with no rtt samples — a stall there means the stream is genuinely dead) and
-     * 'committed' (MSE already released) it returns the base unchanged, so a dead stream is still
-     * reaped on time. Never returns less than base; 0 (disabled) is honored by the caller's guard.
+     * promoted), the one window where the MSE is starved by additive RTC load.
+     *
+     * [v2.17.0 warm-blackout extend] In 'warm'/'committed' the default is the base (a pc-less MSE
+     * stall = genuine death, reap on time). ONE exception: while a grid-wide band=path blackout is
+     * latched (_rtcProbeGate.suppressed), the shared uplink is KNOWN-saturated — warm MSE arrives in
+     * >5s bursts (frozen-but-fed, 30-60 KB/s still flowing per the field BENCHMARKs), so reaping +
+     * reconnect only burns the scarce uplink (the mse_timeout:0 lesson) and stampedes the whole grid
+     * into a retry storm. There we extend warm to base×ADAPT_MAX_EXTEND (30s) so a frozen-but-fed
+     * stream rides the blackout out; a TRULY dead stream is still reaped within 30s (BOUNDED — not
+     * the ∞ of a global mse_timeout:0), and self-heals when the 300s blackout re-arms. Good/LAN paths
+     * never suppress, so their warm reap stays at the base 5s — zero regression on healthy links.
+     * Never returns less than base; 0 (disabled) is honored by the caller's guard.
      */
     _effectiveDisconnectTimeout() {
         const base = this.DISCONNECT_TIMEOUT;
         if (!base || !this.ADAPTIVE_WATCHDOG) return base;
         const rtcProbing = this._rtcPhase === 'negotiating' || this._rtcPhase === 'promoted';
-        if (!rtcProbing) return base;
+        if (!rtcProbing) return _rtcProbeGate.suppressed ? base * this.ADAPT_MAX_EXTEND : base;
         const mult = 1 + (this.ADAPT_MAX_EXTEND - 1) * Math.max(0, Math.min(1, this._congestion));
         return Math.round(base * mult);
     }

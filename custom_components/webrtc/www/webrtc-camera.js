@@ -25,6 +25,18 @@
  *
  * CHANGELOG
  * ---------
+ * v14.12.0 — [DRIVER CHANGE, pin ?v=2.16.0 → 2.17.0 — needs a PWA hard reload] closes the gap the v14.11.0
+ *   retirement left open. That retirement made the watchdog self-configuring ONLY in the RTC-probe phases;
+ *   'warm' MSE-only still reaped at a FIXED 5s. Field 2026-08-27 14:04-14:06 — the SAME saturated-4G grid,
+ *   now genuinely knob-less (the "no reconnect storms" note on v14.11.0 below was measured on the OLD
+ *   mse_timeout:0 sessions, NOT this one) — showed the miss: warm MSE arrived frozen-but-fed (30-60 KB/s
+ *   flowing, frames not advancing) → reaped at 5s → reconnect storm (6 deaths/cam, backoff to 23s, flap
+ *   8.5/3), each reconnect burning the scarce uplink and turning a fed stream into 23s of dead air. Fix
+ *   (driver `_effectiveDisconnectTimeout`, ~4 LOC): extend WARM to base×6 (30s) too, but ONLY while the
+ *   grid-wide band=path blackout is latched (`_rtcProbeGate.suppressed`). Self-configuring successor to
+ *   mse_timeout:0's ride-out — BOUNDED (30s not ∞ → a truly-dead cam is still reaped), CONDITIONAL
+ *   (good/LAN never suppress → warm reap stays 5s, zero regression), keyed on a shipped+validated signal
+ *   (v2.15.0's gate). First ~33s of promote-churn stays Alg.2's job (cross-grid serialized ramp). No knob.
  * v14.11.0 — [card-only, no driver change] Retires the per-card `mse_timeout` knob. It was the sole YAML
  *   override of the driver's `DISCONNECT_TIMEOUT` (the MSE no-data watchdog base). The watchdog is now
  *   self-configuring: the driver default (5000ms) is EXTENDED up to 6× while an un-committed RTC probe
@@ -471,7 +483,7 @@
  *   _promoteShadowToMain().
  */
 
-import {VideoRTC} from './video-rtc.js?v=2.16.0';
+import {VideoRTC} from './video-rtc.js?v=2.17.0';
 import {DigitalPTZ} from './digital-ptz.js?v=3.3.0';
 // [SIDECAR INTEGRATION] Import the Interaction module.
 // This module handles legacy features (Shortcuts, PTZ, Styles) to keep the core driver clean.
@@ -637,7 +649,7 @@ class WebRTCCamera extends HTMLElement {
         // (correlates stream loss with the mobile app backgrounding / 5G handoff).
         this._logVisAbort = null;
 
-        console.info('[WebRTC Camera] v14.11.0');
+        console.info('[WebRTC Camera] v14.12.0');
     }
 
     setConfig(config) {
