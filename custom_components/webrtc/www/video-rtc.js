@@ -4,6 +4,18 @@
  * Derived from AlexxIT/WebRTC. Licensed under the MIT License — see LICENSE.
  */
 /**
+ * VideoRTC v2.21.0 - [MSE-reap grid latch] close the cold-start reconnect storm. Field 2026-08-27 19:37 (on
+ *   v2.20.0 telemetry): the first wave of MSE sockets on a saturated uplink bursts data then chokes; each reaps
+ *   at base 5s BEFORE any RTC probe survives the ~6s to trip band=path `suppressed`, AND before #1 can witness
+ *   a >=2.5s inter-chunk gap (a fresh burst-then-silence leaves no gap to arm on) — 7 of 8 reaps were `base`
+ *   regime in the first ~40s, one camera died 3x. Fix: _rtcProbeGate.noteMseReap() counts DISTINCT cameras
+ *   (streamKey) whose no-data-watchdog reaps land within MSE_REAP_WINDOW_MS (10s); >= MSE_REAP_QUORUM (2) latches
+ *   `mseReapCongested` for MSE_REAP_HOLD_MS (60s, sliding) and retroactively re-arms every live warm socket, so
+ *   the grid rides out the cold-start choke instead of churning. Self-clearing, bounded, superseded by band=path
+ *   suppress() (300s) once a probe survives; a single dead camera can't reach quorum and a healthy grid never
+ *   reaps → zero regression. Also folds in the v2.20.1 telemetry-label fix: `ws-reap` regime is now captured at
+ *   watchdog ARM time (not recomputed at fire, up to `timeout` ms later) — 19:37:47's contradictory
+ *   `ws-reap: 30000ms (base …)` was really a #1 bursty-hold win mislabelled by the lapsed 30s memory window.
  * VideoRTC v2.20.0 - [byte-aware watchdog #1 — TELEMETRY] make #1 observable in the HA log (it was invisible:
  *   the 2026-08-27 15:13 field log could not confirm #1 fired, because grid suppression latched at +15s and
  *   covered every warm ride-out). Two diagnostic-only ui_sync signals, mirrored to the card's HA debug log
@@ -454,6 +466,25 @@ const _rtcProbeGate = {
                         // FRESH blackout latch we push the warm-extend to each so a watchdog already
                         // armed at base(5s) can't reap a rideable stream at the latch boundary.
 
+    // [v2.21.0 MSE-reap grid latch] The cold-start bridge BEFORE band=path suppression can latch. On a
+    // saturated uplink the first wave of MSE sockets bursts then chokes → each reaps at base 5s BEFORE
+    // any RTC probe survives the ~6s band-abort to trip `suppressed`, and before #1 can witness a
+    // >=2.5s inter-chunk gap to prime (a fresh socket's burst-then-silence leaves no gap). Field
+    // 2026-08-27 19:37: 7 base reaps in the first ~40s (extgatecam died 3×), suppression only latched
+    // at +48s. So count no-data-watchdog reaps across DISTINCT cameras (streamKey): >= MSE_REAP_QUORUM
+    // within MSE_REAP_WINDOW_MS = the shared uplink is choking, not one dead camera. Latch
+    // mseReapCongested for MSE_REAP_HOLD_MS (sliding) → _effectiveDisconnectTimeout extends every warm
+    // socket (incl. fresh ones, from their first arm) so the cold-start storm rides out instead of
+    // churning. Bounded + self-clearing; a lone dead camera can't reach quorum; a healthy grid never
+    // reaps so never latches (zero regression). Superseded by band=path suppress() when that latches.
+    mseReapCongested: false,
+    mseReapAt: 0,           // when the latch engaged (diagnostics)
+    mseReapLog: new Map(),  // streamKey -> last reap ts; distinct-camera counting within the window
+    mseReapTID: 0,          // self-release timer (sliding)
+    MSE_REAP_QUORUM: 2,      // distinct cameras reaping within the window to call it grid congestion
+    MSE_REAP_WINDOW_MS: 10000, // how close two DISTINCT reaps must fall to count together
+    MSE_REAP_HOLD_MS: 60000, // latch duration, refreshed on each qualifying reap (band=path 300s supersedes)
+
     /**
      * Await our turn to ramp. Resolves TRUE to proceed (gate OPEN/fat-pipe, or our serial turn) and
      * FALSE to abstain (a band=path grid blackout is in effect — the caller stays on MSE).
@@ -506,6 +537,45 @@ const _rtcProbeGate = {
             }
         }
         return fresh;
+    },
+
+    /**
+     * [v2.21.0 MSE-reap grid latch] Record one no-data-watchdog reap; once DISTINCT cameras cross the
+     * quorum within the window, latch grid MSE-congestion so warm/fresh sockets extend instead of
+     * churning through the cold-start storm. Keyed by streamKey (stable across a camera's reconnects),
+     * so one dead camera's repeated reaps can't reach quorum alone. On a FRESH latch, push the extend
+     * to every live warm stream (same retroactive re-arm as suppress(), so a base(5s) timer already
+     * ticking on a sibling rides out). Returns the distinct-camera count on the fresh latch (else 0),
+     * for the reaping driver's ws_reap telemetry. No-op effect while band=path suppression is latched
+     * (that already extends everything), but we still record so the log shows the reap.
+     */
+    noteMseReap(driver) {
+        const now = Date.now();
+        const key = driver.streamKey || driver.wsURL || driver.clientId;
+        this.mseReapLog.set(key, now);
+        let distinct = 0;
+        for (const [k, ts] of this.mseReapLog) {
+            if (now - ts > this.MSE_REAP_WINDOW_MS) this.mseReapLog.delete(k);
+            else distinct++;
+        }
+        if (distinct < this.MSE_REAP_QUORUM) return 0;
+        const fresh = !this.mseReapCongested;
+        this.mseReapCongested = true;
+        this.mseReapAt = now;
+        if (this.mseReapTID) clearTimeout(this.mseReapTID);
+        this.mseReapTID = setTimeout(() => {
+            this.mseReapTID = 0;
+            this.mseReapCongested = false;
+            this.mseReapLog.clear();
+            console.debug(`[VideoRTC] MSE-reap grid latch cleared — ${Math.round(this.MSE_REAP_HOLD_MS / 1000)}s since the last qualifying reap.`);
+        }, this.MSE_REAP_HOLD_MS);
+        if (fresh) {
+            console.warn(`[VideoRTC:${driver.clientId}] MSE-reap grid latch ENGAGED (${distinct} cams reaped within ${Math.round(this.MSE_REAP_WINDOW_MS / 1000)}s) — warm sockets extend for ${Math.round(this.MSE_REAP_HOLD_MS / 1000)}s.`);
+            for (const d of this.liveDrivers) {
+                try { d._rearmWatchdogForBlackout(); } catch (e) { /* one driver must not block the grid */ }
+            }
+        }
+        return fresh ? distinct : 0;
     },
 
     /** Give up the token, or leave the queue if not yet holder. Idempotent. No-op while OPEN. */
@@ -892,6 +962,7 @@ export class VideoRTC extends HTMLElement {
         
         // [TRACE] Append Client ID to URL for server-side logging correlation
         const separator = value.includes('?') ? '&' : '?';
+        this.streamKey = value;   // [v2.21.0] stable per-camera key (URL sans the per-connection client_id) — the MSE-reap grid latch counts DISTINCT cameras across reconnects
         this.wsURL = value + separator + 'client_id=' + this.clientId;
         
         this.onconnect();
@@ -1211,20 +1282,25 @@ export class VideoRTC extends HTMLElement {
         // byte, so it tracks live congestion. v2.4.6's "always base" comment above still holds for
         // the 'warm'/'committed' phases; the extension applies only to negotiating/promoted.
         const timeout = this._effectiveDisconnectTimeout();
+        // [#1 TELEMETRY, v2.20.1 fix] Capture the regime at ARM time — it is what SET `timeout`.
+        // v2.20.0 recomputed it inside the fire callback (up to `timeout` ms later), so a bursty-hold
+        // whose 30s memory window had since lapsed mislabelled as `base` — the field 19:37:47
+        // `ws-reap: 30000ms (base …)` self-contradiction (it was really a #1 bursty-hold win). The
+        // watchdog only fires when NO byte arrived (so _feedWatchdog wasn't called again) → this
+        // captured value is still the arming regime. base = neither hold engaged (residual first-stall
+        // gap); bursty-hold = #1; suppressed-hold = band=path blackout; mse-congest-hold = cold-start
+        // grid latch; black = video.error fast-reap; probe-congest = RTC-probe-phase extend.
+        const base = this.DISCONNECT_TIMEOUT;
+        const regime = this._timeoutRegime();
         this.reconnectTID = setTimeout(() => {
             this.reconnectTID = 0;
             console.warn(`[VideoRTC:${this.clientId}] No-data watchdog fired (${timeout}ms silent, phase=${this._rtcPhase}, cong=${this._congestion.toFixed(2)}). Forcing close.`);
-            // [#1 TELEMETRY, v2.20.0] Self-identify WHICH regime set this reap timeout, so field
-            // logs show whether #1 (or suppression) was engaged at the death. base = neither held
-            // (the residual first-stall gap); bursty-hold = #1 extended; suppressed-hold = grid
-            // blackout extended; black = video.error fast-reap. No effect on _closeReason (the flap
-            // classifier keys on it) or the reap itself.
-            const base = this.DISCONNECT_TIMEOUT;
-            const regime = (this.video && this.video.error) ? 'black'
-                : _rtcProbeGate.suppressed ? 'suppressed-hold'
-                : this._wsBurstyFed() ? 'bursty-hold'
-                : 'base';
-            this._emitByteAwareDiag('ws_reap', `${timeout}ms (${regime}, base ${base}ms)`);
+            // [v2.21.0] Feed the reap into the MSE-reap grid latch (before onclose tears us down); a
+            // fresh latch returns the distinct-camera count so this line shows the exact reap that
+            // engaged it. Diagnostic append only — no effect on _closeReason (the flap classifier key).
+            const latched = _rtcProbeGate.noteMseReap(this);
+            this._emitByteAwareDiag('ws_reap', `${timeout}ms (${regime}, base ${base}ms)`
+                + (latched ? ` → grid-latch ${latched} cams` : ''));
             this.handoff = false; // a stall is a failure, not an intentional handover
             this._closeReason = 'no-data-watchdog';
             this.onclose();
@@ -1472,6 +1548,10 @@ export class VideoRTC extends HTMLElement {
             // only on real terminal errors, never on an underrun), so this can't reap a held frame.
             if (this.video && this.video.error) return base;
             if (_rtcProbeGate.suppressed) return base * this.ADAPT_MAX_EXTEND;
+            // [v2.21.0 MSE-reap grid latch] Cold-start bridge: DISTINCT cameras just reaped in quorum
+            // (the shared uplink is choking) but band=path suppression hasn't latched yet and #1 has no
+            // witnessed gap on a fresh socket. Extend so the first wave rides out instead of churning.
+            if (_rtcProbeGate.mseReapCongested) return base * this.ADAPT_MAX_EXTEND;
             // [BYTE-AWARE WATCHDOG #1] Even with NO grid-wide blackout latch, a stream arriving in
             // bursts (recent inter-chunk gap >= WS_BURSTY_GAP_MS) is frozen-but-fed on a congested
             // uplink: reaping + reconnecting only burns the scarce link into a retry storm (the pure-
@@ -1483,6 +1563,28 @@ export class VideoRTC extends HTMLElement {
         }
         const mult = 1 + (this.ADAPT_MAX_EXTEND - 1) * Math.max(0, Math.min(1, this._congestion));
         return Math.round(base * mult);
+    }
+
+    /**
+     * [#1 TELEMETRY, v2.20.1 fix] Name the regime that CURRENTLY sets the warm/probe reap timeout —
+     * the exact branch ladder of _effectiveDisconnectTimeout(), as a label. Captured at watchdog ARM
+     * time (not recomputed at fire) so the `ws-reap` line reports what actually held the socket.
+     *   base            = neither hold engaged (residual first-stall gap)
+     *   probe-congest   = RTC probe phase, congestion-scaled extend
+     *   black           = video.error terminal decode error, fast base reap
+     *   suppressed-hold = band=path grid blackout extend (300s)
+     *   mse-congest-hold= cold-start MSE-reap grid latch extend (60s)  [v2.21.0]
+     *   bursty-hold     = byte-aware #1 self-measured frozen-but-fed extend
+     */
+    _timeoutRegime() {
+        const base = this.DISCONNECT_TIMEOUT;
+        if (!base || !this.ADAPTIVE_WATCHDOG) return 'base';
+        if (this._rtcPhase === 'negotiating' || this._rtcPhase === 'promoted') return 'probe-congest';
+        if (this.video && this.video.error) return 'black';
+        if (_rtcProbeGate.suppressed) return 'suppressed-hold';
+        if (_rtcProbeGate.mseReapCongested) return 'mse-congest-hold';
+        if (this._wsBurstyFed()) return 'bursty-hold';
+        return 'base';
     }
 
     /**

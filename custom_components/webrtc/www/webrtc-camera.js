@@ -25,6 +25,19 @@
  *
  * CHANGELOG
  * ---------
+ * v14.16.0 — [DRIVER CHANGE, pin ?v=2.20.0 → 2.21.0 — needs a PWA hard reload] MSE-reap GRID LATCH — closes
+ *   the cold-start reconnect storm. The v14.15.0 telemetry (field 2026-08-27 19:37) proved #1 works, but also
+ *   exposed the dominant residual: on a saturated uplink the first wave of MSE sockets bursts data then chokes,
+ *   and each reaps at base 5s BEFORE any RTC probe survives ~6s to latch band=path suppression AND before #1 can
+ *   witness a >=2.5s gap (a fresh burst-then-silence has no gap to arm on) — 7 of 8 reaps were `base` in the
+ *   first ~40s, one camera died 3x, and the churn saturated the uplink hard enough to drop the HA frontend
+ *   websocket. Fix (driver): count DISTINCT cameras whose no-data reaps land within 10s; >=2 latches a 60s
+ *   grid-wide congestion hold (sliding) that retroactively re-arms every live warm socket, so the first wave
+ *   rides out instead of stampeding. Bounded, self-clearing, superseded by band=path suppression once a probe
+ *   survives; a single dead camera can't reach quorum and a healthy grid never reaps → zero regression. Also
+ *   fixes the `ws-reap` telemetry label: the regime is now captured at watchdog ARM time (19:37:47's
+ *   contradictory `ws-reap: 30000ms (base …)` was really a #1 bursty-hold win mislabelled by a lapsed window),
+ *   and a reap that engages the latch appends `→ grid-latch N cams`.
  * v14.15.0 — [DRIVER CHANGE, pin ?v=2.19.0 → 2.20.0 — needs a PWA hard reload] byte-aware watchdog (#1)
  *   TELEMETRY. #1 was invisible in the field: the 2026-08-27 15:13 log could not confirm it fired, because
  *   grid suppression latched at +15s and covered every warm ride-out. Now the driver mirrors two diagnostic-
@@ -510,7 +523,7 @@
  *   _promoteShadowToMain().
  */
 
-import {VideoRTC} from './video-rtc.js?v=2.20.0';
+import {VideoRTC} from './video-rtc.js?v=2.21.0';
 import {DigitalPTZ} from './digital-ptz.js?v=3.3.0';
 // [SIDECAR INTEGRATION] Import the Interaction module.
 // This module handles legacy features (Shortcuts, PTZ, Styles) to keep the core driver clean.
@@ -676,7 +689,7 @@ class WebRTCCamera extends HTMLElement {
         // (correlates stream loss with the mobile app backgrounding / 5G handoff).
         this._logVisAbort = null;
 
-        console.info('[WebRTC Camera] v14.15.0');
+        console.info('[WebRTC Camera] v14.16.0');
     }
 
     setConfig(config) {
