@@ -4,6 +4,17 @@
  * Derived from AlexxIT/WebRTC. Licensed under the MIT License — see LICENSE.
  */
 /**
+ * VideoRTC v2.19.0 - [byte-aware watchdog #1] the warm ride-out used to arm ONLY when a prior RTC probe had
+ *   latched a grid-wide blackout (_rtcProbeGate.suppressed). Field 2026-08-27 14:50-14:52 exposed the gap: on
+ *   a link so narrow that even the RTC probe is collateral-reaped at 5s (< the ~6s band-abort threshold),
+ *   suppression NEVER latches — so the warm MSE streams also got only the base 5s and churned in a pure-MSE
+ *   reconnect storm (all 4 cams to `rtc-suppressed: link narrow`, backoff to 20s+). Fix: measure frozen-but-fed
+ *   DIRECTLY from the ws byte arrival. MSE fMP4 chunks arriving in bursts with gaps >= WS_BURSTY_GAP_MS (2.5s,
+ *   the congested-uplink signature: >2.5s gaps despite 30-60 KB/s goodput) mark the stream bursty-fed for
+ *   WS_BURSTY_MEMORY_MS (30s); while bursty, _effectiveDisconnectTimeout extends the warm reap to
+ *   base×ADAPT_MAX_EXTEND WITHOUT needing any RTC probe. A smooth stream (LAN / good 4G, sub-second chunks)
+ *   never trips the gap → stays at the tight base 5s → zero regression. Ordered after the video.error guard, so
+ *   a bursty-but-BLACK (decode-errored) element still reaps fast. ~1 tracker method + 1 gate line. No knob.
  * VideoRTC v2.18.0 - [black-screen guard + retroactive blackout re-arm] two field-driven refinements to the
  *   v2.17.0 warm ride-out (grid 2026-08-27 14:28-14:30, new card+driver, validated Alg.2 serial + 30s ride).
  *   (1) BLACK-SCREEN GUARD: the ride-out only pays off while the element HOLDS its last frame (a benign MSE
@@ -713,6 +724,22 @@ export class VideoRTC extends HTMLElement {
         this.ADAPT_MAX_EXTEND = 6;       // hard cap on the timeout multiplier (5s base -> 30s)
         this.ADAPT_EWMA_ALPHA = 0.3;     // congestion EWMA smoothing (higher = twitchier)
         this._congestion = 0;            // smoothed congestion score [0,1]
+
+        // [BYTE-AWARE WATCHDOG #1 — v2.19.0] The warm ride-out (base×ADAPT_MAX_EXTEND) used to arm
+        // ONLY when a prior RTC probe had latched a grid-wide blackout (_rtcProbeGate.suppressed).
+        // Field 2026-08-27 14:50-14:52 exposed the gap: on a link so narrow that even the RTC probe
+        // is collateral-reaped at 5s (< the ~6s band-abort threshold), suppression NEVER latches, so
+        // the warm MSE streams also get only the base 5s and churn in a pure-MSE reconnect storm.
+        // Fix: measure frozen-but-fed DIRECTLY from the ws byte arrival. MSE fMP4 chunks that arrive
+        // in bursts with gaps >= WS_BURSTY_GAP_MS (the congested-uplink signature: >2.5s gaps despite
+        // 30-60 KB/s goodput, per the BENCHMARK lines) mark the stream bursty for WS_BURSTY_MEMORY_MS;
+        // while bursty, the warm reap extends WITHOUT needing any RTC probe. A smooth stream (LAN /
+        // good 4G, sub-second chunks) never trips the gap, so it stays at the tight base 5s — zero
+        // regression on healthy links. Bounded by ADAPT_MAX_EXTEND; self-clears when the link smooths.
+        this.WS_BURSTY_GAP_MS = Math.round(this.DISCONNECT_TIMEOUT / 2);          // 2500ms: gap that marks bursty (0 disables)
+        this.WS_BURSTY_MEMORY_MS = this.DISCONNECT_TIMEOUT * this.ADAPT_MAX_EXTEND; // 30000ms: how long one big gap keeps us bursty
+        this._wsLastByteAt = 0;          // Date.now() of the last binary ws chunk (0 = fresh socket, primes)
+        this._wsBurstyUntil = 0;         // Date.now() until which the stream counts as bursty-fed
         this._rtcFutility = 0;           // decaying penalty for recent doomed RTC promotes [0,1]
 
         // [RTC ABORT — Alg.3→Alg.4] Give up a doomed un-committed RTC probe and snap back to the warm
@@ -1194,6 +1221,28 @@ export class VideoRTC extends HTMLElement {
     }
 
     /**
+     * [BYTE-AWARE WATCHDOG #1] Fold one binary ws chunk into the burstiness tracker. Called from
+     * onopen's binary branch BEFORE _feedWatchdog, so the re-armed timeout reflects the gap that
+     * just closed. A gap >= WS_BURSTY_GAP_MS is the congested-uplink signature (bursts, not smooth
+     * flow); it marks the stream bursty-fed for WS_BURSTY_MEMORY_MS. Cost: two field writes.
+     */
+    _noteWsByte() {
+        const now = Date.now();
+        if (this._wsLastByteAt > 0 && (now - this._wsLastByteAt) >= this.WS_BURSTY_GAP_MS) {
+            this._wsBurstyUntil = now + this.WS_BURSTY_MEMORY_MS;
+        }
+        this._wsLastByteAt = now;
+    }
+
+    /**
+     * [BYTE-AWARE WATCHDOG #1] True while the stream is provably frozen-but-fed: a recent inter-chunk
+     * gap crossed WS_BURSTY_GAP_MS and its memory window has not lapsed. WS_BURSTY_GAP_MS = 0 disables.
+     */
+    _wsBurstyFed() {
+        return this.WS_BURSTY_GAP_MS > 0 && Date.now() < this._wsBurstyUntil;
+    }
+
+    /**
      * [v2.18.0 retroactive blackout re-arm] Called by _rtcProbeGate.suppress() on a FRESH grid
      * blackout latch. The no-data watchdog re-arms at the effective timeout on every MSE byte, but a
      * warm stream that fell silent JUST BEFORE the latch still holds a base(5s) timer from its last
@@ -1364,6 +1413,9 @@ export class VideoRTC extends HTMLElement {
      * never suppress, so their warm reap stays at the base 5s — zero regression on healthy links.
      * [v2.18.0] The extend is further gated on video.error == null: a decode-errored (BLACK) element
      * never self-recovers, so it is reaped at base rather than held black for the whole blackout.
+     * [v2.19.0 byte-aware #1] The extend ALSO fires without any grid latch when the stream is
+     * self-measured frozen-but-fed (_wsBurstyFed: a recent ws inter-chunk gap crossed WS_BURSTY_GAP_MS)
+     * — the pure-MSE narrow-link case where the RTC probe dies too fast to ever latch suppression.
      * Never returns less than base; 0 (disabled) is honored by the caller's guard.
      */
     _effectiveDisconnectTimeout() {
@@ -1380,7 +1432,15 @@ export class VideoRTC extends HTMLElement {
             // base instead → the card reconnects to a clean keyframe. video.error is unambiguous (set
             // only on real terminal errors, never on an underrun), so this can't reap a held frame.
             if (this.video && this.video.error) return base;
-            return _rtcProbeGate.suppressed ? base * this.ADAPT_MAX_EXTEND : base;
+            if (_rtcProbeGate.suppressed) return base * this.ADAPT_MAX_EXTEND;
+            // [BYTE-AWARE WATCHDOG #1] Even with NO grid-wide blackout latch, a stream arriving in
+            // bursts (recent inter-chunk gap >= WS_BURSTY_GAP_MS) is frozen-but-fed on a congested
+            // uplink: reaping + reconnecting only burns the scarce link into a retry storm (the pure-
+            // MSE narrow-link churn of 2026-08-27 14:50-14:52, where no RTC probe ever latched
+            // suppression). Extend it too — bounded by ADAPT_MAX_EXTEND, self-clearing when the link
+            // smooths. Smooth links never trip the gap, so their warm reap stays at the tight base.
+            if (this._wsBurstyFed()) return base * this.ADAPT_MAX_EXTEND;
+            return base;
         }
         const mult = 1 + (this.ADAPT_MAX_EXTEND - 1) * Math.max(0, Math.min(1, this._congestion));
         return Math.round(base * mult);
@@ -1531,6 +1591,9 @@ export class VideoRTC extends HTMLElement {
             this.mode = 'webrtc,mse,hls,mjpeg';
         }
 
+        this._wsLastByteAt = 0;   // [#1] fresh socket: first byte primes, no bogus startup gap
+        this._wsBurstyUntil = 0;
+
         this.ws.addEventListener('message', ev => {
             if (typeof ev.data === 'string') {
                 const msg = JSON.parse(ev.data);
@@ -1545,6 +1608,7 @@ export class VideoRTC extends HTMLElement {
             } else {
                 // Binary data (usually MSE video chunks). Media is flowing,
                 // so pet the no-data watchdog.
+                this._noteWsByte();   // [#1] fold the inter-chunk gap in BEFORE feeding, so the re-arm sees it
                 this._feedWatchdog();
                 if (this.ondata) {
                     this.ondata(ev.data);

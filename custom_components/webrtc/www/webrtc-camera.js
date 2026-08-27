@@ -25,6 +25,15 @@
  *
  * CHANGELOG
  * ---------
+ * v14.14.0 — [DRIVER CHANGE, pin ?v=2.18.0 → 2.19.0 — needs a PWA hard reload] byte-aware watchdog (#1). The
+ *   warm ride-out used to arm ONLY after a prior RTC probe latched a grid-wide blackout. Field 2026-08-27
+ *   14:50-14:52 showed the gap: on a link so narrow the RTC probe itself is reaped at 5s (before it can latch
+ *   suppression), the warm MSE streams also got only 5s and churned in a pure-MSE reconnect storm (all 4 cams
+ *   → `rtc-suppressed: link narrow`, backoff to 20s+). Fix (driver): measure frozen-but-fed DIRECTLY from ws
+ *   byte arrival — fMP4 chunks arriving in bursts with >2.5s gaps (despite 30-60 KB/s goodput) mark the stream
+ *   bursty-fed for 30s, and the warm reap extends without needing any RTC probe. A smooth stream (LAN / good
+ *   4G) never trips the gap → stays at base 5s → zero regression ("non produce danno"). Ordered after the
+ *   v14.13.0 black-screen guard, so a bursty-but-BLACK element still reaps fast. Card change is only pin+version.
  * v14.13.0 — [DRIVER CHANGE, pin ?v=2.17.0 → 2.18.0 — needs a PWA hard reload] two field-driven refinements to
  *   the v14.12.0 warm ride-out (grid 2026-08-27 14:28-14:30, new card+driver — Alg.2 serial + 30s ride both
  *   validated on hardware). (1) BLACK-SCREEN GUARD: some cameras went to a BLACK element instead of holding the
@@ -494,7 +503,7 @@
  *   _promoteShadowToMain().
  */
 
-import {VideoRTC} from './video-rtc.js?v=2.18.0';
+import {VideoRTC} from './video-rtc.js?v=2.19.0';
 import {DigitalPTZ} from './digital-ptz.js?v=3.3.0';
 // [SIDECAR INTEGRATION] Import the Interaction module.
 // This module handles legacy features (Shortcuts, PTZ, Styles) to keep the core driver clean.
@@ -660,7 +669,7 @@ class WebRTCCamera extends HTMLElement {
         // (correlates stream loss with the mobile app backgrounding / 5G handoff).
         this._logVisAbort = null;
 
-        console.info('[WebRTC Camera] v14.13.0');
+        console.info('[WebRTC Camera] v14.14.0');
     }
 
     setConfig(config) {
