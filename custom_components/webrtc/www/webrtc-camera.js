@@ -25,6 +25,14 @@
  *
  * CHANGELOG
  * ---------
+ * v14.7.1 — [DRIVER CHANGE, pin ?v=2.13.0 → 2.13.1 — needs a PWA hard reload] Playback sampler element-swap
+ *   guard. First v14.7.0 field log validated the sensor (it logged `mse-playback: frozen` on esternacancello
+ *   / extgate exactly where the log otherwise claimed "stream-stable healthy 20s" — the blind spot is
+ *   closed), but exposed two impossible detail lines right after a `mode: mse -> rtc`: `advanced -9.71s` and
+ *   `advanced +4.89s`. Cause: onscreenVideo changes identity at promote/revert (MSE this.video ↔ RTC overlay
+ *   _rtcVideo) and the sampler was differencing currentTime across two different elements. The driver now
+ *   re-primes on element change (discards that one cross-element sample) and clamps the ratio to [0,1].
+ *   Card/log unchanged. Still observe-only.
  * v14.7.0 — [DRIVER CHANGE, pin ?v=2.12.1 → 2.13.0 — needs a PWA hard reload] MSE playback-health sensor.
  *   The bad-4G field log looked "healthy" (stream-stable 20s, ~30 KB/s, clean) but the picture was "pessima"
  *   and the network dot stayed WHITE the whole time. Root cause: the only health signal was the no-data
@@ -410,7 +418,7 @@
  *   _promoteShadowToMain().
  */
 
-import {VideoRTC} from './video-rtc.js?v=2.13.0';
+import {VideoRTC} from './video-rtc.js?v=2.13.1';
 import {DigitalPTZ} from './digital-ptz.js?v=3.3.0';
 // [SIDECAR INTEGRATION] Import the Interaction module.
 // This module handles legacy features (Shortcuts, PTZ, Styles) to keep the core driver clean.
@@ -576,7 +584,7 @@ class WebRTCCamera extends HTMLElement {
         // (correlates stream loss with the mobile app backgrounding / 5G handoff).
         this._logVisAbort = null;
 
-        console.info('[WebRTC Camera] v14.7.0');
+        console.info('[WebRTC Camera] v14.7.1');
     }
 
     setConfig(config) {

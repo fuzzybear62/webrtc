@@ -4,6 +4,12 @@
  * Derived from AlexxIT/WebRTC. Licensed under the MIT License — see LICENSE.
  */
 /**
+ * VideoRTC v2.13.1 - [playback sampler: element-swap guard] the sampler now tracks the identity of the
+ *   element it measured last tick; when onscreenVideo flips (MSE this.video <-> promoted RTC overlay
+ *   _rtcVideo) the baseline belongs to the other element, so the cross-element delta is discarded and the
+ *   baseline re-primed. Kills the field artifacts `advanced -9.71s` / `+4.89s` logged right after a mode
+ *   swap. Ratio clamp tightened 2 -> 1 (a within-element live-edge reseek reads as caught-up/flow, never a
+ *   >1x spike). Still observe-only.
  * VideoRTC v2.13.0 - [MSE playback-health sensor] a new always-on sampler measures whether the ON-SCREEN
  *   picture is actually MOVING: onscreenVideo.currentTime advance vs wall-clock, sampled every 2s, EWMA'd,
  *   classified flow/stutter/frozen (ratio >=0.7 / <=0.15 / between). Fills the blind spot behind the "log
@@ -464,6 +470,7 @@ export class VideoRTC extends HTMLElement {
         this._pbTimer = 0;         // playback-health interval handle
         this._pbLastAt = 0;        // wall-clock ms at last sample (0 = needs re-priming)
         this._pbLastCT = -1;       // onscreen currentTime (s) at last sample (-1 = unset)
+        this._pbLastEl = null;     // element sampled last tick — a change (MSE<->RTC overlay) re-primes
         this._pbRatio = 1;         // EWMA of media-advance / wall-advance (1 = realtime)
         this._pbClass = '';        // last emitted verdict: '' | 'flow' | 'stutter' | 'frozen'
         this.PB_SAMPLE_MS = 2000;  // sampler cadence
@@ -917,7 +924,7 @@ export class VideoRTC extends HTMLElement {
     // ondisconnect(). Cheap: one timer, a subtraction, no getStats().
     _startPlaybackSampler() {
         if (this._pbTimer) return;
-        this._pbLastAt = 0; this._pbLastCT = -1; this._pbRatio = 1; this._pbClass = '';
+        this._pbLastAt = 0; this._pbLastCT = -1; this._pbLastEl = null; this._pbRatio = 1; this._pbClass = '';
         this._pbTimer = setInterval(() => this._samplePlayback(), this.PB_SAMPLE_MS);
     }
 
@@ -936,17 +943,22 @@ export class VideoRTC extends HTMLElement {
         const v = this.onscreenVideo;
         const now = Date.now();
         if (!v || v.paused || this._manualHold || v.seeking || v.currentTime <= 0) {
-            this._pbLastAt = 0; this._pbLastCT = -1;   // not a judgeable state → re-prime
+            this._pbLastAt = 0; this._pbLastCT = -1; this._pbLastEl = v || null;   // not judgeable → re-prime
             return;
         }
         const ct = v.currentTime;
+        // Element identity changed (MSE this.video <-> promoted RTC overlay _rtcVideo): the previous
+        // baseline belongs to the OTHER element, so ct-_pbLastCT is a cross-element artifact (seen in
+        // the field as advanced -9.71s / +4.89s right after a mode swap). Re-prime, don't judge.
+        if (v !== this._pbLastEl) { this._pbLastEl = v; this._pbLastAt = now; this._pbLastCT = ct; return; }
         if (this._pbLastAt <= 0 || this._pbLastCT < 0) { this._pbLastAt = now; this._pbLastCT = ct; return; }
         const dtWall = (now - this._pbLastAt) / 1000;
         const dtMedia = ct - this._pbLastCT;
         this._pbLastAt = now; this._pbLastCT = ct;
         if (dtWall <= 0) return;
-        // Clamp: a live-edge reseek jumps currentTime forward (huge ratio) — treat as flowing, not a spike.
-        const ratio = Math.max(0, Math.min(2, dtMedia / dtWall));
+        // Clamp to [0,1]: a within-element live-edge reseek jumps currentTime forward — treat as caught-up
+        // (flow, ratio 1), never a >1x spike that would drag the EWMA above unity.
+        const ratio = Math.max(0, Math.min(1, dtMedia / dtWall));
         this._pbRatio = 0.5 * this._pbRatio + 0.5 * ratio;
         this._pbClass = this._pbRatio >= this.PB_FLOW_RATIO ? 'flow'
             : this._pbRatio <= this.PB_FROZEN_RATIO ? 'frozen' : 'stutter';
