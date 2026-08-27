@@ -4,6 +4,15 @@
  * Derived from AlexxIT/WebRTC. Licensed under the MIT License — see LICENSE.
  */
 /**
+ * VideoRTC v2.16.0 - [A0-grid, race fix] two gaps let the grid blackout fire too LATE to stop the crash
+ *   (field 2026-08-27, v14.9.0: suppression fired at 10:36:55 yet 3 cams promoted after and the streams
+ *   collapsed). (1) The gate used to OPEN on a single band=perf sample from the canary — but at the promote
+ *   instant a 4G uplink reads exc=0 for one poll (a "head-fake") before bufferbloat shows, so the gate flung
+ *   open and released everyone to parallel ramp BEFORE the canary revealed band=path. reportBand() now needs
+ *   PERF_OPEN_STREAK (3, ~1.5s) CONSECUTIVE perf samples to open, resetting on any non-perf. (2) suppress()
+ *   denied NEW/queued acquires but couldn't recall a probe already past the gate; the 500ms poll now drains
+ *   in-flight un-committed probes (negotiating/promoted) the moment _rtcProbeGate.suppressed is set — each
+ *   self-reverts to warm MSE within one poll of the blackout engaging. committed/warm probes are untouched.
  * VideoRTC v2.15.0 - [A0-grid: band=path blackout is grid-wide] the shared RTC probe gate (_rtcProbeGate)
  *   gains a SUPPRESSED state. When ANY camera aborts a probe with band=path (the constrained-uplink
  *   verdict), the gate blacks out RTC probing across the WHOLE page for SUPPRESS_MS (300s): acquire()
@@ -386,7 +395,11 @@ const _rtcProbeGate = {
     holder: null,       // the VideoRTC instance currently allowed to ramp (SERIAL mode), or null
     queue: [],          // FIFO of { driver, resolve } waiting their turn (SERIAL mode)
     leaseTID: 0,        // force-release backstop for the current holder
-    open: false,        // true once the canary reports band=perf: fat pipe, ramp everyone in parallel
+    open: false,        // true once the canary reports SUSTAINED band=perf: fat pipe, ramp everyone in parallel
+    perfStreak: 0,      // consecutive band=perf reports from the canary; opens only past PERF_OPEN_STREAK
+    PERF_OPEN_STREAK: 3,// need ~1.5s of sustained perf to open — a lone perf sample at the promote instant
+                        // is a 4G head-fake (exc=0 momentarily, then bufferbloat); opening on it let the
+                        // whole grid ramp in parallel just before the canary revealed band=path (field 10:36)
     LEASE_MS: 20000,    // hard cap on any single hold (comfortably above RTC_GATE_SETTLE_MS,
                         // far below the 120s FIRSTFRAME give-up so a frozen probe can't wedge us)
     suppressed: false,  // [A0-grid] true = a band=path abort has blacked out RTC probing GRID-WIDE
@@ -423,6 +436,7 @@ const _rtcProbeGate = {
         this.suppressed = true;
         this.suppressedAt = Date.now();
         this.open = false;
+        this.perfStreak = 0;
         if (this.leaseTID) { clearTimeout(this.leaseTID); this.leaseTID = 0; }
         this.holder = null;
         const waiters = this.queue.splice(0);
@@ -450,21 +464,26 @@ const _rtcProbeGate = {
 
     /**
      * [Alg.2 band-adaptive] Fold the canary's live band verdict into the gate mode. Called from
-     * the RTC poll right after _classifyBand. band=perf opens the gate (fat pipe → parallel ramps);
-     * band=path re-arms serialization; degr/'' are left ambiguous and change nothing.
+     * the RTC poll right after _classifyBand. SUSTAINED band=perf opens the gate (fat pipe → parallel
+     * ramps); band=path re-arms serialization; degr/'' are ambiguous and only reset the perf streak.
      */
     reportBand(driver, band) {
         if (this.suppressed) return;                           // [A0-grid] blackout wins over a stale perf sample
-        if (band === 'perf' && !this.open) {
-            console.debug(`[VideoRTC:${driver.clientId}] RTC probe gate OPEN — canary band=perf, fat pipe, parallel ramps allowed.`);
+        if (band === 'perf') {
+            if (this.open) return;                             // already fat-pipe
+            if (++this.perfStreak < this.PERF_OPEN_STREAK) return; // need SUSTAINED perf, not a promote-instant head-fake
+            console.debug(`[VideoRTC:${driver.clientId}] RTC probe gate OPEN — canary sustained band=perf ×${this.perfStreak}, fat pipe, parallel ramps allowed.`);
             this.open = true;
             if (this.leaseTID) { clearTimeout(this.leaseTID); this.leaseTID = 0; }
             this.holder = null;
             const waiters = this.queue.splice(0);              // drain the whole queue at once
             for (const w of waiters) w.resolve(true);
-        } else if (band === 'path' && this.open) {
-            console.debug(`[VideoRTC:${driver.clientId}] RTC probe gate SERIAL — band=path, constrained link, re-serializing ramps.`);
-            this.open = false;
+        } else {
+            this.perfStreak = 0;                               // any non-perf sample breaks the streak
+            if (band === 'path' && this.open) {
+                console.debug(`[VideoRTC:${driver.clientId}] RTC probe gate SERIAL — band=path, constrained link, re-serializing ramps.`);
+                this.open = false;
+            }
         }
     },
 
@@ -1970,6 +1989,21 @@ export class VideoRTC extends HTMLElement {
                 // band=perf opens it (fat pipe → parallel ramps, no serialization cost), band=path
                 // re-arms serialization. Only the ramping probe(s) poll, so this stays cheap.
                 _rtcProbeGate.reportBand(this, this._bandClass);
+                // [A0-grid] If the shared gate went into a band=path blackout while THIS probe was
+                // already ramping (the gate had opened on sustained perf, then a camera revealed
+                // band=path), suppress() only denies NEW/queued acquires — it can't recall a probe
+                // already past the gate. Drain it here: an un-committed probe self-aborts within one
+                // poll of the blackout engaging. Emit rtc_suppressed first so the card latches MSE-only
+                // immediately (the rtc_failed from _revertToWarmMSE then no-ops its bailed re-probe).
+                if (_rtcProbeGate.suppressed &&
+                    (this._rtcPhase === 'negotiating' || this._rtcPhase === 'promoted')) {
+                    if (this.onmessage && typeof this.onmessage['ui_sync'] === 'function') {
+                        this.onmessage['ui_sync']({ type: 'signal', value: 'rtc_suppressed',
+                            detail: 'grid blackout (band=path) — in-flight probe drained' });
+                    }
+                    this._revertToWarmMSE('grid blackout (band=path) — draining in-flight RTC probe');
+                    return;
+                }
                 if (fd < 0) return;
                 const advanced = lastDecoded >= 0 && fd > lastDecoded;
                 lastDecoded = fd;
