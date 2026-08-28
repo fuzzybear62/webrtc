@@ -1,0 +1,66 @@
+name: Bug report
+description: A stream problem or crash — with the logs that make it fixable
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report. A quick note: this is a **personal fork**, shared as-is —
+        support is best-effort and not guaranteed ([SUPPORT](https://github.com/fuzzybear62/webrtc/blob/main/SUPPORT.md)).
+        A report **with logs** is far more likely to get fixed than one without, so please fill in the
+        diagnostics below — most stream problems are readable straight from them.
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Before reporting
+      options:
+        - label: I confirmed the running version from the console banner (`[WebRTC Camera] vXX.XX.X`) and hard-reloaded if it was stale.
+          required: true
+        - label: I read [DIAGNOSTICS.md](https://github.com/fuzzybear62/webrtc/blob/main/DIAGNOSTICS.md) and collected the relevant log lines.
+          required: true
+  - type: input
+    id: version
+    attributes:
+      label: Fork version
+      description: The version from the console banner, e.g. 14.16.0.
+      placeholder: "14.16.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: path
+    attributes:
+      label: Network path
+      description: The path between the camera and the viewer — usually the whole story.
+      options:
+        - Wired / strong LAN
+        - Wi-Fi (single hop)
+        - Wi-Fi repeater (multi-hop)
+        - 4G / 5G mobile
+        - Remote tunnel (Nabu Casa / reverse proxy / VPN)
+        - Mixed / not sure
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happens
+      description: What you see vs. what you expect. Which camera(s), always or intermittent, on which client (desktop / Android PWA / iOS).
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: |
+        The relevant lines from the HA log (`custom_components.webrtc.card`) and/or browser console —
+        especially the `metrics` line and any `connection-closed` / `rtc-revert` / `rtc-suppressed`
+        events. See DIAGNOSTICS.md for how to enable and read them.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: Card config (optional)
+      description: Your `type: custom:webrtc-camera` YAML, and the relevant go2rtc stream definition.
+      render: yaml

@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Read the diagnostics first
+    url: https://github.com/fuzzybear62/webrtc/blob/main/DIAGNOSTICS.md
+    about: The fork is heavily instrumented. Enabling and reading the logs often solves the problem on its own — and makes any issue you open actionable.
+  - name: Support policy (as-is, best-effort)
+    url: https://github.com/fuzzybear62/webrtc/blob/main/SUPPORT.md
+    about: This is a personal fork shared to help others. Issues are welcome; support is best-effort and not guaranteed.

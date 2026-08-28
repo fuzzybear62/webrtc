@@ -16,6 +16,9 @@ the [go2rtc](https://github.com/AlexxIT/go2rtc) streaming server.
 > indicators, browser-side ICE, tap actions, diagnostic sensors, and more.
 > **[Highlights](#highlights)** is the one-screen tour; [What this fork adds](#what-this-fork-adds) is
 > the deep dive.
+>
+> _Maintained as a personal project for my own multi-camera fleet. Issues and fixes are welcome, but
+> support is best-effort and not guaranteed — see **[SUPPORT](SUPPORT.md)**._
 
 ---
 
