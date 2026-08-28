@@ -147,11 +147,22 @@ this in the go2rtc config.
 ## Installation
 
 > [!IMPORTANT]
-> **Migrating from AlexxIT/WebRTC?** This fork reuses the same `webrtc` domain, so you must
-> **remove the upstream integration from HACS first** (HACS > the WebRTC Camera card > ⋮ > Remove),
-> otherwise HACS sees two sources for the same domain. Your config entry, entity IDs and dashboards
-> are **not** affected — the removal is HACS-only; after installing this fork below and restarting HA
-> everything comes back. (No need to hand-delete `custom_components/webrtc`; the install overwrites it.)
+> **A true drop-in replacement — by design.** This fork deliberately keeps the **same `webrtc`
+> integration domain, the same `webrtc-camera` card, and the same file paths** as
+> [AlexxIT/WebRTC](https://github.com/AlexxIT/WebRTC). That is a design choice, not an oversight: it
+> means you **migrate without re-creating anything**. Your existing config entry, entity IDs, camera
+> definitions, dashboard cards and automations keep working untouched — swapping the code underneath
+> them does not force you to redefine your setup. (A renamed fork with its own domain would orphan
+> every entity and every card that references `webrtc`, forcing a full rebuild — exactly what this
+> avoids.)
+>
+> **The one consequence:** because the domain is shared, HACS treats this and the upstream repo as the
+> *same* installation slot, and won't track both at once. So **if you already have AlexxIT/WebRTC
+> installed via HACS, remove it there first** (HACS > the WebRTC Camera entry > ⋮ > Remove), then add
+> this fork. That removal is **HACS-only** — it just changes which source HACS pulls updates from; it
+> does **not** delete your config entry, entities or dashboards, and they all come back after you
+> install the fork below and restart HA. No need to hand-delete `custom_components/webrtc` either — the
+> install overwrites it in place.
 
 **Method 1 (HACS custom repository).** HACS > Integrations > ⋮ > Custom repositories > add
 `https://github.com/fuzzybear62/webrtc` as an *Integration* > install **WebRTC Camera** > restart
