@@ -26,6 +26,7 @@ the [go2rtc](https://github.com/AlexxIT/go2rtc) streaming server.
 * [Configuration](#configuration)
 * [Custom card](#custom-card)
 * [Fork card options](#fork-card-options)
+* [Dual stream: grid vs fullscreen (`url_fullscreen`)](#dual-stream-low-res-in-the-grid-full-quality-in-fullscreen-url_fullscreen)
 * [Diagnostic sensors](#diagnostic-sensors)
 * [Upstream issues & PRs addressed](#upstream-issues--prs-addressed)
 * [Templates](#templates)
@@ -139,6 +140,25 @@ You can install go2rtc in several ways:
    [Docker](https://github.com/AlexxIT/go2rtc#go2rtc-docker) on any server in LAN.
 
 You can change the go2rtc settings by adding the `go2rtc.yaml` file to your Hass configuration folder.
+
+**Defining a low-res substream + a full-res stream (for [`url_fullscreen`](#dual-stream-low-res-in-the-grid-full-quality-in-fullscreen-url_fullscreen)).**
+Give each camera *two* named streams in `go2rtc.yaml` — a light one for the grid and the full-resolution
+one for fullscreen. Many cameras publish both a main and a sub RTSP profile natively; otherwise let
+go2rtc downscale with FFmpeg:
+
+```yaml
+streams:
+  # Full-resolution stream — used only when the card is fullscreen
+  camera: rtsp://user:pass@192.168.1.123:554/Streaming/Channels/101
+  # Low-res substream — shown in the dashboard grid
+  camera_sub:
+    - rtsp://user:pass@192.168.1.123:554/Streaming/Channels/102   # native sub-profile if the camera has one
+    # or transcode down from the main stream instead of a native sub-profile:
+    # - "ffmpeg:camera#video=h264#width=640#hardware"
+```
+
+Then point the card at both: `url: camera_sub` and `url_fullscreen: camera` (see
+[the card feature](#dual-stream-low-res-in-the-grid-full-quality-in-fullscreen-url_fullscreen)).
 
 **Important.** go2rtc runs its own web interface on port `1984` without a password. There you can see a
 list of active camera streams. Anyone on your LAN can **access them without a password**. You can disable
@@ -556,6 +576,45 @@ tap_action:
 If you configure the card with `entity: camera.foo` instead of `url:`, then a bare `action: more-info`
 works because the card *does* have an entity to fall back to (resolution order:
 `tap_action.entity` → card `entity:` → the current stream's `entity`).
+
+## Dual stream: low-res in the grid, full quality in fullscreen (`url_fullscreen`)
+
+A high-resolution stream that is perfect fullscreen is wasteful — and on a weak link outright harmful —
+when the camera is just one small tile in a dashboard grid. This fork lets you point the card at **two
+streams**: a light **substream** for normal (grid / thumbnail) viewing, and a **high-res** stream that is
+swapped in **only while the card is fullscreen**, then swapped back out on exit.
+
+```yaml
+type: 'custom:webrtc-camera'
+url: 'camera_sub'          # low-res substream — shown in the grid / normal view
+url_fullscreen: 'camera'   # full-res stream — used only while fullscreen
+ui: true                   # needed for the fullscreen button
+```
+
+`url_fullscreen` takes the **same kind of value as `url`** — a go2rtc stream name (recommended; define
+both streams in `go2rtc.yaml`, see [go2rtc](#go2rtc)) or a direct source URL.
+
+**Why this matters**
+
+- **Bandwidth & CPU where it counts.** A 9-camera wall pulls nine light substreams; only the tile you
+  open fullscreen ever pulls the heavy high-res feed. On mobile / 4G this is the difference between a
+  fluid grid and a stalled one.
+- **It reuses the full resilience stack.** The fullscreen swap is a clean cold-restart of the *main*
+  driver onto the high-res stream, so the reversible MSE→WebRTC upgrade, the adaptive watchdog and the
+  congestion logic all apply to it exactly as they do to the normal stream — you are not dropping to a
+  dumber player for fullscreen.
+- **Fully automatic revert.** Leaving fullscreen restores the substream on its own; nothing to wire up.
+
+**Caveats**
+
+- **iOS.** On iOS/iPadOS the fullscreen control is bound by WebKit to the raw `<video>` element
+  (`webkitEnterFullscreen`), which the card cannot restart underneath — so **iOS keeps showing the
+  substream in fullscreen**. The swap works on the desktop and **Android PWA** path, where fullscreen is
+  taken on the card container. If your primary viewer is an iPhone, size the substream for the quality
+  you want fullscreen (or just use a single `url`).
+- **One extra negotiation.** Entering and leaving fullscreen each trigger one clean reconnect (a brief
+  reconnect, not a black grid), because the two streams are separate go2rtc sources.
+- Omit `url_fullscreen` and the card behaves exactly as before — single stream, no swap.
 
 ## Custom-UI overlay options (`ui: true`)
 

@@ -31,7 +31,11 @@ First public release of the fork. To migrate: remove the AlexxIT/WebRTC source i
 - **All of the above is automatic** — a plain card needs no options. The new card options only *tune* it.
 - **Two diagnostic sensors** exposing how many cameras are streaming and whether the background upgrade
   path is working.
-- **New card options**: `network_indicator` (network-state dot), `live_indicator` (#922), `tap_action`
+- **Dual stream** — a light substream in the dashboard grid, swapped to a full-res stream only while
+  fullscreen, via `url_fullscreen` (desktop / Android PWA; iOS keeps the substream). Reuses the full
+  resilience stack.
+- **New card options**: `url_fullscreen` (grid-vs-fullscreen dual stream), `network_indicator`
+  (network-state dot), `live_indicator` (#922), `tap_action`
   (#668), `ice_servers` (#952/#923/#915), `spinner_delay`/`spinner` (#924), `digital_ptz.persist`,
   plus tuning knobs (`rtc_swap_prove_ms`, `firstframe_timeout`, `rtc_reprobe*`, `network_strict`,
   `pause_delay`). `background` now defaults to `true`. See the README for the full reference.
