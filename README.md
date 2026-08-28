@@ -783,12 +783,22 @@ table below summarizes each upstream report and how this fork resolves it.
 Status legend: **fixed** (root-caused and resolved here) · **mitigated** (symptom removed; root cause is
 outside the card, e.g. a codec limit) · **already immune** (fork's modern code never had the bug).
 
+> **Searching for a symptom?** In plain language, this fork resolves: a camera that **freezes or
+> constantly buffers** on a multi-camera dashboard or in Safari (`InvalidStateError`); a stream that
+> **plays in slow motion — roughly one frame every few seconds — on iPhone or iPad** after updating to
+> **iOS 26.1**; a **black tile after the stream switches** technology (MSE↔WebRTC); the **`media_player`
+> platform failing to load** after a Home Assistant update (`cannot import name 'SUPPORT_PLAY_MEDIA'`,
+> `'LovelaceData' object is not subscriptable`); a camera whose reconnects get the **client IP-banned by
+> Home Assistant** (repeated `401`); **WebRTC that never connects** behind a blocked STUN/TURN provider;
+> and the `"webrtc-camera" has already been used with this registry` console error. If any of these is
+> what you're seeing, the exact fix is in the table below.
+
 ### Crashes & stream stability
 
 | Upstream | Symptom | In this fork |
 |---|---|---|
 | [#886](https://github.com/AlexxIT/WebRTC/issues/886), [#901](https://github.com/AlexxIT/WebRTC/issues/901), [#933](https://github.com/AlexxIT/WebRTC/issues/933), PR [#938](https://github.com/AlexxIT/WebRTC/pull/938) | `InvalidStateError` / constant buffering & freezing on Safari and multi-camera dashboards | **fixed** — the whole MSE `updateend` block (including the unguarded `sb.buffered` access upstream leaves exposed) is wrapped so a teardown race can't throw. |
-| [#910](https://github.com/AlexxIT/WebRTC/issues/910), [#884](https://github.com/AlexxIT/WebRTC/issues/884) | ~1 frame / 3 s crawl on iOS 26.1 after upstream 3.6→3.6.1 | **fixed** — removed the inherited live-sync `playbackRate` catch-up whose 0.1× floor pins the picture near the live edge on iOS WebKit; MSE plays at 1×, buffer trim kept. |
+| [#910](https://github.com/AlexxIT/WebRTC/issues/910), [#884](https://github.com/AlexxIT/WebRTC/issues/884) | video **plays in slow motion / stutters at ~1 frame every 3 s on iPhone & iPad** (iOS 26.1) after upstream 3.6→3.6.1 | **fixed** — removed the inherited live-sync `playbackRate` catch-up whose 0.1× floor pins the picture near the live edge on iOS WebKit; MSE plays at 1×, buffer trim kept. |
 | [#871](https://github.com/AlexxIT/WebRTC/issues/871) | Black screen when WebRTC can't re-init after an MSE switch | **mitigated** — root cause is a real codec limit (H265/AAC can't traverse WebRTC); the fork removes the *symptom* by reverting to the warm MSE stream instead of leaving a frozen overlay. |
 
 ### Home Assistant compatibility regressions
