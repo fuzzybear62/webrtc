@@ -917,6 +917,11 @@ new resource version.
 
 ## Debug logging (troubleshooting stream loss)
 
+> [!TIP]
+> This section is the quick reference. For the **full instrumentation manual** — every field of the
+> `metrics` line decoded, the `phase`/`band`/`cong`/`path` vocabulary, the backend handshake log, and
+> worked "how to read a collapse" examples from real sessions — see **[DIAGNOSTICS.md](DIAGNOSTICS.md)**.
+
 The browser console is the natural place to watch a stream — but the **Home Assistant mobile app has no
 console**. If a camera keeps dropping only on a phone (e.g. on mobile data / 5G) you are blind. The card
 fixes that by mirroring every stream's lifecycle to the HA log, which you can read from the app under
