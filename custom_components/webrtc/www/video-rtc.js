@@ -30,9 +30,8 @@
  *                                  instead of reaping at the base timeout and stampeding into a storm.
  *
  * There are NO user knobs for the congestion stack — the driver self-calibrates from measured link
- * state. Per-version rationale and field-validation notes live in RELEASE.md; the file:line map of
- * every mechanism is in ARCHITECTURE.md. Derived from AlexxIT/WebRTC; the congestion-control stack
- * above (Alg.1–4, A0, the adaptive/byte-aware watchdog) is fork-specific.
+ * state. Derived from AlexxIT/WebRTC; the congestion-control stack above (Alg.1–4, A0, the
+ * adaptive/byte-aware watchdog) is fork-specific.
  */
 
 /**

@@ -23,7 +23,6 @@
  * working stream. Per-driver signal routing is role-dispatched (_onMainMessage vs
  * _onPreSwapShadowMessage); all active-mode writes go through _setActiveMode() (single audit point).
  *
- * Version history and field-validation notes: RELEASE.md. File:line map: ARCHITECTURE.md.
  * The `?v=` query on the driver import below is the cache-bust pin — bump it on any driver change so
  * the PWA/service worker fetches the new module. PITFALL: a driver change additionally needs a hard
  * reload on the HA PWA; bumping the pin alone does not force the service worker to drop the old module.
@@ -1360,7 +1359,7 @@ class WebRTCCamera extends HTMLElement {
         // the reversible RTC negotiation + MSE keep-warm is ADDITIVE uplink load that starves the
         // MSE feed on constrained mobile — a narrow link holds MSE-only but collapses once the RTC
         // probe runs concurrently. The latch is card state so it holds across driver churn; it
-        // clears itself after RTC_RETEST_MS. Fat links never reach the latch. (See RELEASE.md.)
+        // clears itself after RTC_RETEST_MS. Fat links never reach the latch.
         newDriver.mode = this._rtcSuppressed
             ? this._stripWebrtc(effectiveConfig.mode)
             : effectiveConfig.mode;
