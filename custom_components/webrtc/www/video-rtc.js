@@ -478,7 +478,6 @@ const _rtcProbeGate = {
     // churning. Bounded + self-clearing; a lone dead camera can't reach quorum; a healthy grid never
     // reaps so never latches (zero regression). Superseded by band=path suppress() when that latches.
     mseReapCongested: false,
-    mseReapAt: 0,           // when the latch engaged (diagnostics)
     mseReapLog: new Map(),  // streamKey -> last reap ts; distinct-camera counting within the window
     mseReapTID: 0,          // self-release timer (sliding)
     MSE_REAP_QUORUM: 2,      // distinct cameras reaping within the window to call it grid congestion
@@ -561,7 +560,6 @@ const _rtcProbeGate = {
         if (distinct < this.MSE_REAP_QUORUM) return 0;
         const fresh = !this.mseReapCongested;
         this.mseReapCongested = true;
-        this.mseReapAt = now;
         if (this.mseReapTID) clearTimeout(this.mseReapTID);
         this.mseReapTID = setTimeout(() => {
             this.mseReapTID = 0;
