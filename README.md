@@ -117,6 +117,26 @@ stubborn, self-throttling MSE picture that stays up instead of flickering — fr
 no per-network tuning.** The full list of upstream bugs and PRs this fork folds in is in
 [Upstream issues & PRs addressed](#upstream-issues--prs-addressed).
 
+### New features at a glance (vs. upstream)
+
+Beyond the protocol and resilience work above, this fork adds a set of **user-facing features** that
+plain upstream does not have (or leaves broken). Each links to its own section:
+
+| Feature | What it gives you |
+|---------|-------------------|
+| [**Dual stream** `url_fullscreen`](#dual-stream-low-res-in-the-grid-full-quality-in-fullscreen-url_fullscreen) | A light substream in the dashboard grid, automatically swapped to a full-res stream only while fullscreen — big bandwidth/CPU win on camera walls and mobile. |
+| [**Diagnostic sensors**](#diagnostic-sensors) | Two sensor entities showing how many cameras are streaming and whether the background upgrade path is healthy — usable in dashboards and automations. |
+| [**`tap_action`**](#tap_action--action-on-tapping-the-video) | Run any Home Assistant action (navigate, call-service, more-info, URL…) when you tap the video. |
+| [**`live_indicator`**](#live_indicator--liveness-dot) | A liveness dot that shows at a glance whether the tile is actually receiving live video. |
+| [**`network_indicator`**](#custom-ui-overlay-options-ui-true) | A network-state dot exposing the fork's own link/health assessment for the tile. |
+| [**Browser-side `ice_servers`**](#browser-side-ice-servers-ice_servers) | Configure your own STUN/TURN in the card, and use Home Assistant's own ICE servers (incl. rotating Nabu Casa TURN). Two default public STUN servers so one blocked provider isn't fatal. |
+| [**`unmute_in_fullscreen`**](#custom-ui-overlay-options-ui-true) | Automatically unmute while fullscreen and restore the muted state on exit (iOS + desktop). |
+| [**`digital_ptz`** persistence & spinner options](#custom-ui-overlay-options-ui-true) | Remembered digital pan/tilt/zoom, plus a configurable loading spinner. |
+| [**`media_player` fixes**](#upstream-issues--prs-addressed) | Working `play_media` via go2rtc, `volume_entity`, and `fire-dom-event` shortcuts. |
+
+Full reference for the tuning knobs is in [Fork card options](#fork-card-options); the upstream bugs and
+PRs folded in are listed in [Upstream issues & PRs addressed](#upstream-issues--prs-addressed).
+
 ## go2rtc
 
 This component uses the [go2rtc](https://github.com/AlexxIT/go2rtc) application as a streaming server:
@@ -624,6 +644,7 @@ play/pause, volume). These fork options tune that overlay:
 | Option                 | Type    | Default | What it does |
 |------------------------|---------|---------|--------------|
 | `unmute_in_fullscreen` | boolean | `false` | (#953) Unmute the stream while it is fullscreen, then restore the previous muted state when fullscreen ends. Works on iOS (`webkitendfullscreen`) and desktop (`fullscreenchange`). |
+| `network_indicator`    | boolean | `false` | Draw a small **network-state dot** on the tile that mirrors the driver's own live link assessment: it tracks the measured bandwidth band, turns **red** when the camera has been latched to MSE-only on a weak link, and fades out when no signal has arrived recently. A fork-only, at-a-glance view of what the resilience stack is doing per camera. |
 | `spinner`              | boolean | `true`  | (#924) Set `false` to remove the loading spinner entirely. |
 | `spinner_delay`        | number  | `0` (ms)| (#924) Delay before the spinner appears on a `waiting` event, so a brief stall doesn't flash it. |
 
