@@ -10,16 +10,17 @@ the [go2rtc](https://github.com/AlexxIT/go2rtc) streaming server.
 > [@fuzzybear62](https://github.com/fuzzybear62) and validated on a multi-camera fleet running over
 > lossy multi-hop Wi-Fi repeater paths and remote tunnels.
 >
-> The fork keeps 100% of the upstream card/config surface and adds a **seamless, reversible
-> MSE→WebRTC upgrade path** plus two diagnostic sensors. Its design rule is simple and absolute:
-> **never permanently harm a working stream in order to chase a better one.** A camera that can
-> only reach MSE stays on MSE forever, cleanly; a camera that can reach WebRTC is upgraded in the
-> background and only ever *switched* once the better stream has proven itself. See
-> [What this fork adds](#what-this-fork-adds).
+> The fork keeps 100% of the upstream card/config surface and adds two things: a **seamless, reversible
+> MSE→WebRTC upgrade path** that never permanently harms a working stream to chase a better one, and a
+> set of **new user-facing features** upstream doesn't have — dual grid/fullscreen streams, overlay
+> indicators, browser-side ICE, tap actions, diagnostic sensors, and more.
+> **[Highlights](#highlights)** is the one-screen tour; [What this fork adds](#what-this-fork-adds) is
+> the deep dive.
 
 ---
 
 <!-- TOC -->
+* [Highlights](#highlights)
 * [What this fork adds](#what-this-fork-adds)
 * [go2rtc](#go2rtc)
 * [Installation](#installation)
@@ -39,6 +40,41 @@ the [go2rtc](https://github.com/AlexxIT/go2rtc) streaming server.
 * [Debug logging (troubleshooting stream loss)](#debug-logging-troubleshooting-stream-loss)
 * [Known work cameras](#known-work-cameras)
 <!-- TOC -->
+
+## Highlights
+
+The one-screen tour of what this fork gives you over plain upstream. Two categories: the **reliability**
+engine (automatic — a plain `type: custom:webrtc-camera` card gets all of it, no options) and the **new
+user-facing features** (opt-in card options). Each links to its full section.
+
+**Reliability & resilience — automatic, zero config:**
+
+- **Seamless, reversible MSE→WebRTC upgrade.** A reliable picture shows immediately (MSE); low-latency
+  WebRTC is tried in the background and swapped in *only after it proves itself*, never producing a black
+  frame or flicker. → [details](#what-this-fork-adds)
+- **Stays up on bad networks.** Congested streams are nursed instead of killed, frozen-but-fed pictures
+  are nudged back to live, weak links are protected from the upgrade's own load, and cameras are
+  serialized so a wall of tiles cooperates instead of competing for one uplink. →
+  [details](#keeping-the-picture-alive-sustained-sessions--weak-links)
+- **Upstream bugs fixed & PRs folded in** — crashes, iOS 1 fps, HA-compat breaks, auth/ICE, media_player.
+  → [list](#upstream-issues--prs-addressed)
+
+**New user-facing features — not in upstream (or fixed here):**
+
+| Feature | What it gives you |
+|---------|-------------------|
+| [**Dual stream** `url_fullscreen`](#dual-stream-low-res-in-the-grid-full-quality-in-fullscreen-url_fullscreen) | A light substream in the dashboard grid, automatically swapped to a full-res stream only while fullscreen — big bandwidth/CPU win on camera walls and mobile. |
+| [**Diagnostic sensors**](#diagnostic-sensors) | Two sensor entities showing how many cameras are streaming and whether the background upgrade path is healthy — usable in dashboards and automations. |
+| [**`tap_action`**](#tap_action--action-on-tapping-the-video) | Run any Home Assistant action (navigate, call-service, more-info, URL…) when you tap the video. |
+| [**`live_indicator`**](#live_indicator--liveness-dot) | A liveness dot that shows at a glance whether the tile is actually receiving live video. |
+| [**`network_indicator`**](#custom-ui-overlay-options-ui-true) | A network-state dot exposing the fork's own link/health assessment for the tile. |
+| [**Browser-side `ice_servers`**](#browser-side-ice-servers-ice_servers) | Configure your own STUN/TURN in the card, and use Home Assistant's own ICE servers (incl. rotating Nabu Casa TURN). Two default public STUN servers so one blocked provider isn't fatal. |
+| [**`unmute_in_fullscreen`**](#custom-ui-overlay-options-ui-true) | Automatically unmute while fullscreen and restore the muted state on exit (iOS + desktop). |
+| [**`digital_ptz`** persistence & spinner options](#custom-ui-overlay-options-ui-true) | Remembered digital pan/tilt/zoom, plus a configurable loading spinner. |
+| [**`media_player` fixes**](#upstream-issues--prs-addressed) | Working `play_media` via go2rtc, `volume_entity`, and `fire-dom-event` shortcuts. |
+
+Tuning knobs for the reliability engine are in [Fork card options](#fork-card-options). Reading the logs
+is covered by [DIAGNOSTICS.md](DIAGNOSTICS.md).
 
 ## What this fork adds
 
@@ -117,25 +153,9 @@ stubborn, self-throttling MSE picture that stays up instead of flickering — fr
 no per-network tuning.** The full list of upstream bugs and PRs this fork folds in is in
 [Upstream issues & PRs addressed](#upstream-issues--prs-addressed).
 
-### New features at a glance (vs. upstream)
-
-Beyond the protocol and resilience work above, this fork adds a set of **user-facing features** that
-plain upstream does not have (or leaves broken). Each links to its own section:
-
-| Feature | What it gives you |
-|---------|-------------------|
-| [**Dual stream** `url_fullscreen`](#dual-stream-low-res-in-the-grid-full-quality-in-fullscreen-url_fullscreen) | A light substream in the dashboard grid, automatically swapped to a full-res stream only while fullscreen — big bandwidth/CPU win on camera walls and mobile. |
-| [**Diagnostic sensors**](#diagnostic-sensors) | Two sensor entities showing how many cameras are streaming and whether the background upgrade path is healthy — usable in dashboards and automations. |
-| [**`tap_action`**](#tap_action--action-on-tapping-the-video) | Run any Home Assistant action (navigate, call-service, more-info, URL…) when you tap the video. |
-| [**`live_indicator`**](#live_indicator--liveness-dot) | A liveness dot that shows at a glance whether the tile is actually receiving live video. |
-| [**`network_indicator`**](#custom-ui-overlay-options-ui-true) | A network-state dot exposing the fork's own link/health assessment for the tile. |
-| [**Browser-side `ice_servers`**](#browser-side-ice-servers-ice_servers) | Configure your own STUN/TURN in the card, and use Home Assistant's own ICE servers (incl. rotating Nabu Casa TURN). Two default public STUN servers so one blocked provider isn't fatal. |
-| [**`unmute_in_fullscreen`**](#custom-ui-overlay-options-ui-true) | Automatically unmute while fullscreen and restore the muted state on exit (iOS + desktop). |
-| [**`digital_ptz`** persistence & spinner options](#custom-ui-overlay-options-ui-true) | Remembered digital pan/tilt/zoom, plus a configurable loading spinner. |
-| [**`media_player` fixes**](#upstream-issues--prs-addressed) | Working `play_media` via go2rtc, `volume_entity`, and `fire-dom-event` shortcuts. |
-
-Full reference for the tuning knobs is in [Fork card options](#fork-card-options); the upstream bugs and
-PRs folded in are listed in [Upstream issues & PRs addressed](#upstream-issues--prs-addressed).
+The user-facing features that complement this engine — dual stream, overlay indicators, browser-side ICE,
+tap actions and more — are summarized in [Highlights](#highlights); the tuning knobs are in
+[Fork card options](#fork-card-options).
 
 ## go2rtc
 
