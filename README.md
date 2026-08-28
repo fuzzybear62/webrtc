@@ -146,8 +146,16 @@ this in the go2rtc config.
 
 ## Installation
 
+> [!IMPORTANT]
+> **Migrating from AlexxIT/WebRTC?** This fork reuses the same `webrtc` domain, so you must
+> **remove the upstream integration from HACS first** (HACS > the WebRTC Camera card > ⋮ > Remove),
+> otherwise HACS sees two sources for the same domain. Your config entry, entity IDs and dashboards
+> are **not** affected — the removal is HACS-only; after installing this fork below and restarting HA
+> everything comes back. (No need to hand-delete `custom_components/webrtc`; the install overwrites it.)
+
 **Method 1 (HACS custom repository).** HACS > Integrations > ⋮ > Custom repositories > add
-`https://github.com/fuzzybear62/webrtc` as an *Integration* > install **WebRTC Camera**.
+`https://github.com/fuzzybear62/webrtc` as an *Integration* > install **WebRTC Camera** > restart
+Home Assistant.
 
 **Method 2 (manual).** Copy the `custom_components/webrtc` folder from this repo into your
 `/config/custom_components` folder and restart Home Assistant.
