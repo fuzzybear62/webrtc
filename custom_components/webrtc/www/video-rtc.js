@@ -4,418 +4,35 @@
  * Derived from AlexxIT/WebRTC. Licensed under the MIT License — see LICENSE.
  */
 /**
- * VideoRTC v2.21.0 - [MSE-reap grid latch] close the cold-start reconnect storm. Field 2026-08-27 19:37 (on
- *   v2.20.0 telemetry): the first wave of MSE sockets on a saturated uplink bursts data then chokes; each reaps
- *   at base 5s BEFORE any RTC probe survives the ~6s to trip band=path `suppressed`, AND before #1 can witness
- *   a >=2.5s inter-chunk gap (a fresh burst-then-silence leaves no gap to arm on) — 7 of 8 reaps were `base`
- *   regime in the first ~40s, one camera died 3x. Fix: _rtcProbeGate.noteMseReap() counts DISTINCT cameras
- *   (streamKey) whose no-data-watchdog reaps land within MSE_REAP_WINDOW_MS (10s); >= MSE_REAP_QUORUM (2) latches
- *   `mseReapCongested` for MSE_REAP_HOLD_MS (60s, sliding) and retroactively re-arms every live warm socket, so
- *   the grid rides out the cold-start choke instead of churning. Self-clearing, bounded, superseded by band=path
- *   suppress() (300s) once a probe survives; a single dead camera can't reach quorum and a healthy grid never
- *   reaps → zero regression. Also folds in the v2.20.1 telemetry-label fix: `ws-reap` regime is now captured at
- *   watchdog ARM time (not recomputed at fire, up to `timeout` ms later) — 19:37:47's contradictory
- *   `ws-reap: 30000ms (base …)` was really a #1 bursty-hold win mislabelled by the lapsed 30s memory window.
- * VideoRTC v2.20.0 - [byte-aware watchdog #1 — TELEMETRY] make #1 observable in the HA log (it was invisible:
- *   the 2026-08-27 15:13 field log could not confirm #1 fired, because grid suppression latched at +15s and
- *   covered every warm ride-out). Two diagnostic-only ui_sync signals, mirrored to the card's HA debug log
- *   under distinct keys: `ws-bursty` = a >=2.5s inter-chunk gap ARMED the frozen-but-fed hold (edge-triggered,
- *   no flood); `ws-reap` = a no-data-watchdog reap self-identifying its regime (base / bursty-hold /
- *   suppressed-hold / black) + the base timeout. An arm with NO following base-regime reap = #1 rode the burst
- *   out. Zero stream side effects — no change to _closeReason (the flap classifier keys on it) or the reap.
- * VideoRTC v2.19.0 - [byte-aware watchdog #1] the warm ride-out used to arm ONLY when a prior RTC probe had
- *   latched a grid-wide blackout (_rtcProbeGate.suppressed). Field 2026-08-27 14:50-14:52 exposed the gap: on
- *   a link so narrow that even the RTC probe is collateral-reaped at 5s (< the ~6s band-abort threshold),
- *   suppression NEVER latches — so the warm MSE streams also got only the base 5s and churned in a pure-MSE
- *   reconnect storm (all 4 cams to `rtc-suppressed: link narrow`, backoff to 20s+). Fix: measure frozen-but-fed
- *   DIRECTLY from the ws byte arrival. MSE fMP4 chunks arriving in bursts with gaps >= WS_BURSTY_GAP_MS (2.5s,
- *   the congested-uplink signature: >2.5s gaps despite 30-60 KB/s goodput) mark the stream bursty-fed for
- *   WS_BURSTY_MEMORY_MS (30s); while bursty, _effectiveDisconnectTimeout extends the warm reap to
- *   base×ADAPT_MAX_EXTEND WITHOUT needing any RTC probe. A smooth stream (LAN / good 4G, sub-second chunks)
- *   never trips the gap → stays at the tight base 5s → zero regression. Ordered after the video.error guard, so
- *   a bursty-but-BLACK (decode-errored) element still reaps fast. ~1 tracker method + 1 gate line. No knob.
- * VideoRTC v2.18.0 - [black-screen guard + retroactive blackout re-arm] two field-driven refinements to the
- *   v2.17.0 warm ride-out (grid 2026-08-27 14:28-14:30, new card+driver, validated Alg.2 serial + 30s ride).
- *   (1) BLACK-SCREEN GUARD: the ride-out only pays off while the element HOLDS its last frame (a benign MSE
- *   underrun, which self-recovers when the burst lands — the 21.95s/28.66s advances in the log). A terminal
- *   MediaError (code 3, corrupt/keyframe-gapped fMP4 on the saturated uplink) BLACKS the element and never
- *   self-recovers, yet the byte trickle keeps feeding the watchdog → we'd hold 30s of BLACK ("alcune camere
- *   vanno in black screen"). _effectiveDisconnectTimeout now returns base when video.error is set → reap fast,
- *   card reconnects to a clean keyframe. video.error is set only on real errors, never on an underrun → the
- *   held-frame case is untouched. (2) RETROACTIVE RE-ARM: a warm stream that fell silent JUST BEFORE the
- *   blackout latched still held a base(5s) timer from its last byte and reaped at the latch boundary (3 cams
- *   at 49.58/50.40/53.22) before a byte could extend it — NOT Alg.2 churn (Alg.2 correctly ran one serial
- *   probe, denied the other 3). suppress() now pushes the extend to every live warm stream (module-level
- *   liveDrivers Set) the instant the blackout latches. Both reuse _effectiveDisconnectTimeout, so the black
- *   guard also governs the retroactive path (a black element re-arms at base, not the extend).
- * VideoRTC v2.17.0 - [warm-blackout watchdog extend] the no-data watchdog was self-configuring ONLY in the
- *   RTC-probe phases; 'warm' MSE-only reaped at a FIXED 5s. Field 2026-08-27 14:04-14:06 (same saturated-4G
- *   grid as the good session, now WITHOUT the retired mse_timeout:0): warm MSE arrived frozen-but-fed
- *   (30-60 KB/s per the BENCHMARKs, frames not advancing) → reaped at 5s → reconnect storm (6 deaths/cam,
- *   backoff climbing to 23s, flap 8.5/3), each reconnect burning the scarce uplink and CONVERTING a
- *   frozen-but-fed stream into 23s of dead air (flow windows at 14:05:33 / 14:06:26 were thrown away).
- *   Fix: _effectiveDisconnectTimeout now extends WARM to base×ADAPT_MAX_EXTEND (30s) too, but ONLY while
- *   the grid-wide band=path blackout is latched (_rtcProbeGate.suppressed) — the known-saturated window.
- *   This is the self-configuring successor to the old per-card mse_timeout:0 ride-out: bounded (30s, not ∞
- *   → a truly-dead cam is still reaped), conditional (good/LAN never suppress → warm reap stays 5s, zero
- *   regression), and keyed on a signal already shipped+field-validated (v2.15.0's suppressed gate). ~4 LOC,
- *   one function; the churn in the first ~33s (pre-suppression promote ramp) stays Alg.2's job. No knob.
- * VideoRTC v2.16.0 - [A0-grid, race fix] two gaps let the grid blackout fire too LATE to stop the crash
- *   (field 2026-08-27, v14.9.0: suppression fired at 10:36:55 yet 3 cams promoted after and the streams
- *   collapsed). (1) The gate used to OPEN on a single band=perf sample from the canary — but at the promote
- *   instant a 4G uplink reads exc=0 for one poll (a "head-fake") before bufferbloat shows, so the gate flung
- *   open and released everyone to parallel ramp BEFORE the canary revealed band=path. reportBand() now needs
- *   PERF_OPEN_STREAK (3, ~1.5s) CONSECUTIVE perf samples to open, resetting on any non-perf. (2) suppress()
- *   denied NEW/queued acquires but couldn't recall a probe already past the gate; the 500ms poll now drains
- *   in-flight un-committed probes (negotiating/promoted) the moment _rtcProbeGate.suppressed is set — each
- *   self-reverts to warm MSE within one poll of the blackout engaging. committed/warm probes are untouched.
- * VideoRTC v2.15.0 - [A0-grid: band=path blackout is grid-wide] the shared RTC probe gate (_rtcProbeGate)
- *   gains a SUPPRESSED state. When ANY camera aborts a probe with band=path (the constrained-uplink
- *   verdict), the gate blacks out RTC probing across the WHOLE page for SUPPRESS_MS (300s): acquire()
- *   now resolves a boolean and returns FALSE while suppressed → every camera abstains and stays on the
- *   already-flowing MSE. This closes the crash the per-card flap score (webrtc-camera.js _accrueFlap)
- *   is structurally blind to: on band=path 4G, each of 4 cards reverts exactly ONCE (score 1.0, never
- *   latches) yet the AGGREGATE of 4 one-shot ~7s RTC-over-TURN probes saturates the shared uplink and
- *   drops the HA socket (field 2026-08-27, two crashes; a third under v14.8.1 confirmed the per-card
- *   score maxes at 1.0/3). The aborting camera emits one rtc_suppressed to its card (MSE-only + RED
- *   dot); the others learn at their next denied acquire. degr/'' still only re-serialize, as before.
- * VideoRTC v2.14.0 - [MSE ride-out — work item B, first ACTING step] the playback sampler now DOES
- *   something with a sustained freeze instead of only reporting it: `_maybeRideOut` counts consecutive
- *   'frozen' samples on the MSE element and, past PB_FROZEN_SAMPLES (~6s), nudges currentTime to the live
- *   edge (a non-destructive reseek) — recovering the picture WITHOUT the no-data watchdog's onclose() that
- *   tore the socket into the escalating retry storm on lossy 4G. MSE element only (the promoted RTC overlay
- *   has empty seekable + its own liveness); acts only when there is unplayed buffer AHEAD of currentTime
- *   (else it's a true underrun — nothing to jump to — and the watchdog fallback is correct); cooldown-gated
- *   (RIDEOUT_COOLDOWN_MS) so it nudges at most once per window and gives the nudge a fresh window to prove
- *   it worked. Emits ui_sync {type:'rideout'} → card logs `mse-rideout` in HA. The no-data watchdog still
- *   exists as the fallback for a genuine underrun; this just handles the recoverable stall first.
- * VideoRTC v2.13.1 - [playback sampler: element-swap guard] the sampler now tracks the identity of the
- *   element it measured last tick; when onscreenVideo flips (MSE this.video <-> promoted RTC overlay
- *   _rtcVideo) the baseline belongs to the other element, so the cross-element delta is discarded and the
- *   baseline re-primed. Kills the field artifacts `advanced -9.71s` / `+4.89s` logged right after a mode
- *   swap. Ratio clamp tightened 2 -> 1 (a within-element live-edge reseek reads as caught-up/flow, never a
- *   >1x spike). Still observe-only.
- * VideoRTC v2.13.0 - [MSE playback-health sensor] a new always-on sampler measures whether the ON-SCREEN
- *   picture is actually MOVING: onscreenVideo.currentTime advance vs wall-clock, sampled every 2s, EWMA'd,
- *   classified flow/stutter/frozen (ratio >=0.7 / <=0.15 / between). Fills the blind spot behind the "log
- *   said healthy, video was pessima" case: the no-data watchdog (DISCONNECT_TIMEOUT) only asks "did bytes
- *   arrive in 5s", and on bursty 4G the bytes trickle in within each window so the socket stays alive while
- *   the buffer-starved <video> is frozen. Sampling onscreenVideo (not this.video) means a hidden warm MSE
- *   can't paint a false freeze while an RTC overlay is promoted. Emitted as ui_sync {type:'playback'} every
- *   judged sample (heartbeat, so a steady freeze keeps the verdict fresh); the card feeds the network dot
- *   (worst-wins with the RTC band verdict — the ONLY signal on an MSE-only session) and mirrors transitions
- *   to the HA log (`mse-playback: frozen/stutter/flow`), which was previously invisible. Observe-only: does
- *   not yet drive suppression or a reseek (work item B). No card-visible knob.
- * VideoRTC v2.12.1 - [Alg.4.1 excess not ratio] the self-calibrating band primitive becomes the ABSOLUTE
- *   standing-queue EXCESS = rttEwma - session-min-RTT (_mRttMin, queue-empty baseline), in ms — replacing
- *   v2.12's rttEwma/rttMin RATIO. The ratio was scale-free and EXPLODED at a tiny LAN baseline (min 2-3ms):
- *   a few ms of harmless jitter (2ms->7ms) fabricated infl 3-4x, false-flagging 'path' and abort-storming a
- *   0%-loss LAN grid in a loop (the "su lan sempre peggio" regression). Excess in ms is scale-correct — 5ms
- *   of queue is 5ms — while still subtracting the link's own floor, so it stays RELATIVE (a 4G judged by its
- *   LIVE queue, not by "it's 4G"). Label + continuous abort severity both key off excess; loss stays the
- *   absolute backstop. Metrics line: `exc=Nms` (was `infl=`). See webrtc-mobile-collapse memory.
- * VideoRTC v2.12.0 - [Alg.4 self-calibrating band] the 3 categorical band buckets collapse to ONE
- *   continuous primitive: bufferbloat INFLATION = rttEwma / session-min-RTT (superseded by v2.12.1's
- *   absolute excess — the ratio was too twitchy at small LAN baselines). The abort accumulator integrates
- *   a CONTINUOUS severity (∝ how far the stressors exceed their floors), deleting the 'degr' HOLD dead-zone
- *   that let a doomed 4G canary storm ~15s before giving up. See webrtc-mobile-collapse memory.
- * VideoRTC v2.11.0 - [Alg.2 band-adaptive] the probe serializer now uses the FIRST probe as a canary:
- *   it serializes ramps only until the canary's Alg.1 verdict lands (~2s). band=perf OPENS the gate
- *   (fat pipe → no storm possible → drain the queue, ramp everyone in PARALLEL, zero serialization cost);
- *   band=path keeps/returns to SERIAL (one ramp at a time). Kills the 8s/cam convergence penalty on
- *   LAN/wideband while preserving the storm guard on constrained 4G. See webrtc-mobile-collapse memory.
- * VideoRTC v2.10.0 - [Alg.2] cross-grid RTC probe serializer: one module-level single-flight gate
- *   (_rtcProbeGate), shared by EVERY VideoRTC on the page (each card's main driver + its shadow), so at
- *   most ONE RTC ramp runs at a time. Bounds the collective double-load peak to MSE(all)+RTC(one) instead
- *   of MSE(all)+RTC(N), killing the simultaneous-GCC-ramp "bufferbloat storm" seen in the direct-4G logs.
- *   The token is held from offer (onwebrtc) until the earliest of: promote-settle (RTC_GATE_SETTLE_MS
- *   gapless — ramp plateaued), warm/committed, any failWebRTC path, or a LEASE_MS backstop. MSE stays
- *   flowing while a camera waits, so queueing adds ZERO load. See webrtc-mobile-collapse memory.
- * VideoRTC v2.9.0 - [Alg.3] class-driven RTC abort: a leaky asymmetric accumulator (_bandBadMs) integrates
- *   the Alg.1 band verdict (+poll on 'path', hold on 'degr', bleed on 'perf') and aborts once it crosses the
- *   futility-shortened hold. RETIRES the blind jbuf/RTT-ceiling abort (loss-blind) and its dead mse_abort_*
- *   knobs — the loss-aware band verdict is now the sole abort signal. See webrtc-mse-timeout-zero memory.
- * VideoRTC v2.8.0 - [Alg.1] early band classifier: fold the per-poll RTT/loss already harvested for
- *   the metrics line into a live 'perf'|'degr'|'path' verdict (~2s), surfaced as `band=` (OBSERVE-ONLY;
- *   Alg.2/3 will consume _bandClass and retire the blind step-3 abort). See webrtc-mse-timeout-zero memory.
- * VideoRTC v2.7.1 - carry the revert REASON on the rtc_failed signal so the card mirrors it to HA
- * VideoRTC v2.7.0 - Strato-1 step 3: abort a doomed RTC probe on absolute jbuf/RTT ceilings
- * * Changelog v2.7.0:
- * - STRATO-1 STEP 3 — RTC ABORT on a pathological path. The v2.5.0 adaptive watchdog EXTENDS
- *   tolerance while congested; the 2026-08-26 direct-4G diagnostics run (v2.6.0) confirmed that on a
- *   PATHOLOGICAL path that extend only PROLONGS a doomed storm. Measured cause = BUFFERBLOAT, not
- *   fragmentation: jbuf ballooned to 1500-2100ms, RTT plateaued at a standing ~1.5s that never drained,
- *   pkt stayed well under MTU (272-1012B, content-shaped, no MTU pinning), loss moderate; path was
- *   srflx/…/udp (direct UDP hole-punch, NOT TURN — the "many gateways fragment" hypothesis is out).
- *   New `_evaluateAbort` (called once per 3s metrics emit) reverts a still-un-committed RTC probe to
- *   the warm MSE when jitter-buffer delay (jbuf) OR candidate-pair RTT holds at/over a hard ceiling for
- *   RTC_ABORT_HOLD_MS — a deterministic ~6-9s teardown replacing the up-to-30× watchdog balloon. The
- *   trigger uses ABSOLUTE ceilings on purpose: `cong` SATURATES past ADAPT_RTT_EXCESS_MS (~1.0 for both
- *   800ms and 20s RTT) so it cannot tell recoverable bufferbloat (the CF-tunnel run that converged at
- *   cong 0.5-0.82) from pathological — a cong-based abort would have killed that run. jbuf/RTT don't
- *   saturate. A jbuf=? window neither arms nor disarms the hold (only a definitively healthy sample
- *   clears it). Knobs (per-card, parametric): RTC_ABORT_ENABLED/JBUF_MS/RTT_MS/HOLD_MS/FUTILITY_K.
- * - FUTILITY INVERSION FIXED. `_rtcFutility` (bumped on every revert) used to feed `inst` in
- *   _updateCongestion, RAISING congestion → LENGTHENING the watchdog extension after a failure —
- *   i.e. it babied the doomed probe (backwards). It no longer touches congestion; it now SHORTENS the
- *   next probe's abort hold toward HOLD*(1-FUTILITY_K), so a repeatedly-doomed path gives up faster.
- *   Futility drives suppression, as intended. Its decay still lives in _updateCongestion (per emit).
- *   No change to the extend logic (_effectiveDisconnectTimeout) or the promote/commit/revert gates.
- * * Changelog v2.6.0:
- * - TRANSPORT DIAGNOSTICS (no behaviour change — purely observational). The `metrics` line now also
- *   carries `jbuf`/`nack`/`pkt`/`path`, harvested from the SAME getStats poll, to settle a field
- *   question the 2026-08-26 runs raised: the direct-4G (ha-native/TURN) path collapsed to 20s RTT
- *   and killed HA, while the SAME grid over a Cloudflare tunnel rode a transient storm and converged
- *   — is the direct path dying of bufferbloat or of IP fragmentation? The new fields discriminate:
- *     • `path=local/remote/proto` — selected candidate-pair candidateType + protocol
- *       (e.g. srflx/host/udp, relay/relay/udp, host/host/tcp). Tests the "UDP-to-TURN vs TCP-over-CF"
- *       hypothesis directly instead of guessing the transport.
- *     • `jbuf=Nms` — avg jitter-buffer delay over the window (Δ jitterBufferDelay / Δ emittedCount).
- *       The receiver-side BUFFERBLOAT tell: grows as packets queue.
- *     • `nack=N` — retransmit requests over the window (Δ nackCount). The LOSS/fragmentation tell.
- *     • `pkt=NB` — avg received packet size (Δ bytesReceived / Δ packetsReceived). The MTU tell:
- *       sustained near/over ~1200B with high loss ⇒ suspect IP fragmentation.
- *   Reading: RTT↑ + jbuf↑ + nack/loss low ⇒ bufferbloat. loss/nack high + pkt near MTU + RTT bounded
- *   ⇒ fragmentation. This lands BEFORE Strato-1 step 3 so the abort trigger (RTT-ceiling vs a
- *   loss-based one) is tuned on measured cause, not on the saturating `cong` signal.
- * * Changelog v2.5.0:
- * - ADAPTIVE WATCHDOG (Strato-1). The MSE no-data watchdog is no longer a fixed 5s: a tiny in-loop
- *   controller (_updateCongestion / _effectiveDisconnectTimeout) turns the existing passive metrics
- *   into a smoothed `congestion` score [0,1] and EXTENDS the effective timeout up to ADAPT_MAX_EXTEND×
- *   the base (this.DISCONNECT_TIMEOUT, 5s default) — never below it — but ONLY while an
- *   un-committed RTC probe is live (negotiating/promoted), the one window where the MSE is starved by
- *   additive RTC load. Signal = rttExcess (rtt - session-min-rtt, the bufferbloat leading indicator)
- *   reinforced by loss% and a decaying `_rtcFutility` penalty bumped on every _revertToWarmMSE (a
- *   doomed RTC promote). In 'warm'/'committed' the base is used unchanged, so a genuinely dead
- *   MSE-only stream is still reaped on time. Field motivation: the 2026-08-26 mse_timeout:0 run
- *   proved the socket SURVIVES a 21s-rttExcess congestion storm and all 4 cams converge to clean RTC
- *   — the fixed 5s watchdog was the disease (the reconnect storm), not the cure. High/low-band paths
- *   now diverge from identical code (the substream keeps the tight base; the main earns the
- *   extension). All thresholds parametric (ADAPTIVE_WATCHDOG / ADAPT_RTT_EXCESS_MS / ADAPT_LOSS_PCT /
- *   ADAPT_MAX_EXTEND / ADAPT_EWMA_ALPHA), overridable per-card. The `metrics` line now ends with
- *   `cong=N.NN`. Reprobe-suppression on sustained futility (Strato-1 step 3) is a follow-up.
- * * Changelog v2.4.6:
- * - FIX (MSE strand → frozen stream, "press pause+play to start"): the 5s buffer eviction
- *   (sb.remove) can leave the element's currentTime BELOW the buffered window — initial autoplay
- *   never started before the window slid past currentTime=0 (slow-4G / backgrounded first-frame),
- *   or an MSE stall stranded currentTime behind an evicted region. The element then waits forever
- *   for removed data and freezes; only a manual pause→play (resume() seeks to live) cleared it.
- *   onmse's updateend now seeks to the live edge ONCE when it detects that strand (guarded by
- *   !_manualHold, and by currentTime<buffered.start so it can't fire on a healthy stream) — NOT
- *   the continuous upstream currentTime=start catch-up that caused the iOS 0.1x crawl.
- * - REVERT of v2.4.3's phase-aware no-data watchdog shortening. `_feedWatchdog` now always uses
- *   the full DISCONNECT_TIMEOUT (5s). That watchdog is fed by binary WS bytes = MSE chunks (RTC
- *   is P2P), so it measures MSE liveness only; the 2.5s window while negotiating false-fired on
- *   bursty-but-alive MSE over congested 4G (loss 29-54%), and `onclose()` tore down the working
- *   MSE too (a retry storm, not the "revert to MSE" the old comment claimed). It also killed
- *   streams before the first loss% metric was emitted, starving the card's A0 severity gate so
- *   suppression latched slowly. At 5s the loss sample lands first and 4xMSE settles. Killing a
- *   doomed RTC probe fast stays the job of the RTC give-up watchdog + card narrow-link suppression.
- * * Changelog v2.4.5:
- * - NEW `setMuted(muted)`: the card's volume button now mutes the ON-SCREEN element (onscreenVideo)
- *   AND records `_mseWanted`, so promote/commit/revert restore the intended audio state. The old
- *   card path set this.video.muted directly — muted the hidden MSE during promoted RTC while the
- *   audible overlay kept its sound, and the next handoff overwrote the choice.
- * * Changelog v2.4.4:
- * - FIX two card-facing bugs whose shared root cause was the card binding to `this.video` (the
- *   hidden MSE element) while, during the reversible-RTC `promoted` phase, the on-screen pixels
- *   are the overlay `_rtcVideo`. New `get onscreenVideo()` returns the element the viewer actually
- *   sees (overlay while promoted, else this.video). The card now targets it for BOTH the live-dot
- *   and play/pause.
- * - NEW manual-pause API: `suspend()` soft-pauses the on-screen element and sets `_manualHold`,
- *   which freezes the commit/revert poll (and the give-up timer) so the handoff machine can't call
- *   play() and auto-resume behind the user. `resume()` clears the hold, seeks MSE to the live edge
- *   (RTC unaffected), and plays. Instant freeze/resume — decoder+socket kept warm on purpose;
- *   bandwidth teardown stays the OFF-SCREEN auto-pause's job.
- * * Changelog v2.4.3:
- * - The no-data watchdog (DISCONNECT_TIMEOUT) is now PHASE-AWARE. While an un-committed RTC
- *   probe is live (_rtcPhase 'negotiating' or 'promoted') the RTC overlay is ADDITIVE load on
- *   the link, so a ws MSE-media silence almost certainly means that experiment is choking the
- *   link (the multi-camera 4G collapse). In those phases the watchdog fires at
- *   NEGOTIATING_DISCONNECT_TIMEOUT (2.5s) instead of 5s, so the doomed probe is killed sooner,
- *   the link is freed for the other cameras, and the card reaches MSE-only suppression faster.
- *   Low risk: MSE is still warm underneath in both phases, so a watchdog fire reverts to MSE
- *   (~1 frame), not a black screen; on a fat link MSE never goes 2.5s silent so it never trips.
- *   'warm' (no experiment) and 'committed' (no MSE net) keep the full 5s.
- * * Changelog v2.4.2:
- * - FIX: onopen() guards against a null/undefined this.mode. A stream entry without `mode`
- *   or a teardown<->open race during rapid reconnect churn left this.mode null; the
- *   `this.mode.includes(...)` calls threw, the ws died at open (0-byte channel) and the card
- *   reconnected immediately -> reconnect storm (seen even on LAN). Now restores the default
- *   ('webrtc,mse,hls,mjpeg') + warns once, so onopen can't throw. Behaviour unchanged when
- *   this.mode is already a valid string.
- * * Changelog v2.4.1:
- * - Added a PASSIVE per-pc metric sampler (_sampleMetrics) piggybacking on the getStats poll
- *   already running for framesDecoded. Harvests inbound-rtp (bytesReceived/packetsReceived/
- *   packetsLost/jitter) + the selected candidate-pair currentRoundTripTime, and emits a compact
- *   `metrics` line to the card every METRICS_EMIT_MS (3s). Diagnostic ONLY — the values never
- *   feed the promote/commit/revert logic (that stays framesDecoded-only), so behaviour is
- *   byte-identical on every path (fat LAN included: same stream, the numbers are just now
- *   visible in the HA log). First data-gathering step toward history-driven adaptation: lets us
- *   check on real links whether RTT bufferbloat / rising loss PRECEDES the mse->rtc->mse reverts.
- * * Changelog v2.4.0:
- * - Default pcConfig.iceServers now lists TWO independent public STUN servers
- * (Google + Cloudflare). If one provider is blocked/filtered/down, the other still
- * lets the browser discover its srflx candidate. Applies to every camera (the default
- * lives on each driver). A per-card `ice_servers` REPLACES it; `ice_servers: []`
- * removes all defaults (privacy opt-out). See webrtc-camera.js `_normalizeIceServers`.
- * * Changelog v2.3.9:
- * - FIX: removed the MSE `updateend` live-sync inherited from upstream v3.6.1
- * (`this.video.currentTime = start` re-seek + `this.video.playbackRate = gap`).
- * On iOS 26.1 WebKit the `gap > 0.1 ? gap : 0.1` floor pinned playbackRate to
- * ~0.1x near the live edge, so the picture crawled at "~1 frame / 3s". MSE now
- * plays at 1x (pre-3.6.1 behavior); the 5s buffer trim + setLiveSeekableRange are
- * kept. WebRTC remains the low-latency path, MSE the reliable fallback.
- * * Changelog v2.3.8:
- * - FIX: ondisconnect() now revokes the MSE blob URL (URL.createObjectURL(ms),
- * legacy MediaSource path on Chrome/Firefox) if the {once} 'sourceopen' handler
- * never fired — i.e. a driver torn down before the MediaSource opened (a shadow
- * reaped within ms, or teardown mid-negotiation). Without it the blob->MediaSource
- * mapping leaked one entry per such driver, growing slowly under reprobe churn.
- * Double revoke is a harmless no-op; ManagedMediaSource (srcObject) is unaffected.
- * * Changelog v2.3.7:
- * - CHANGE: routine lifecycle/negotiation traces (Mode:*, pc state, RTC promote/commit/phase,
- * RTC-rejected, autoplay-warn, "WebRTC …; keeping MSE", relaxed-ws-error "Ignored") moved from
- * info/warn to `console.debug` — hidden at the browser console's default level, visible with
- * Verbose on. Genuine recoverable anomalies stay at `console.warn` (video/ICE/SDP/buffer/mic
- * errors, strict ws-error, no-data watchdog, RTC revert). Lets the native console level filter
- * act as the gate; no custom debug flag on the driver.
- * * Changelog v2.3.6:
- * - ADD: the `connection-closed` CustomEvent now carries `detail.reason` so the card can log
- * WHY a stream dropped without a browser console — 'ws-close' (server/browser closed the
- * socket), 'no-data-watchdog' (5s silent freeze, socket still open), or 'ws-error' (strict
- * mode). Purely additive: the field is optional and existing consumers ignore it. Feeds the
- * card's new `debug`-gated Home Assistant logging (card v14.2.7).
- * * Changelog v2.3.5:
- * - REFACTOR (smell #1): the RTC handoff is now an explicit 4-state machine on `_rtcPhase`
- * ('warm' | 'negotiating' | 'promoted' | 'committed') driven through a single `_setPhase()`
- * transition point (which logs every edge — free observability, no counters). Replaces the
- * old implicit `_promoted`/`_committed` boolean constellation; illegal combinations are no
- * longer representable and the poll loop reads as phase comparisons.
- * - REMOVE: the legacy/non-reversible RTC branch (irreversible one-shot handoff) and the
- * `reversible` flag are gone. The card made EVERY driver reversible, so that branch — plus
- * the whole non-reversible body of onpcvideo() and the `RTC_PROVE_MS` knob — was dead code
- * that still shared state fields with the live path (the actual root of smell #1). onpcvideo()
- * is now a no-op the card wraps for its UI update; net −122 lines. Behaviour unchanged.
- * * Changelog v2.3.4:
- * - TUNE: RTC_SWAP_PROVE_MS 20000 -> 30000 (wider evidence window before a shadow may swap in;
- * zero effect on good nets, which upgrade directly and never swap). FIRSTFRAME_TIMEOUT
- * 600000 -> 120000 (reap a connected-but-frameless pc in 2min instead of 10). Both are now
- * overridable per-card via `rtc_swap_prove_ms` / `firstframe_timeout` (ms) in the card YAML.
- * * Changelog v2.3.3:
- * - ADD: RTC_SWAP_PROVE_MS (~20s) + one-shot `rtc_sustained` signal. After PROMOTE, once RTC
- * has decoded gaplessly for RTC_SWAP_PROVE_MS the driver emits ui_sync {signal:'rtc_sustained'}
- * exactly once. This is the SHADOW-SWAP gate: the card swaps a background shadow in to replace
- * the MSE main ONLY on this proven-durable signal, never on the 2s PROMOTE. A shadow that
- * stalls before proving (throttled path) never fires it, so the working MSE main is never
- * torn down for an unproven replacement (kills the black-tile + swap-churn failure mode).
- * * Changelog v2.3.2:
- * - FIX: the shadow-swap upgrade path was still the legacy IRREVERSIBLE mechanism and the
- * remaining crash vector. The card now makes EVERY driver reversible (webrtc+mse), so a
- * shadow that swaps in as the new main carries its own warm MSE and reverts to it on a
- * stall instead of freezing black. New applyAudio(muted) routes the configured mute state
- * to the on-screen element (RTC overlay while promoted, else this.video), which the card
- * calls after the swap to un-mute (the shadow negotiates force-muted); un-muting
- * this.video directly would have played the hidden warm-MSE audio under the RTC video.
- * * Changelog v2.3.1:
- * - FIX: reversible handoff still crash-looped on the COMMIT step. v2.3.0 committed
- * (released MSE + closed ws) after a fixed 30s from promote; a bursty repeater camera
- * held RTC for 30s, got committed, then the next inevitable stall had no MSE to fall
- * back on -> failWebRTC -> connection-closed -> nuke -> cold start -> loop (log 4IRQL:
- * promoted @14s, committed @44s, Connection Closed). Commit is the ONLY irreversible
- * step, so it is now reserved for genuinely rock-solid paths: it requires CONTINUOUS
- * gapless decode for RTC_COMMIT_MS (raised 30s -> 180s), and ANY decode gap
- * > RTC_STALL_RESET restarts that clock. Bursty cameras therefore never commit — they
- * stay in warm-MSE mode and revert harmlessly on each stall (one frame, no reconnect).
- * Also restored RTC_LIVENESS_TIMEOUT 8s -> 15s (the value the historically-working
- * handoff used; 8s reverted on ordinary congestion bursts). Dual bandwidth while warm
- * is LAN-side (go2rtc->viewer), not on the constrained camera->go2rtc repeater path.
- * * Changelog v2.3.0:
- * - FIX (major): the MSE->WebRTC handoff is now REVERSIBLE on the main parallel driver,
- * so reaching WebRTC can no longer crash the working MSE stream. Root problem across
- * v2.2.15-19: onpcvideo closed the MSE ws (irreversible), so any post-handoff RTC stall
- * forced a full reconnect (nuke from zero). On congested repeater paths WebRTC delivers
- * bursts that pass any prove window then stall, so every camera that DID promote entered
- * a prove->stall->reconnect loop; cameras that never sustained decode sat throttled. NEW
- * model (see _startReversibleRTC): MSE stays ATTACHED and warm on this.video; WebRTC
- * decodes on an overlaid, rendered <video> (full-rate decode — the old offscreen probe
- * was browser-throttled, which made good cameras take 90s+ to "prove"). Promotion just
- * reveals the overlay (reversible, near-instant at RTC_PROMOTE_MS=2s); a stall before
- * commit snaps back to the warm MSE in one frame (no reconnect, no black) and re-probes;
- * MSE is released (ws closed) only after RTC_COMMIT_MS=30s of continuous liveness. Gated
- * per-driver by `reversible` (set by the card for the main driver only) so the shadow-
- * swap path stays on the legacy prove-before-commit branch, unchanged.
- * * Changelog v2.2.19:
- * - FIX: reconnect loop / driver churn on congested paths. v2.2.18 promoted (and
- * closed MSE) after ~1s of decode; repeater paths deliver WebRTC in bursts, so a
- * stream would pass that gate, stall, get caught by the post-handoff liveness
- * watchdog, and force a full reconnect that tore down the working MSE too — every
- * ~15s, forever, and via connection-closed so no reprobe/shadow ever armed. NEW
- * model "prove before commit": the visible element stays on MSE while the offscreen
- * probe accumulates ACTUALLY-flowing decode time; onpcvideo (switch + close MSE)
- * fires only after RTC_PROVE_MS (15s) of real flow. Burst-then-stall paths never
- * reach it -> MSE never interrupted, and the 600s watchdog gives up with rtc_failed
- * -> reprobe/shadow. The post-handoff liveness watchdog stays as a backstop.
- * * Changelog v2.2.18:
- * - FIX: promoted RTC streams could freeze BLACK forever. framesDecoded > 0 is a
- * single keyframe; on congested paths RTP then stalled, so we handed off (closing
- * MSE) to a stream delivering no further frames. Because the pc stays 'connected'
- * (ICE/DTLS fine) no state change fires and nothing caught it — black with MSE gone,
- * no reconnect, no reprobe. TWO changes: (1) gate the handoff on SUSTAINED decode
- * (framesDecoded advancing across consecutive polls), not the first frame; (2) keep
- * the getStats poll alive AFTER handoff as an RTC liveness watchdog: if framesDecoded
- * stops advancing for RTC_LIVENESS_TIMEOUT (15s) recover via failWebRTC's no-MSE
- * branch (connection-closed -> card reconnects MSE + re-probes). Restores the "never
- * permanently black" invariant the MSE no-data watchdog can't provide post-handoff
- * (RTC media flows P2P off the ws).
- * * Changelog v2.2.17:
- * - FIX: promote to WebRTC on the first actually-DECODED frame, not on 'loadeddata'.
- * On a WebRTC MediaStream loadeddata fires the moment the track is attached, long
- * before RTP video flows on slow repeater paths — promoting then swapped the visible
- * element to a BLACK video AND tore down the working MSE stream (observed: black
- * screen for minutes until RTP finally started). Gate the swap on
- * inbound-rtp.framesDecoded > 0 (compositing-independent proof a real picture
- * exists), polled from getStats(); loadeddata is no longer used as the success edge.
- * - CHANGE: FIRSTFRAME_TIMEOUT 15000 -> 600000. With the swap gated on a real frame,
- * MSE keeps serving the user while the pc waits, so a slow-but-real first frame (seen
- * to take minutes) must not be reaped early; 15s was far below the observed latency.
- * * Changelog v2.2.16:
- * - ADDED: first-frame watchdog on the WebRTC pc. 'connectionState=connected' is
- * not proof of a working stream — on multi-hop paths ICE/DTLS checks pass while
- * RTP media never flows, leaving the pc "connected" but medialess forever. If no
- * first frame lands within FIRSTFRAME_TIMEOUT of 'connected', the pc
- * is reaped and rtc_failed is signalled so the card retries with a fresh ICE
- * gather (was: main waited forever; shadow was killed blindly by the card's 15s).
- * - CHANGE: a rejected webrtc/offer now routes through the shared failWebRTC path
- * (emits rtc_failed) instead of a bare pc.close() that fired no signal.
- * - ADDED: [DIAGNOSTIC] pc connectionstatechange logging with elapsed ICE time.
- * * Changelog v2.2.14:
- * - FIX: in parallel webrtc+mse mode a WebRTC ICE failure no longer tears down a
- * working MSE stream. When MSE is a live fallback (socket open + codecs
- * negotiated) only WebRTC is dropped and an 'rtc_failed' signal is emitted; the
- * full-teardown/retry path is reserved for when no fallback remains.
- * * Changelog v2.2.13:
- * - FIX: a PeerConnection failure AFTER a successful MSE->RTC handover now
- * notifies the card (retry) instead of silently freezing. onclose() is called
- * before this.pc is nulled so its (!ws && !pc) guard no longer short-circuits.
- * * Changelog v2.2.12:
- * - FIX: onclose() now actually closes the WebSocket on proactive-close paths
- * (no-data watchdog, strict-mode WS error, PC failure) instead of only nulling
- * the reference, which left an orphaned open socket streaming into a discarded
- * driver. Added a re-entrancy guard so the self-triggered close event can't
- * double-fire 'connection-closed'.
- * - FIX: MSE staging buffer now bounds-checks before buf.set(), preventing an
- * uncaught RangeError when the SourceBuffer stalls while media keeps arriving.
- * - CLEANUP: removed dead fields (disconnectTID, background, visibilityThreshold,
- * visibilityCheck) left over from the driver-internal auto-pause that now lives
- * in the card.
- * * Changelog v2.2.11:
- * - ADDED: Emits 'signal' event with value 'rtc_rejected' when WebRTC is discarded due to lower priority.
- * This allows the parent controller to stop upgrade timers immediately.
- * * Changelog v2.2.10:
- * - FIX: 'onopen' no longer wipes external message handlers (ui_sync).
- * * Changelog v2.2.9:
- * - FIX: Renamed 'this.id' to 'this.clientId' to avoid DOM conflict.
+ * VideoRTC — the streaming driver (`<video-rtc>`), one instance per visible stream.
+ *
+ * Owns exactly ONE WebSocket to go2rtc and, once it promotes, ONE RTCPeerConnection. Plays a
+ * stream over the best transport the link allows — MSE (fMP4 over the ws), WebRTC (P2P, low
+ * latency), HLS, or MJPEG — and performs a REVERSIBLE MSE→WebRTC handoff: MSE keeps flowing while
+ * an RTC probe ramps in the background, and a failed probe silently falls back to the still-warm
+ * MSE instead of blacking out.
+ *
+ * The driver is deliberately dumb and disposable: the card (`<webrtc-camera>`) owns lifecycle and
+ * recreates the driver on every retry. Do NOT add cross-reconnect state here — it belongs on the
+ * card, or (for grid-wide state) on the module-level `_rtcProbeGate` singleton below.
+ *
+ * Congestion control (the hard part — a multi-camera 4G grid shares one uplink; N cameras ramping
+ * WebRTC at once overshoot it together into a bufferbloat storm):
+ *   - Alg.1  band classifier    — folds per-poll RTT-excess + loss into a perf/degr/path verdict (~2s).
+ *   - Alg.2  probe serializer    — `_rtcProbeGate`, shared by every driver on the page, ramps ONE RTC
+ *                                  probe at a time on a constrained link and all at once on a fat one
+ *                                  (the first probe is a canary that opens or re-serializes the gate).
+ *   - Alg.3  band-driven abort   — a leaky accumulator reverts a doomed probe to warm MSE.
+ *   - A0     grid blackout       — one band=path abort suppresses RTC page-wide for 300s.
+ *   - Adaptive no-data watchdog  — the warm-MSE reap timeout self-extends while the shared uplink is
+ *                                  known-congested (grid blackout, self-measured bursty feed, or an
+ *                                  MSE-reap quorum), so a frozen-but-fed stream rides the choke out
+ *                                  instead of reaping at the base timeout and stampeding into a storm.
+ *
+ * There are NO user knobs for the congestion stack — the driver self-calibrates from measured link
+ * state. Per-version rationale and field-validation notes live in RELEASE.md; the file:line map of
+ * every mechanism is in ARCHITECTURE.md. Derived from AlexxIT/WebRTC; the congestion-control stack
+ * above (Alg.1–4, A0, the adaptive/byte-aware watchdog) is fork-specific.
  */
 
 /**
@@ -423,7 +40,7 @@
  * WebRTC bandwidth-hungry RAMP. EVERY VideoRTC on the page — each card's main driver AND its
  * background shadow — shares this one coordinator. Why: N cameras promoting RTC ~simultaneously
  * each fire an uncoordinated GCC bitrate ramp; on one constrained 4G uplink the N ramps overshoot
- * together → a grid-wide RTT balloon (the "bufferbloat storm" seen in the direct-4G field logs).
+ * together → a grid-wide RTT balloon (a bufferbloat storm that can drop the HA websocket).
  *
  * BUT serializing only earns its keep on a CONSTRAINED link — on a fat pipe (LAN / wideband) there
  * is no storm to prevent, and holding cameras in a queue just delays their upgrade for nothing. So
@@ -453,30 +70,33 @@ const _rtcProbeGate = {
     leaseTID: 0,        // force-release backstop for the current holder
     open: false,        // true once the canary reports SUSTAINED band=perf: fat pipe, ramp everyone in parallel
     perfStreak: 0,      // consecutive band=perf reports from the canary; opens only past PERF_OPEN_STREAK
-    PERF_OPEN_STREAK: 3,// need ~1.5s of sustained perf to open — a lone perf sample at the promote instant
-                        // is a 4G head-fake (exc=0 momentarily, then bufferbloat); opening on it let the
-                        // whole grid ramp in parallel just before the canary revealed band=path (field 10:36)
+    PERF_OPEN_STREAK: 3,// consecutive perf samples (~1.5s) required to open the gate.
+                        // PITFALL: do NOT open on a single perf sample. At the promote instant a saturated
+                        // 4G link reads exc=0 for one poll (head-fake) before bufferbloat shows; opening on
+                        // it lets the whole grid ramp in parallel right before the canary reveals band=path.
     LEASE_MS: 20000,    // hard cap on any single hold (comfortably above RTC_GATE_SETTLE_MS,
                         // far below the 120s FIRSTFRAME give-up so a frozen probe can't wedge us)
     suppressed: false,  // [A0-grid] true = a band=path abort has blacked out RTC probing GRID-WIDE
     suppressedAt: 0,    // when the blackout began (diagnostics)
     SUPPRESS_MS: 300000,// grid RTC blackout after a band=path abort — matches the card's RTC_RETEST_MS
     reprobeTID: 0,      // re-arm backstop that lifts the blackout
-    liveDrivers: new Set(), // [v2.18.0] every connected VideoRTC on the page (main + shadow). On a
-                        // FRESH blackout latch we push the warm-extend to each so a watchdog already
-                        // armed at base(5s) can't reap a rideable stream at the latch boundary.
+    liveDrivers: new Set(), // every connected VideoRTC on the page (main + shadow). On a FRESH latch
+                        // (blackout or MSE-reap) we push the warm-extend to each, so a watchdog already
+                        // armed at base(5s) can't reap a rideable stream in the moment the latch engages.
 
-    // [v2.21.0 MSE-reap grid latch] The cold-start bridge BEFORE band=path suppression can latch. On a
-    // saturated uplink the first wave of MSE sockets bursts then chokes → each reaps at base 5s BEFORE
-    // any RTC probe survives the ~6s band-abort to trip `suppressed`, and before #1 can witness a
-    // >=2.5s inter-chunk gap to prime (a fresh socket's burst-then-silence leaves no gap). Field
-    // 2026-08-27 19:37: 7 base reaps in the first ~40s (extgatecam died 3×), suppression only latched
-    // at +48s. So count no-data-watchdog reaps across DISTINCT cameras (streamKey): >= MSE_REAP_QUORUM
-    // within MSE_REAP_WINDOW_MS = the shared uplink is choking, not one dead camera. Latch
-    // mseReapCongested for MSE_REAP_HOLD_MS (sliding) → _effectiveDisconnectTimeout extends every warm
-    // socket (incl. fresh ones, from their first arm) so the cold-start storm rides out instead of
-    // churning. Bounded + self-clearing; a lone dead camera can't reach quorum; a healthy grid never
-    // reaps so never latches (zero regression). Superseded by band=path suppress() when that latches.
+    // MSE-reap grid latch — the cold-start bridge that covers the window BEFORE band=path suppression
+    // can latch. On a saturated uplink the first wave of MSE sockets bursts then chokes: each reaps at
+    // base(5s) before any RTC probe survives its ~6s band-abort to trip `suppressed`, and before the
+    // byte-aware watchdog can see a >=2.5s inter-chunk gap to prime (a fresh socket that bursts then
+    // goes silent leaves no gap to measure). So count no-data-watchdog reaps across DISTINCT cameras
+    // (by streamKey): >= MSE_REAP_QUORUM within MSE_REAP_WINDOW_MS means the shared uplink is choking,
+    // not one dead camera. Latch mseReapCongested for MSE_REAP_HOLD_MS (sliding) → every warm socket
+    // (fresh ones included, from their first arm) extends via _effectiveDisconnectTimeout, so the
+    // cold-start storm rides out instead of churning. Bounded and self-clearing; band=path suppress()
+    // supersedes it once that latches (300s > 60s).
+    // PITFALL: key on streamKey, not clientId/wsURL — one dead camera reconnecting must NOT reach quorum
+    // by itself; quorum means DISTINCT cameras. A healthy grid never reaps, so it never latches (no
+    // regression on good links).
     mseReapCongested: false,
     mseReapLog: new Map(),  // streamKey -> last reap ts; distinct-camera counting within the window
     mseReapTID: 0,          // self-release timer (sliding)
@@ -500,13 +120,12 @@ const _rtcProbeGate = {
 
     /**
      * [A0-grid] A band=path RTC abort on ANY camera means the SHARED uplink cannot carry RTC — not
-     * just for the camera that aborted. The per-card flap score (webrtc-camera.js) can't see this:
-     * each card reverts once (score 1.0), and 4 independent cards each burning one ~7s RTC-over-TURN
-     * probe together saturate the uplink and drop the HA socket (field 2026-08-27, two crashes). So
-     * black out RTC probing GRID-WIDE for SUPPRESS_MS: deny every acquire, drop any serial holder and
-     * queue, and let MSE (already flowing, zero extra load) carry every camera. Self-releasing. Returns
-     * TRUE on the FRESH transition so the caller emits one rtc_suppressed to its card; a repeat hit
-     * just refreshes the window.
+     * just for the camera that aborted. The per-card flap score (webrtc-camera.js) can't see this: each
+     * card reverts once (score 1.0), and N independent cards each burning one ~7s RTC-over-TURN probe
+     * together saturate the uplink and can drop the HA websocket. So black out RTC probing GRID-WIDE for
+     * SUPPRESS_MS: deny every acquire, drop any serial holder and queue, and let MSE (already flowing,
+     * zero extra load) carry every camera. Self-releasing. Returns TRUE on the FRESH transition so the
+     * caller emits one rtc_suppressed to its card; a repeat hit just refreshes the window.
      */
     suppress(driver) {
         const fresh = !this.suppressed;
@@ -526,11 +145,10 @@ const _rtcProbeGate = {
         }, this.SUPPRESS_MS);
         if (fresh) {
             console.warn(`[VideoRTC:${driver.clientId}] RTC probe gate SUPPRESSED grid-wide (band=path) — no RTC probes for ${Math.round(this.SUPPRESS_MS / 1000)}s.`);
-            // [v2.18.0 retroactive re-arm] suppressed is set above, so every warm stream's effective
-            // no-data timeout is now the extend (30s). But a stream that fell silent JUST BEFORE this
-            // latch still holds a base(5s) timer from its last byte and would reap mid-blackout (field
-            // 2026-08-27: 3 cams reaped at 49.58/50.40/53.22, the latch boundary) before a byte could
-            // extend it. Push the extend to every live warm stream NOW so it rides the blackout out.
+            // Retroactive re-arm. `suppressed` is set above, so every warm stream's effective no-data
+            // timeout is now the extend (30s). But a stream that fell silent JUST BEFORE this latch
+            // still holds a base(5s) timer from its last byte and would reap mid-blackout before a new
+            // byte could extend it. Push the extend to every live warm stream NOW so it rides out.
             for (const d of this.liveDrivers) {
                 try { d._rearmWatchdogForBlackout(); } catch (e) { /* one driver must not block the grid */ }
             }
@@ -539,7 +157,7 @@ const _rtcProbeGate = {
     },
 
     /**
-     * [v2.21.0 MSE-reap grid latch] Record one no-data-watchdog reap; once DISTINCT cameras cross the
+     * [MSE-reap grid latch] Record one no-data-watchdog reap; once DISTINCT cameras cross the
      * quorum within the window, latch grid MSE-congestion so warm/fresh sockets extend instead of
      * churning through the cold-start storm. Keyed by streamKey (stable across a camera's reconnects),
      * so one dead camera's repeated reaps can't reach quorum alone. On a FRESH latch, push the extend
@@ -627,48 +245,39 @@ export class VideoRTC extends HTMLElement {
     constructor() {
         super();
 
-        // [TRACE] Generate a short random ID for this session (e.g., "X7K9P")
-        // Renamed to clientId to avoid conflict with HTMLElement.id
+        // Short random per-session id, for correlating this driver with go2rtc's server-side logs.
+        // Named clientId (not `id`) to avoid shadowing HTMLElement.id.
         this.clientId = Math.random().toString(36).substring(2, 7).toUpperCase();
 
-        // No-media watchdog: if the socket stays open but no media bytes arrive
-        // for this long, treat the stream as stalled and force a reconnect.
+        // --- No-data watchdog (warm MSE) ---
+        // If the ws stays open but no media bytes arrive for this long, the stream is stalled: reap
+        // the socket and reconnect. This is the BASE timeout; _effectiveDisconnectTimeout() extends it
+        // while the shared uplink is known-congested (see the adaptive-watchdog block below).
         this.DISCONNECT_TIMEOUT = 5000;
-
-        // Phase-aware variant of the above (v2.4.3). While an un-committed RTC probe is live
-        // (_rtcPhase 'negotiating'/'promoted') the RTC overlay is additive load on the link; a
-        // ws MSE-media silence there is almost certainly that experiment choking the link (the
-        // multi-camera 4G collapse), so we bail at this shorter deadline to free the link and
-        // fall back to the still-warm MSE (~1 frame revert, not a black screen). 'warm' and
-        // 'committed' keep the full DISCONNECT_TIMEOUT. Set to 0 to disable the shortening.
+        // Shorter deadline used ONLY while an un-committed RTC probe is live (_rtcPhase
+        // negotiating/promoted). There the RTC overlay is additive load on the link, so an MSE-media
+        // silence is almost certainly that probe choking the uplink — bail fast and fall back to the
+        // still-warm MSE (~1 frame, not a black screen). warm/committed keep the full base. 0 disables.
         this.NEGOTIATING_DISCONNECT_TIMEOUT = 2500;
 
-        // First-frame watchdog: 'connectionState=connected' is NOT proof of a working
-        // WebRTC stream. On multi-hop paths ICE/DTLS connectivity checks (tiny packets)
-        // can pass while the sustained RTP media never traverses, so the pc sits
-        // "connected" but no frame is ever decoded. If no frame decodes within this long
-        // after 'connected', treat it as a WebRTC failure so the connection can be
-        // dropped and retried with a freshly gathered ICE path instead of lingering as a
-        // media-less zombie.
-        // 600s: because the swap is gated on a real decoded frame (see onwebrtc), MSE
-        // keeps serving the user while the pc waits, so a slow-but-real first frame
-        // (observed to take minutes on repeater paths) must not be reaped early. Only
-        // genuinely media-less paths hit this deadline. Tunable.
-        // Default 120s (v2.3.4, was 600000): on a path where the pc reaches "connected" but
-        // never decodes a frame (e.g. cloudflared tunnel), 10min was a wasteful zombie pc;
-        // 2min gives a slow-but-real repeater first frame ample room while reaping dead paths
-        // far sooner. Overridable per-card via `firstframe_timeout` (ms) in the card YAML.
+        // --- First-frame watchdog (promoted RTC) ---
+        // pc.connectionState === 'connected' is NOT proof of flowing media: on multi-hop paths the
+        // ICE/DTLS connectivity checks (tiny packets) pass while sustained RTP never traverses, so the
+        // pc sits 'connected' with no frame ever decoded. If no frame decodes within this long after
+        // 'connected', treat it as a WebRTC failure and drop/retry with a freshly gathered ICE path.
+        // Generous because the swap is gated on a real decoded frame (see onwebrtc): MSE serves the
+        // user meanwhile, so a slow-but-real repeater first frame (can take minutes) must not be reaped
+        // early — only genuinely media-less paths hit this. Overridable per-card via `firstframe_timeout`.
         this.FIRSTFRAME_TIMEOUT = 120000;
         this._firstFrameTID = 0;   // first-frame watchdog timer handle
         this._firstFramePoll = 0;  // getStats() poll interval handle (framesDecoded)
-        // [MSE PLAYBACK HEALTH] Always-on "is the picture actually moving?" sampler. The no-data
-        // watchdog (DISCONNECT_TIMEOUT) only asks "did bytes arrive in the last 5s"; on bursty 4G
-        // the bytes trickle in within each window so the socket looks alive while the on-screen
-        // <video> is buffer-starved and frozen/stuttering. This samples the ON-SCREEN element's
-        // currentTime advance vs wall-clock — the truth the viewer actually sees — and reports
-        // flow/stutter/frozen to the card, independent of RTC. Fills the gap where MSE-only sessions
-        // produced no signal (no RTC band verdict, socket never died) so the network dot stayed
-        // white and the freeze was invisible in the HA log.
+
+        // --- MSE playback-health sampler (always on) ---
+        // The no-data watchdog only asks "did bytes arrive?"; on bursty 4G the bytes trickle in within
+        // each window so the socket looks alive while the on-screen <video> is buffer-starved and
+        // frozen. This samples the ON-SCREEN element's currentTime advance vs wall-clock — the truth
+        // the viewer sees — and reports flow/stutter/frozen to the card, independent of RTC. It is the
+        // only freeze signal for an MSE-only session (no RTC band verdict, socket never dies).
         this._pbTimer = 0;         // playback-health interval handle
         this._pbLastAt = 0;        // wall-clock ms at last sample (0 = needs re-priming)
         this._pbLastCT = -1;       // onscreen currentTime (s) at last sample (-1 = unset)
@@ -676,123 +285,103 @@ export class VideoRTC extends HTMLElement {
         this._pbRatio = 1;         // EWMA of media-advance / wall-advance (1 = realtime)
         this._pbClass = '';        // last emitted verdict: '' | 'flow' | 'stutter' | 'frozen'
         this.PB_SAMPLE_MS = 2000;  // sampler cadence
-        this.PB_FLOW_RATIO = 0.7;  // EWMA >= this → flowing (green)
-        this.PB_FROZEN_RATIO = 0.15; // EWMA <= this → frozen (red); in between → stutter (yellow)
-        // [MSE RIDE-OUT — work item B] When the sampler sees a SUSTAINED freeze on the MSE element,
-        // nudge the picture to the live edge (a non-destructive reseek) instead of letting the no-data
-        // watchdog tear the socket down into a retry storm. Complements the updateend strand-recovery,
-        // which only fires when currentTime fell BELOW buffered.start (evicted region); this covers the
-        // bursty-4G freeze where the element stalls with data still buffered ahead of it.
+        this.PB_FLOW_RATIO = 0.7;  // EWMA >= this -> flowing (green)
+        this.PB_FROZEN_RATIO = 0.15; // EWMA <= this -> frozen (red); in between -> stutter (yellow)
+        // Ride-out: on a SUSTAINED freeze of the MSE element, nudge the picture to the live edge (a
+        // non-destructive reseek) instead of letting the no-data watchdog tear the socket into a retry
+        // storm. Complements updateend strand-recovery (which fires only when currentTime fell BELOW
+        // buffered.start); this covers the bursty-4G freeze where data is still buffered ahead.
         this._pbFrozenRun = 0;       // consecutive 'frozen' samples on the MSE element
         this._rideoutAt = 0;         // wall-clock ms of the last ride-out reseek (cooldown gate)
-        this.PB_FROZEN_SAMPLES = 3;  // sustained frozen (~6s) before a nudge — below the 5s watchdog's storm
-        this.RIDEOUT_COOLDOWN_MS = 10000; // don't reseek more than once per this window
-        // After handoff the RTC media flows P2P off the ws, so the MSE no-data
-        // watchdog can never see it stall. This is the liveness deadline for the
-        // *promoted* RTC stream: if framesDecoded stops advancing for this long the
-        // picture is frozen/black and we recover (reconnect -> MSE + fresh probe).
-        // Long enough to ride out a brief congestion pause, short enough that a dead
-        // handoff self-heals in seconds instead of staying black forever. Tunable.
-        // Post-promotion stall deadline (framesDecoded stops advancing this long).
-        // In the reversible flow (see onwebrtc) a stall BEFORE commit reverts to the
-        // still-warm MSE instantly (one frame, no reconnect); AFTER commit it reconnects.
-        // 15s matches the value the historically-working handoff used: short enough to
-        // self-heal fast, long enough to ride the brief congestion pauses that are normal
-        // on repeater paths (8s was too twitchy and reverted on ordinary bursts). Tunable.
+        this.PB_FROZEN_SAMPLES = 3;  // sustained frozen (~6s) before a nudge — below the 5s watchdog reap
+        this.RIDEOUT_COOLDOWN_MS = 10000; // minimum spacing between ride-out reseeks
+
+        // --- Promoted-RTC liveness ---
+        // After promotion RTC media flows P2P off the ws, so the MSE no-data watchdog can't see it
+        // stall. This is the promoted-RTC liveness deadline: if framesDecoded stops advancing this long
+        // the picture is frozen/black and we recover. In the reversible flow (see onwebrtc) a stall
+        // BEFORE commit reverts to warm MSE instantly (one frame, no reconnect); AFTER commit it
+        // reconnects. 15s rides brief congestion pauses that are normal on repeater paths without being
+        // twitchy (shorter reverted on ordinary bursts). Tunable.
         this.RTC_LIVENESS_TIMEOUT = 15000;
 
-        // [REVERSIBLE RTC — EXPLICIT PHASE, v2.3.5] The driver keeps its MSE stream ATTACHED
-        // and warm on this.video and decodes WebRTC on a second, overlaid <video>
+        // --- Reversible RTC handoff — explicit phase machine ---
+        // MSE stays ATTACHED and warm on this.video; WebRTC decodes on a second, overlaid <video>
         // (this._rtcVideo). The handoff is a 4-state machine on this._rtcPhase:
         //   'warm'        no RTC overlay — MSE only (initial state, and after a revert).
         //   'negotiating' overlay decoding, still hidden (opacity 0); MSE warm. REVERSIBLE.
         //   'promoted'    overlay revealed to the user; MSE still warm underneath. REVERSIBLE.
-        //   'committed'   overlay collapsed onto this.video, MSE released, ws closed. This is
-        //                 the ONLY irreversible state (a later stall must reconnect).
-        // Legal edges: warm -> negotiating -> promoted -> committed, plus
-        // negotiating/promoted -> warm (revert). Every edge goes through _setPhase() so the
-        // transition is logged in exactly one place (free observability, no counters).
+        //   'committed'   overlay collapsed onto this.video, MSE released, ws closed. IRREVERSIBLE.
+        // Legal edges: warm -> negotiating -> promoted -> committed, plus negotiating/promoted -> warm.
+        // PITFALL: every transition MUST go through _setPhase() — it is the single logging point and
+        // clears the phase timers; setting _rtcPhase directly desyncs the timers and the card mirror.
         this._rtcVideo = null;     // overlaid <video> carrying the RTC MediaStream
         this._rtcPhase = 'warm';   // 'warm' | 'negotiating' | 'promoted' | 'committed'
-        this._manualHold = false;  // [MANUAL PAUSE] user soft-paused: freeze the on-screen element
-                                   // AND hold the commit/revert poll so it can't auto-resume.
+        this._manualHold = false;  // viewer soft-paused: freeze the on-screen element AND hold the
+                                   // commit/revert poll so it cannot auto-resume behind the pause.
         this._commitTID = 0;       // unused in the poll-driven commit model; kept for _clearRtcTimers
         this._mseWanted = false;   // desired mute state of the MSE element, restored on revert/commit
-        // Flowing decode required before we REVEAL RTC (make it visible). Small because
-        // the overlay is rendered (full-rate decode) and promotion is reversible, so we can
-        // be aggressive and restore near-instant RTC on good paths. Tunable.
+        // Flowing decode required before REVEALING RTC (making the overlay visible). Small: the overlay
+        // is already rendered and promotion is reversible, so we can restore RTC near-instantly on good
+        // paths and revert harmlessly if it stalls. Tunable.
         this.RTC_PROMOTE_MS = 2000;
-        // CONTINUOUS gapless liveness required AFTER promotion before we commit (release MSE).
-        // Committing is the ONLY irreversible step (MSE gone -> a later stall must reconnect),
-        // so it must be reserved for paths that are genuinely rock-solid. This is deliberately
-        // long: any decode gap > RTC_STALL_RESET restarts the clock (see the poll below), so a
-        // bursty repeater camera never reaches it — it just stays in warm-MSE mode and reverts
-        // harmlessly on each stall. Only a camera that decodes essentially gaplessly for this
-        // whole window releases MSE (freeing the 2nd decoder + the LAN-side dual bandwidth), and
-        // for such a camera a post-commit stall is rare. 30s was far too short: cameras that
-        // held RTC briefly got committed and then crash-looped on the next stall. Tunable.
+        // CONTINUOUS gapless liveness required AFTER promotion before COMMIT (releasing MSE). Commit is
+        // the only irreversible step, so it is reserved for genuinely rock-solid paths. Deliberately
+        // long: any decode gap > RTC_STALL_RESET restarts this clock, so a bursty repeater never
+        // reaches it — it stays in warm-MSE and reverts on each stall. PITFALL: do not shorten this to
+        // "upgrade faster" — a short commit window commits flaky cameras that then crash-loop on the
+        // next stall (MSE is already gone). Tunable.
         this.RTC_COMMIT_MS = 180000;
-        // A decode gap longer than this (but shorter than RTC_LIVENESS_TIMEOUT) counts as
-        // instability and restarts the commit stability clock without reverting. Tunable.
+        // A decode gap longer than this (but shorter than RTC_LIVENESS_TIMEOUT) counts as instability
+        // and restarts the commit stability clock without reverting. Tunable.
         this.RTC_STALL_RESET = 2000;
-        // GAPLESS liveness after promotion before we emit a one-shot `rtc_sustained` signal.
-        // This is the SHADOW-SWAP gate: the card keeps the old (proven) main visible and only
-        // swaps a background shadow in AFTER the shadow's RTC has held gaplessly this long — so
-        // a shadow that promotes at 2s but stalls (bursty/throttled path) NEVER triggers a swap,
-        // and the working MSE main is never destroyed for an unproven replacement. Deliberately
-        // set well beyond RTC_LIVENESS_TIMEOUT (15s) so surviving it is real evidence the path
-        // is better than the reverted main, while staying far below the full 180s commit so a
-        // genuinely good upgrade still lands quickly. Default 30s (v2.3.4, was 20000): on a
-        // throttled path RTC dies at ~15s, so a 5s margin let the odd "lucky" shadow swap in
-        // only to fall back seconds later; 30s doubles the evidence window (zero effect on good
-        // nets, which never use the swap). Overridable per-card via `rtc_swap_prove_ms` (ms).
+        // GAPLESS liveness after promotion before emitting the one-shot `rtc_sustained` signal. This is
+        // the SHADOW-SWAP gate: the card keeps the proven main visible and swaps a background shadow in
+        // only after the shadow has held gaplessly this long, so a shadow that promotes at 2s but then
+        // stalls NEVER triggers a swap and the working main is never destroyed for an unproven
+        // replacement. Set well beyond RTC_LIVENESS_TIMEOUT (surviving it is real evidence the path
+        // beats the reverted main) yet far below the 180s commit (a good upgrade still lands quickly).
+        // Overridable per-card via `rtc_swap_prove_ms`.
         this.RTC_SWAP_PROVE_MS = 30000;
-        // [RTC SERIALIZER — Alg.2] GAPLESS time in 'promoted' after which the probe's GCC ramp has
-        // plateaued, so the cross-instance _rtcProbeGate token is handed to the NEXT camera — we do
-        // NOT hold it for the full 180s commit, which would serialize a good wideband grid at
-        // 180s/camera. ~8s covers a typical GCC ramp-to-plateau; on a bad path Alg.3 aborts in ~6s
-        // and releases even sooner. Tunable.
+        // [Alg.2] GAPLESS time in 'promoted' after which the probe's GCC ramp has plateaued, so the
+        // cross-instance _rtcProbeGate token is handed to the NEXT camera. We do NOT hold it for the
+        // full 180s commit — that would serialize a good wideband grid at 180s/camera. ~8s covers a
+        // typical GCC ramp-to-plateau; a bad path aborts (Alg.3) in ~6s and releases even sooner. Tunable.
         this.RTC_GATE_SETTLE_MS = 8000;
 
         this._lastLiveness = 0;    // Date.now() of the last framesDecoded advance
         this._stableSince = 0;     // start of the current gapless run (drives the commit clock)
         this._sustainedSignaled = false; // guards the one-shot rtc_sustained (shadow-swap) signal
 
-        // [BW INSTRUMENTATION v2.4.1] Passive metric sampler state (see _sampleMetrics). Emits a
-        // compact `metrics` line to the card every METRICS_EMIT_MS, harvested from the getStats
-        // poll already running for framesDecoded. Diagnostic only — never feeds stream decisions.
+        // --- Metrics sampler (diagnostic only; harvested from the framesDecoded getStats poll) ---
+        // Emits a compact `metrics` line to the card every METRICS_EMIT_MS. Also computes the raw
+        // signals the band classifier / adaptive watchdog consume. PITFALL: the emit is diagnostic —
+        // stream decisions read _bandExcess/_bandLoss/_congestion, never the emitted text.
         this._mLastBytes = -1;    // previous inbound-rtp bytesReceived (delta -> goodput)
         this._mLastRecv = -1;     // previous packetsReceived           (delta -> loss %)
         this._mLastLost = -1;     // previous packetsLost               (delta -> loss %)
-        this._mRttMin = Infinity; // session-min candidate-pair RTT (bufferbloat baseline)
+        this._mRttMin = Infinity; // session-min candidate-pair RTT — the queue-empty baseline (Alg.1/4)
         this._mNextEmit = 0;      // Date.now() gate for the next emit
         this.METRICS_EMIT_MS = 3000; // sampling cadence; bypasses the card's 10s log throttle
-        // [TRANSPORT DIAGNOSTICS v2.6.0] Extra getStats fields to settle bufferbloat-vs-fragmentation
-        // on the direct-4G path (see the CF-tunnel control run 2026-08-26). `path` = selected
-        // candidate-pair local/remote candidateType + protocol (relay/srflx/host, udp/tcp) — tests the
-        // "UDP-to-TURN vs TCP-over-CF" hypothesis directly. `jbuf` = avg jitter-buffer delay (ms),
-        // the receiver-side bufferbloat tell (grows when packets queue). `nack` = retransmit requests
-        // over the window, the loss/fragmentation tell. `pkt` = avg received packet size (B), the MTU
-        // tell (near/over ~1200 sustained -> suspect IP fragmentation). All diagnostic ONLY.
+        // Transport-diagnostic getStats fields (relay/srflx/host + udp/tcp path, jitter-buffer delay,
+        // nack count, mean packet size). Diagnostic ONLY — they separate bufferbloat from
+        // fragmentation in the logs; no stream decision reads them.
         this._mLastJbDelay = -1;  // previous inbound-rtp jitterBufferDelay (cumulative s)
         this._mLastJbEmit = -1;   // previous inbound-rtp jitterBufferEmittedCount
         this._mLastNack = -1;     // previous inbound-rtp nackCount
 
-        // [ADAPTIVE WATCHDOG v2.5.0 / Strato-1] The MSE no-data watchdog timeout is no longer a
-        // fixed constant. A tiny in-loop controller turns the passive metrics above into a smoothed
-        // `congestion` score in [0,1] and EXTENDS the effective watchdog up to ADAPT_MAX_EXTEND× the
-        // base while a link is congested — it NEVER shortens below the base. Field-validated
-        // 2026-08-26 (mse_timeout:0 run): on a congested 4G multi-cam grid the RTC upgrade is
-        // ADDITIVE load that transiently starves the warm MSE (rttExcess ballooned to ~21s, loss to
-        // 40%+, yet the socket never died and all 4 cams converged to clean RTC once committed). A
-        // fixed 5s watchdog tears such a recoverable stream down (the reconnect storm). Extending
-        // ONLY while an un-committed RTC probe is live, then decaying back to the tight base, lets a
-        // real stall ride out while still reaping a genuinely dead warm MSE-only stream on time.
-        // The high/low-band paths thus diverge from IDENTICAL code: the substream rarely congests so
-        // it keeps the tight base; the main saturates the link and earns the extension automatically.
-        // Signal: rttExcess = rtt - session-min-rtt (bufferbloat, the leading indicator), reinforced
-        // by loss and by a decaying penalty for recent doomed RTC promotes (`_rtcFutility`). All
-        // thresholds are parametric (overridable per-card) even though the loop self-adapts.
+        // --- Adaptive no-data watchdog ---
+        // The warm-MSE watchdog is not a fixed constant. A tiny in-loop controller folds the metrics
+        // above into a smoothed `congestion` score in [0,1] and EXTENDS the effective timeout up to
+        // ADAPT_MAX_EXTEND x base while a link is congested; it NEVER shortens below the base. Rationale:
+        // an RTC upgrade is additive load that can transiently starve the warm MSE (RTT balloons, loss
+        // spikes) on a link that then recovers — a fixed 5s reap tears that recoverable stream down into
+        // a reconnect storm. Extending only while congested, then decaying back to the tight base, lets
+        // a real stall ride out while a genuinely dead MSE-only stream is still reaped on time. High- and
+        // low-band cameras diverge from IDENTICAL code: a substream rarely congests (keeps the base), a
+        // main that saturates the link earns the extension automatically. Leading signal: rttExcess =
+        // rtt - session-min-rtt (standing queue), reinforced by loss and by _rtcFutility. All thresholds
+        // overridable per-card even though the loop self-adapts.
         this.ADAPTIVE_WATCHDOG = true;   // master switch (per-card `mse_adaptive`)
         this.ADAPT_RTT_EXCESS_MS = 400;  // rttExcess (ms) that alone drives congestion -> 1
         this.ADAPT_LOSS_PCT = 20;        // loss (%) that alone drives congestion -> 1
@@ -800,86 +389,60 @@ export class VideoRTC extends HTMLElement {
         this.ADAPT_EWMA_ALPHA = 0.3;     // congestion EWMA smoothing (higher = twitchier)
         this._congestion = 0;            // smoothed congestion score [0,1]
 
-        // [BYTE-AWARE WATCHDOG #1 — v2.19.0] The warm ride-out (base×ADAPT_MAX_EXTEND) used to arm
-        // ONLY when a prior RTC probe had latched a grid-wide blackout (_rtcProbeGate.suppressed).
-        // Field 2026-08-27 14:50-14:52 exposed the gap: on a link so narrow that even the RTC probe
-        // is collateral-reaped at 5s (< the ~6s band-abort threshold), suppression NEVER latches, so
-        // the warm MSE streams also get only the base 5s and churn in a pure-MSE reconnect storm.
-        // Fix: measure frozen-but-fed DIRECTLY from the ws byte arrival. MSE fMP4 chunks that arrive
-        // in bursts with gaps >= WS_BURSTY_GAP_MS (the congested-uplink signature: >2.5s gaps despite
-        // 30-60 KB/s goodput, per the BENCHMARK lines) mark the stream bursty for WS_BURSTY_MEMORY_MS;
-        // while bursty, the warm reap extends WITHOUT needing any RTC probe. A smooth stream (LAN /
-        // good 4G, sub-second chunks) never trips the gap, so it stays at the tight base 5s — zero
-        // regression on healthy links. Bounded by ADAPT_MAX_EXTEND; self-clears when the link smooths.
+        // --- Byte-aware watchdog (self-measured bursty feed) ---
+        // The warm ride-out also arms when THIS socket is directly measured to be frozen-but-fed,
+        // independent of any RTC probe: MSE fMP4 chunks arriving in bursts with inter-chunk gaps
+        // >= WS_BURSTY_GAP_MS mark the stream bursty for WS_BURSTY_MEMORY_MS, and while bursty the reap
+        // extends. This closes the pure-MSE narrow-link storm — a link so narrow that even the RTC probe
+        // is reaped before it can trip the grid blackout, so no RTC-derived extension ever latches. A
+        // smooth stream (sub-second chunks) never trips the gap and stays at the tight base (no
+        // regression). Bounded by ADAPT_MAX_EXTEND; self-clears when the feed smooths.
         this.WS_BURSTY_GAP_MS = Math.round(this.DISCONNECT_TIMEOUT / 2);          // 2500ms: gap that marks bursty (0 disables)
         this.WS_BURSTY_MEMORY_MS = this.DISCONNECT_TIMEOUT * this.ADAPT_MAX_EXTEND; // 30000ms: how long one big gap keeps us bursty
         this._wsLastByteAt = 0;          // Date.now() of the last binary ws chunk (0 = fresh socket, primes)
         this._wsBurstyUntil = 0;         // Date.now() until which the stream counts as bursty-fed
         this._rtcFutility = 0;           // decaying penalty for recent doomed RTC promotes [0,1]
 
-        // [RTC ABORT — Alg.3→Alg.4] Give up a doomed un-committed RTC probe and snap back to the warm
-        // MSE. This SUPERSEDES the v2.7.0 blind-ceiling abort (jbuf/RTT over a hard limit), which was
-        // structurally blind to the pure-LOSS pathology the field logs exposed (direct-4G 2026-08-26:
-        // esternacancello RTT pinned at 107ms with 10-29% loss — healthy by any RTT/jbuf ceiling, yet the
-        // stream was unusable). The decision reads the same two live stressors the band classifier folds —
-        // standing-queue EXCESS (rttEwma - session-min RTT, absolute ms) and short-window loss — so it
-        // inherits loss-awareness for free and the absolute RTT ceilings are deleted (no dead code).
-        //
-        // A LEAKY ASYMMETRIC ACCUMULATOR integrates a CONTINUOUS severity over time (worsen fast, recover
-        // slow — field finding A): each poll adds pollMs*severity, where severity ramps 0→SEV_MAX as excess/
-        // loss exceed their floors. This replaced v2.9's 3-bucket accrual (path=+pollMs, degr=HOLD,
-        // perf=bleed): the 20:36 4G disaster proved 'degr' was a DEAD-ZONE where a clearly-dying canary
-        // (rtt 5.7x its floor, loss 15%) accrued NOTHING for ~10s and stormed HA off the uplink before the
-        // abort fired. Continuous severity gives up in ~2s on a runaway while still absorbing verdict flap
-        // and the optimistic opening (excess unknown → sev 0 until a baseline+window exist). The revert bumps
-        // `_rtcFutility`, which SHORTENS the next probe's hold toward HOLD*(1-K) so a repeatedly-doomed path
-        // gives up faster; rtc_failed then arms the card's backed-off re-probe loop. Master switch only
-        // (per-card `mse_abort`); the tuning surface is the internal excess/loss severity shaping constants.
+        // --- RTC abort (Alg.3/4): give up a doomed un-committed probe, snap back to warm MSE ---
+        // The decision reads the same two live stressors the band classifier folds — standing-queue
+        // EXCESS (rttEwma - session-min RTT, absolute ms) and short-window loss — so it is loss-aware
+        // for free (a path can be RTT-healthy yet unusable at 10-30% loss). A LEAKY ASYMMETRIC
+        // ACCUMULATOR integrates a CONTINUOUS severity over time (worsen fast, recover slow): each poll
+        // adds pollMs*severity, where severity ramps 0->SEV_MAX as excess/loss exceed their floors.
+        // PITFALL: severity must be CONTINUOUS, not bucketed by band label. A discrete 'degr' bucket that
+        // accrued nothing was a dead-zone where a clearly-dying canary sat for ~10s and stormed the
+        // uplink (dropping HA) before the abort fired. On revert we bump _rtcFutility, which shortens the
+        // next probe's hold; rtc_failed then arms the card's backed-off re-probe. Master switch only
+        // (per-card `mse_abort`).
         this.RTC_ABORT_ENABLED = true;   // master switch (per-card `mse_abort`)
-        this.RTC_ABORT_HOLD_MS = 6000;   // integrated severity·time (ms, at futility 0) that -> abort
+        this.RTC_ABORT_HOLD_MS = 6000;   // integrated severity*time (ms, at futility 0) that -> abort
         this.RTC_ABORT_FUTILITY_K = 0.5; // futility [0,1] shortens the hold toward HOLD*(1-K)
         this.RTC_ABORT_RECOVER_K = 0.5;  // a healthy poll bleeds _bandBadMs at pollMs*K (<1 -> recover slow)
-        // [Alg.4.1] CONTINUOUS severity (replaces the old perf/degr/path 3-bucket accrual). Each poll adds
-        // pollMs*severity, where severity ramps 0 -> SEV_MAX as the standing-queue EXCESS climbs past
-        // EXCESS_LOW (or loss past LOSS_LOW): a mildly-bloated link accrues slowly, a runaway (the
-        // 4G-disaster signature: excess growing into the hundreds of ms) blows through the hold in ~2s.
-        // This deletes the old 'degr' HOLD dead-zone — the 20:36 4G log sat at 'degr' with rtt 5.7x its
-        // floor and loss 15% for ~10s accruing NOTHING, so the doomed canary stormed the uplink to rtt
-        // 3546ms (killing HA) before Alg.3 finally aborted. v2.12.1: severity is driven by ABSOLUTE excess
-        // (ms of standing queue), not the rttEwma/rttMin RATIO — the ratio is scale-free and explodes at
-        // a tiny LAN baseline (min 2-3ms), where a few ms of harmless jitter fabricated infl 3-4x and
-        // false-aborted a 0%-loss LAN grid in a loop. Excess in ms is scale-correct: 5ms of queue is 5ms.
+        // Continuous severity shaping. PITFALL: severity is driven by ABSOLUTE excess (ms of standing
+        // queue), NOT the rttEwma/rttMin ratio. The ratio is scale-free and explodes at a tiny LAN
+        // baseline (min 2-3ms), where a few ms of harmless jitter reads as 3-4x inflation and
+        // false-aborts a 0%-loss LAN grid in a loop. Excess in ms is scale-correct: 5ms of queue is 5ms.
         this.RTC_ABORT_EXCESS_LOW_MS = 200; // standing-queue excess (rttEwma-rttMin, ms) below which no severity accrues
         this.RTC_ABORT_EXCESS_REF_MS = 300; // excess span (ms) per 1.0 severity unit (LOW+REF => sev 1)
         this.RTC_ABORT_LOSS_LOW = 8;     // loss (%) below which no loss-severity accrues
         this.RTC_ABORT_LOSS_REF = 12;    // loss span (%) per 1.0 severity unit (loss LOW+REF => sev 1)
         this.RTC_ABORT_SEV_MAX = 3;      // per-poll severity cap (an extreme link -> abort in ~2s)
-        this._bandBadMs = 0;             // leaky integral of severity·time (ms); 0 = clear
+        this._bandBadMs = 0;             // leaky integral of severity*time (ms); 0 = clear
 
-        // [EARLY BAND CLASSIFIER — Alg.1, v2.8.0] The self-configuring rework's foundation. The
-        // reactive levers above (adaptive-watchdog EXTEND, step-3 ABORT) treat SYMPTOMS after a doomed
-        // promote has already loaded the link; field analysis (2026-08-26, see
-        // webrtc-mse-timeout-zero-validation memory) showed the instrumentation already tells a
-        // PERFORMANT link from a non-performant one within ~2s of a probe. This classifier folds the
-        // per-poll signals ALREADY harvested for the metrics line (candidate-pair RTT, session-min RTT,
-        // short-window loss%) into a live signal. Two consumers: the gate reads the coarse label
-        // ('perf' | 'degr' | 'path'), the abort reads the continuous excess/loss severity. It runs
-        // ONLY while an un-committed probe is live (negotiating/promoted); '' otherwise. Field-validated
-        // against real 4G/LAN logs: the v2.8 absolute BAND_*_RTT_MS ceilings both mislabelled an in-form
-        // 4G (rtt~200ms) as degr AND were too lenient to catch the 20:36 disaster path until rtt had run
-        // to seconds; the v2.12 rttEwma/rttMin RATIO fixed the 4G mislabel but exploded on a tiny LAN
-        // baseline (jitter 2ms->7ms => infl 3-4x => false path/abort on a 0%-loss LAN). v2.12.1 uses the
-        // ABSOLUTE standing-queue EXCESS below. NOT user knobs (self-calibrate off _mRttMin).
-        this.BAND_CLASSIFY_MS = 2000;    // min observation before the first verdict (the user's "~2s")
-        // [Alg.4.1] Self-calibrating band signal: standing-queue EXCESS = rttEwma - session-min-RTT
-        // (_mRttMin, the queue-empty baseline), in ms. excess≈0 = empty queue → healthy at ANY absolute
-        // RTT (LAN 2ms OR in-form 4G 200ms); excess growing = a standing queue building under the RTC
-        // ramp. Subtracting the link's own floor keeps it self-calibrating (the same 4G that holds 4 RTC
-        // one moment and storms the next is judged by its LIVE queue, not by "it's 4G"), while measuring
-        // in ABSOLUTE ms keeps it scale-correct — unlike the v2.12 rttEwma/rttMin ratio, a 2ms LAN floor
-        // no longer manufactures huge "inflation" from single-digit-ms jitter. Loss stays an ABSOLUTE
-        // backstop (a lossy path is bad regardless of RTT). This label is display+gate only; the abort
-        // integrates the continuous excess/loss severity above.
+        // --- Early band classifier (Alg.1): perf / degr / path within ~2s of a probe ---
+        // The reactive levers above (adaptive EXTEND, RTC abort) treat symptoms AFTER a doomed promote
+        // has already loaded the link. This classifier folds the per-poll signals ALREADY harvested for
+        // the metrics line (candidate-pair RTT, session-min RTT, short-window loss%) into a live verdict
+        // within ~2s, so the gate can serialize/parallelize probes proactively. Two consumers: the gate
+        // reads the coarse label; the abort reads the continuous excess/loss severity. Runs ONLY while
+        // an un-committed probe is live; '' otherwise. Self-calibrating — no user knobs.
+        this.BAND_CLASSIFY_MS = 2000;    // min observation before the first verdict (~2s)
+        // Self-calibrating band signal: standing-queue EXCESS = rttEwma - session-min-RTT (_mRttMin, the
+        // queue-empty baseline), in ms. excess ~ 0 = empty queue -> healthy at ANY absolute RTT (LAN 2ms
+        // OR in-form 4G 200ms); excess growing = a standing queue building under the RTC ramp.
+        // Subtracting the link's own floor makes it judge the LIVE queue, not "it's 4G"; measuring in
+        // ABSOLUTE ms keeps it scale-correct (see the ratio PITFALL above). Loss is an absolute backstop.
+        // This label is display+gate only; the abort integrates the continuous severity.
         this.BAND_GOOD_EXCESS_MS = 80;   // excess <= this (with low loss) => 'perf' (queue ~empty)
         this.BAND_PATH_EXCESS_MS = 400;  // excess >= this (or high loss)  => 'path' (standing queue)
         this.BAND_GOOD_LOSS_PCT = 3;     // loss (%) below which, with low excess, the link is 'perf'
@@ -899,9 +462,10 @@ export class VideoRTC extends HTMLElement {
             'mp4a.40.2', 'mp4a.40.5', 'flac', 'opus',
         ];
 
-        // CONFIGURATION FLAGS
-        // strictMode: false = Ignore minor errors (faster load). true = Disconnect on any error (safer).
-        this.strictMode = false; 
+        // strictMode gates only the ws 'error' path: false = tolerate a transient ws error and let the
+        // watchdog/reconnect handle it (fewer needless teardowns); true = disconnect on any ws error.
+        // Recovery (spec close + the 5s watchdog) is mode-independent, so relaxed is the safer default.
+        this.strictMode = false;
 
         this.mode = 'webrtc,mse,hls,mjpeg';
         this.media = 'video,audio';
@@ -939,10 +503,9 @@ export class VideoRTC extends HTMLElement {
         // proactively closed fires its own (async) close event.
         this._notifiedClosed = false;
         
-        // CRITICAL: "Handoff" state.
-        // If true, it means we are closing the WebSocket on purpose because
-        // we switched to WebRTC. It prevents the "connection-closed" event
-        // from triggering a restart loop.
+        // Handoff flag: true means WE are closing the ws on purpose (committed to WebRTC), so the
+        // socket's own close event must NOT be treated as a failure. PITFALL: clear/set this around
+        // every intentional close — a stale false here turns a deliberate handoff into a reconnect loop.
         this.handoff = false;
     }
 
@@ -958,30 +521,29 @@ export class VideoRTC extends HTMLElement {
             value = 'ws' + location.origin.substring(4) + value;
         }
         
-        // [TRACE] Append Client ID to URL for server-side logging correlation
+        // Append the per-session clientId so go2rtc's logs can be correlated with this driver.
         const separator = value.includes('?') ? '&' : '?';
-        this.streamKey = value;   // [v2.21.0] stable per-camera key (URL sans the per-connection client_id) — the MSE-reap grid latch counts DISTINCT cameras across reconnects
+        // streamKey = the URL WITHOUT the per-connection client_id: a stable per-camera identity that
+        // survives reconnects. The MSE-reap grid latch keys on it to count DISTINCT cameras.
+        this.streamKey = value;
         this.wsURL = value + separator + 'client_id=' + this.clientId;
         
         this.onconnect();
     }
 
     /**
-     * Safe Play Method.
-     * 1. Checks if already playing to avoid CPU waste (Promise churn).
-     * 2. Handles the "Autoplay Policy" error by muting and retrying.
+     * Start playback on the MSE element, tolerating the browser autoplay policy.
+     * No-op if already playing (avoids play()/Promise churn). On an autoplay block, retry muted.
      */
     play() {
-        // OPTIMIZATION: If video exists and is playing, do nothing.
-        // Saves CPU cycles on mobile devices.
         if (!this.video || !this.video.paused) return;
 
         this.video.play().catch(er => {
-            if (er.name === 'AbortError') return; // Ignore aborts (user navigated away)
+            if (er.name === 'AbortError') return; // navigated away mid-play(); not a failure
 
-            // Mute-fallback ONLY on a real autoplay-policy block (NotAllowedError).
-            // Other rejections (transient decode errors, races during reconnect) must
-            // NOT force a permanent mute — that silences audio for a non-audio reason.
+            // PITFALL: mute-fallback ONLY on NotAllowedError (a real autoplay-policy block). Other
+            // rejections (transient decode errors, reconnect races) must NOT force a permanent mute —
+            // that would silence audio for a non-audio reason (#951).
             if (er.name === 'NotAllowedError' && !this.video.muted) {
                 this.video.muted = true;
                 this.video.play().catch(e => console.debug(`[VideoRTC:${this.clientId}] Autoplay warn:`, e));
@@ -992,24 +554,21 @@ export class VideoRTC extends HTMLElement {
     }
 
     /**
-     * [MANUAL PAUSE — card #913] The element the viewer actually sees. While RTC is REVEALED but
-     * not yet committed (`promoted`), the on-screen pixels are the overlay (`_rtcVideo`) and the
-     * MSE element (`this.video`) is hidden underneath; warm/negotiating/committed all present
-     * `this.video`. The card binds the play/pause button and the live-indicator dot to THIS getter
-     * so both act on what's on screen, not on the hidden MSE element (the old bug: pause froze the
-     * invisible MSE while RTC kept playing; the dot watched the stalled hidden MSE and went red on
-     * a perfect RTC stream).
+     * The element the viewer actually sees. While RTC is REVEALED but not yet committed ('promoted')
+     * that is the overlay (`_rtcVideo`), with the MSE element hidden underneath; warm/negotiating/
+     * committed all present `this.video`.
+     * PITFALL: the card must bind the play/pause button and the live-indicator dot to THIS getter, not
+     * to `this.video`. Binding to the hidden MSE element while promoted froze the invisible MSE (pause
+     * did nothing visible) and turned the dot red on a perfectly healthy RTC stream (#913).
      */
     get onscreenVideo() {
         return (this._rtcPhase === 'promoted' && this._rtcVideo) ? this._rtcVideo : this.video;
     }
 
     /**
-     * [MANUAL PAUSE] Soft-freeze the on-screen element and HOLD the RTC handoff poll so its
-     * commit/revert can't call play() and silently auto-resume (which would defeat the pause).
-     * Intentionally does NOT free the decoder or close the socket — that's the OFF-SCREEN
-     * auto-pause's job (bandwidth). A viewer pausing a stream they're watching wants an instant
-     * freeze and an instant resume, so the flow is kept warm.
+     * Viewer soft-pause: freeze the on-screen element and set _manualHold so the RTC handoff poll
+     * can't call play() and silently auto-resume behind the pause. Deliberately keeps the decoder and
+     * socket warm (that is the off-screen auto-pause's job) so freeze and resume are both instant.
      */
     suspend() {
         this._manualHold = true;
@@ -1032,12 +591,12 @@ export class VideoRTC extends HTMLElement {
     }
 
     /**
-     * [MUTE — card] Set the audio state the way the card's volume button should: apply it to the
-     * element that is actually AUDIBLE (the on-screen one — the overlay while promoted, else
-     * this.video) AND record it as `_mseWanted`, the driver's desired-audio state that promote/
-     * commit/revert restore. Toggling `this.video.muted` directly (the old card path) muted the
-     * hidden MSE while the audible overlay kept its sound, and the next handoff transition then
-     * overwrote the user's choice from the stale `_mseWanted`.
+     * Set the audio state for the card's volume button: apply it to the AUDIBLE element (the overlay
+     * while promoted, else this.video) AND record it as `_mseWanted`, the desired-audio state that
+     * promote/commit/revert restore.
+     * PITFALL: go through here, don't toggle `this.video.muted` directly — while promoted that mutes
+     * the hidden MSE while the audible overlay keeps its sound, and the next handoff transition then
+     * restores the user's choice from a stale `_mseWanted`.
      */
     setMuted(muted) {
         this._mseWanted = muted;
@@ -1145,7 +704,7 @@ export class VideoRTC extends HTMLElement {
         });
 
         this._startPlaybackSampler();
-        _rtcProbeGate.liveDrivers.add(this);   // [v2.18.0] join the grid so a blackout latch can re-arm our warm watchdog
+        _rtcProbeGate.liveDrivers.add(this);   // join the grid registry so a latch can re-arm our warm watchdog
         return true;
     }
 
@@ -1178,8 +737,8 @@ export class VideoRTC extends HTMLElement {
         }
         const ct = v.currentTime;
         // Element identity changed (MSE this.video <-> promoted RTC overlay _rtcVideo): the previous
-        // baseline belongs to the OTHER element, so ct-_pbLastCT is a cross-element artifact (seen in
-        // the field as advanced -9.71s / +4.89s right after a mode swap). Re-prime, don't judge.
+        // baseline belongs to the OTHER element, so ct-_pbLastCT is a cross-element artifact (a large
+        // spurious jump, either sign, right after a mode swap). Re-prime, don't judge.
         if (v !== this._pbLastEl) { this._pbLastEl = v; this._pbLastAt = now; this._pbLastCT = ct; return; }
         if (this._pbLastAt <= 0 || this._pbLastCT < 0) { this._pbLastAt = now; this._pbLastCT = ct; return; }
         const dtWall = (now - this._pbLastAt) / 1000;
@@ -1209,7 +768,7 @@ export class VideoRTC extends HTMLElement {
     }
 
     /**
-     * [MSE RIDE-OUT — work item B] A sustained MSE freeze: nudge the on-screen picture to the live
+     * MSE ride-out. On a sustained MSE freeze, nudge the on-screen picture to the live
      * edge instead of waiting for the no-data watchdog to force onclose() (which tears the socket down
      * into the escalating retry storm seen on lossy 4G). MSE element ONLY — the promoted RTC overlay
      * has empty seekable and its own liveness (first-frame poll + band). Only acts when there is unplayed
@@ -1247,55 +806,38 @@ export class VideoRTC extends HTMLElement {
     }
 
     /**
-     * No-media watchdog.
-     * Re-armed on every media byte. If media stops flowing while the socket is
-     * still technically open (frozen MSE, or a black-holed path that never sends
-     * a FIN/RST), no 'close' event ever fires and the parent never learns the
-     * stream is dead. When the timer elapses we force onclose(), which dispatches
-     * 'connection-closed' and lets the card reconnect.
+     * No-media watchdog. Re-armed on every media byte. If media stops while the socket stays open
+     * (frozen MSE, or a black-holed path that never sends FIN/RST) no 'close' event ever fires, so the
+     * card would never learn the stream is dead. When the timer elapses we force onclose(), which
+     * dispatches 'connection-closed' and lets the card reconnect.
      */
     _feedWatchdog() {
         if (!this.DISCONNECT_TIMEOUT) return;
         if (this.reconnectTID) clearTimeout(this.reconnectTID);
-        // This watchdog is fed by binary WS bytes = the MSE fMP4 chunks (onopen's message
-        // handler). RTC media flows P2P and never touches it, so this measures MSE liveness
-        // ONLY. Therefore it always uses the full DISCONNECT_TIMEOUT.
-        //
-        // v2.4.6 REVERTS the v2.4.3 phase-aware shortening (2.5s while negotiating/promoted).
-        // Field data (congested 4G, loss 29-54%, 4 cams) proved it self-defeating on TWO fronts:
-        //   (1) It shortened the guardian of the MSE, not the RTC probe. Under TCP-over-lossy-uplink
-        //       the MSE arrives in bursts with >2.5s gaps despite 70-114 KB/s average goodput, so
-        //       the 2.5s window FALSE-fired and `onclose()` tore down the whole connection — the
-        //       working MSE included (the old "reverts to MSE, ~1 frame" claim was wrong: onclose
-        //       kills MSE too, hence the mode:mse->none retry storm).
-        //   (2) Deaths at ~2.5s landed BEFORE the first `metrics` (loss%) line was emitted, so the
-        //       card's A0 severity gate (latch rtc-suppressed on the first death with a fresh
-        //       loss ≥20% sample) had no data and never latched fast — the exact opposite of the
-        //       "reach MSE-only suppression faster" goal. At the full 5s the loss sample lands
-        //       first, so A0 latches on the first bad death and 4xMSE settles.
-        // Abandoning a doomed RTC probe fast is the job of the RTC give-up/first-frame watchdog +
-        // the card's narrow-link suppression, NOT this MSE no-data watchdog.
-        // [ADAPTIVE WATCHDOG v2.5.0] Effective timeout = base, EXTENDED while an un-committed RTC
-        // probe is congesting the warm MSE (see _effectiveDisconnectTimeout). Re-armed on every MSE
-        // byte, so it tracks live congestion. v2.4.6's "always base" comment above still holds for
-        // the 'warm'/'committed' phases; the extension applies only to negotiating/promoted.
+        // Fed by binary ws bytes = MSE fMP4 chunks, so this measures MSE liveness ONLY (RTC media flows
+        // P2P and never touches the ws). The effective timeout is the base, EXTENDED while the shared
+        // uplink is known-congested (RTC-probe phase, grid blackout, bursty feed, or MSE-reap latch);
+        // see _effectiveDisconnectTimeout.
+        // PITFALL: do NOT shorten this while an RTC probe is live to "reap the probe faster". The probe
+        // is P2P and invisible here — a short window only reaps the warm MSE, which on a bursty link
+        // arrives with >2.5s inter-chunk gaps at healthy goodput, so it false-fires and tears the whole
+        // connection down (MSE included) into a reconnect storm. Killing a doomed probe is the job of
+        // the RTC abort / first-frame watchdog, not this one.
         const timeout = this._effectiveDisconnectTimeout();
-        // [#1 TELEMETRY, v2.20.1 fix] Capture the regime at ARM time — it is what SET `timeout`.
-        // v2.20.0 recomputed it inside the fire callback (up to `timeout` ms later), so a bursty-hold
-        // whose 30s memory window had since lapsed mislabelled as `base` — the field 19:37:47
-        // `ws-reap: 30000ms (base …)` self-contradiction (it was really a #1 bursty-hold win). The
-        // watchdog only fires when NO byte arrived (so _feedWatchdog wasn't called again) → this
-        // captured value is still the arming regime. base = neither hold engaged (residual first-stall
-        // gap); bursty-hold = #1; suppressed-hold = band=path blackout; mse-congest-hold = cold-start
-        // grid latch; black = video.error fast-reap; probe-congest = RTC-probe-phase extend.
+        // Snapshot the regime NOW, at ARM time: it is what selected `timeout`. The callback fires up to
+        // `timeout` ms later, when a bursty/latched hold may have lapsed — recomputing the label there
+        // would mislabel the reap (e.g. a bursty-hold reap printed as `base`). The watchdog only fires
+        // when NO byte arrived (so _feedWatchdog wasn't re-called), so this snapshot stays accurate.
+        // PITFALL: never move this capture into the fire callback.
         const base = this.DISCONNECT_TIMEOUT;
         const regime = this._timeoutRegime();
         this.reconnectTID = setTimeout(() => {
             this.reconnectTID = 0;
             console.warn(`[VideoRTC:${this.clientId}] No-data watchdog fired (${timeout}ms silent, phase=${this._rtcPhase}, cong=${this._congestion.toFixed(2)}). Forcing close.`);
-            // [v2.21.0] Feed the reap into the MSE-reap grid latch (before onclose tears us down); a
-            // fresh latch returns the distinct-camera count so this line shows the exact reap that
-            // engaged it. Diagnostic append only — no effect on _closeReason (the flap classifier key).
+            // Feed the reap into the MSE-reap grid latch (before onclose tears us down); a fresh latch
+            // returns the distinct-camera count, so this line shows the exact reap that engaged it.
+            // PITFALL: this only APPENDS to the diagnostic; _closeReason must stay 'no-data-watchdog'
+            // (the card's flap classifier keys on that exact string).
             const latched = _rtcProbeGate.noteMseReap(this);
             this._emitByteAwareDiag('ws_reap', `${timeout}ms (${regime}, base ${base}ms)`
                 + (latched ? ` → grid-latch ${latched} cams` : ''));
@@ -1313,10 +855,10 @@ export class VideoRTC extends HTMLElement {
     }
 
     /**
-     * [BYTE-AWARE WATCHDOG #1] Fold one binary ws chunk into the burstiness tracker. Called from
-     * onopen's binary branch BEFORE _feedWatchdog, so the re-armed timeout reflects the gap that
-     * just closed. A gap >= WS_BURSTY_GAP_MS is the congested-uplink signature (bursts, not smooth
-     * flow); it marks the stream bursty-fed for WS_BURSTY_MEMORY_MS. Cost: two field writes.
+     * Byte-aware watchdog: fold one binary ws chunk into the burstiness tracker. Called from onopen's
+     * binary branch BEFORE _feedWatchdog, so the re-armed timeout reflects the gap that just closed. An
+     * inter-chunk gap >= WS_BURSTY_GAP_MS is the congested-uplink signature (bursts, not smooth flow)
+     * and marks the stream bursty-fed for WS_BURSTY_MEMORY_MS. Cheap: two field writes.
      */
     _noteWsByte() {
         const now = Date.now();
@@ -1324,10 +866,9 @@ export class VideoRTC extends HTMLElement {
             const gap = now - this._wsLastByteAt;
             const wasBursty = now < this._wsBurstyUntil;   // already inside a hold window?
             this._wsBurstyUntil = now + this.WS_BURSTY_MEMORY_MS;
-            // [#1 TELEMETRY, v2.20.0] One debug line per bursty ARM edge (not per byte): a
-            // >= WS_BURSTY_GAP_MS inter-chunk gap just primed/extended the frozen-but-fed hold.
-            // The absence of a subsequent ~base 'ws-reap' after this line = #1 rode the burst
-            // out (the win case, which otherwise leaves no trace). Edge-triggered to avoid flood.
+            // One debug line per bursty ARM edge (not per byte, to avoid flooding): a >= WS_BURSTY_GAP_MS
+            // inter-chunk gap just primed/extended the frozen-but-fed hold. If no ~base 'ws-reap' line
+            // follows, the extend rode the burst out (the success case, which otherwise leaves no trace).
             if (!wasBursty) {
                 this._emitByteAwareDiag('ws_bursty_armed',
                     `gap ${gap}ms → hold ${Math.round(this.WS_BURSTY_MEMORY_MS / 1000)}s`);
@@ -1337,9 +878,9 @@ export class VideoRTC extends HTMLElement {
     }
 
     /**
-     * [#1 TELEMETRY, v2.20.0] Mirror one byte-aware-watchdog milestone to the card's HA log via
-     * the ui_sync signal channel (same path as rtc_suppressed/rtc_failed). Diagnostic ONLY — no
-     * stream side effects. The card routes it to a throttled _logHA('debug', 'ws-bursty' | 'ws-reap').
+     * Mirror one byte-aware-watchdog milestone to the card's HA log via the ui_sync signal channel
+     * (same path as rtc_suppressed/rtc_failed). Diagnostic ONLY — no stream side effects. The card
+     * routes it to a throttled _logHA('debug', 'ws-bursty' | 'ws-reap').
      */
     _emitByteAwareDiag(value, detail) {
         if (this.onmessage && typeof this.onmessage['ui_sync'] === 'function') {
@@ -1348,22 +889,22 @@ export class VideoRTC extends HTMLElement {
     }
 
     /**
-     * [BYTE-AWARE WATCHDOG #1] True while the stream is provably frozen-but-fed: a recent inter-chunk
-     * gap crossed WS_BURSTY_GAP_MS and its memory window has not lapsed. WS_BURSTY_GAP_MS = 0 disables.
+     * True while the stream is provably frozen-but-fed: a recent inter-chunk gap crossed
+     * WS_BURSTY_GAP_MS and its memory window has not lapsed. WS_BURSTY_GAP_MS = 0 disables.
      */
     _wsBurstyFed() {
         return this.WS_BURSTY_GAP_MS > 0 && Date.now() < this._wsBurstyUntil;
     }
 
     /**
-     * [v2.18.0 retroactive blackout re-arm] Called by _rtcProbeGate.suppress() on a FRESH grid
-     * blackout latch. The no-data watchdog re-arms at the effective timeout on every MSE byte, but a
-     * warm stream that fell silent JUST BEFORE the latch still holds a base(5s) timer from its last
-     * byte and would reap mid-blackout before any byte could extend it. Re-arm from NOW at the (now
-     * extended) effective timeout so a frozen-but-fed stream rides the blackout out. No-op unless we
-     * have a live socket AND an already-armed watchdog: we never CREATE one here (a torn-down or
-     * RTC-only driver stays untouched), and _feedWatchdog reads _effectiveDisconnectTimeout, so a
-     * video.error (black) or still-RTC-probing element correctly re-arms at base, not the extend.
+     * Retroactive re-arm, called by _rtcProbeGate on a FRESH grid latch (blackout or MSE-reap). A warm
+     * stream that fell silent JUST BEFORE the latch still holds a base(5s) timer from its last byte and
+     * would reap mid-latch before a new byte could extend it. Re-arm from NOW so it picks up the (now
+     * extended) effective timeout and rides the latch out.
+     * PITFALL: guarded on a live socket AND an already-armed watchdog — we must NOT CREATE a watchdog
+     * here (a torn-down or RTC-only driver stays untouched). Since _feedWatchdog reads
+     * _effectiveDisconnectTimeout, a black (video.error) or still-probing element correctly re-arms at
+     * base, not the extend.
      */
     _rearmWatchdogForBlackout() {
         if (this.ws && this.reconnectTID) this._feedWatchdog();
@@ -1376,11 +917,10 @@ export class VideoRTC extends HTMLElement {
      * (bufferbloat) scaled by ADAPT_RTT_EXCESS_MS, and loss% scaled by ADAPT_LOSS_PCT. An EWMA damps
      * the whole thing (no discrete flapping). All inputs in ms / percent; -1 = no sample.
      *
-     * v2.7.0 FIXES THE FUTILITY INVERSION: `_rtcFutility` no longer feeds `inst` here. Folding it in
-     * RAISED congestion after a doomed promote, which under _effectiveDisconnectTimeout EXTENDED the
-     * watchdog — i.e. it babied the very RTC probe that just failed (backwards). Futility now drives
-     * SUPPRESSION only: it shortens the abort hold in _evaluateBandAbort. Its decay lives here (per
-     * emit) so a good stretch bleeds the penalty off.
+     * PITFALL: `_rtcFutility` must NOT feed `inst` here. Folding it in raises congestion after a doomed
+     * promote, which EXTENDS the watchdog — i.e. babies the very probe that just failed (backwards).
+     * Futility drives SUPPRESSION only (it shortens the abort hold in _evaluateBandAbort); only its
+     * decay lives here, per emit, so a good stretch bleeds the penalty off.
      */
     _updateCongestion(rttMs, baseMs, lossPct) {
         let inst = 0;
@@ -1401,19 +941,21 @@ export class VideoRTC extends HTMLElement {
      * poll (`pollMs` cadence) while an un-committed RTC probe is live (negotiating/promoted). Leaky
      * ASYMMETRIC accumulator driven by severity = max(excess-severity, loss-severity), each 0..SEV_MAX:
      * accrue `pollMs*severity` (worsen ∝ how bad AND how long), bleed `pollMs*RECOVER_K` only when clearly
-     * healthy (K<1 → recover slow), hold in the narrow middle. Replaces the v2.9 perf/degr/path 3-bucket
-     * accrual whose 'degr' HOLD was a dead-zone (the 4G disaster sat there ~10s accruing nothing). Aborting
-     * only when the integral crosses the futility-shortened hold keeps the flap-absorbing stability window;
-     * outside the probe the accumulator is held at 0 by `_resetBandClassifier`.
+     * healthy (K<1 → recover slow), hold in the narrow middle. Aborting only when the integral crosses
+     * the futility-shortened hold keeps a flap-absorbing stability window; outside the probe the
+     * accumulator is held at 0 by `_resetBandClassifier`.
+     * PITFALL: severity is CONTINUOUS, not a discrete band-label bucket. A categorical 'degr' bucket
+     * that accrued nothing was a dead-zone where a clearly-dying canary sat ~10s accruing zero and
+     * stormed the uplink before the abort fired.
      */
     _evaluateBandAbort(pollMs) {
         if (!this.RTC_ABORT_ENABLED) return;
         if (this._rtcPhase !== 'negotiating' && this._rtcPhase !== 'promoted') return;
-        // [Alg.4.1] Continuous severity from the two live stressors: standing-queue EXCESS (rttEwma minus
-        // the link's own queue-empty floor, in ms) and absolute loss. Each ramps 0 -> SEV_MAX past its
-        // floor; accrue pollMs*max(sev) (worsen ∝ how bad AND how long), bleed only when clearly healthy,
-        // and HOLD in the narrow middle. No categorical bucket -> no 'degr' dead-zone. Excess in ms (not
-        // the rttEwma/rttMin ratio) keeps a tiny LAN baseline from fabricating severity out of jitter.
+        // Continuous severity from the two live stressors: standing-queue EXCESS (rttEwma minus the
+        // link's own queue-empty floor, in ms) and absolute loss. Each ramps 0 -> SEV_MAX past its
+        // floor; accrue pollMs*max(sev), bleed only when clearly healthy, HOLD in the narrow middle.
+        // PITFALL: EXCESS is in ms, NOT the rttEwma/rttMin ratio — the ratio explodes at a tiny LAN
+        // baseline (a few ms of jitter reads as 3-4x) and false-aborts a 0%-loss LAN grid.
         const excess = this._bandExcess, loss = this._bandLoss, cap = this.RTC_ABORT_SEV_MAX;
         const clamp = (x) => Math.max(0, Math.min(cap, x));
         const sevExcess = excess >= 0 ? clamp((excess - this.RTC_ABORT_EXCESS_LOW_MS) / this.RTC_ABORT_EXCESS_REF_MS) : 0;
@@ -1424,7 +966,7 @@ export class VideoRTC extends HTMLElement {
         } else if ((excess < 0 || excess <= this.BAND_GOOD_EXCESS_MS) &&
                    (loss < 0 || loss < this.BAND_GOOD_LOSS_PCT)) {
             this._bandBadMs = Math.max(0, this._bandBadMs - pollMs * this.RTC_ABORT_RECOVER_K); // heal
-        } // mild middle (GOOD_EXCESS < excess < EXCESS_LOW): hold — far narrower than the old 'degr' bucket
+        } // mild middle (GOOD_EXCESS < excess < EXCESS_LOW): neither accrue nor bleed — just hold
         const k = Math.max(0, Math.min(1, this.RTC_ABORT_FUTILITY_K));
         const hold = this.RTC_ABORT_HOLD_MS * (1 - k * Math.max(0, Math.min(1, this._rtcFutility)));
         if (this._bandBadMs >= hold) {
@@ -1510,25 +1052,23 @@ export class VideoRTC extends HTMLElement {
     }
 
     /**
-     * [ADAPTIVE WATCHDOG] The live no-data timeout: the base (this.DISCONNECT_TIMEOUT, the 5s
-     * default) EXTENDED by up to ADAPT_MAX_EXTEND× in proportion
-     * to smoothed congestion — but ONLY while an un-committed RTC probe is live (negotiating /
-     * promoted), the one window where the MSE is starved by additive RTC load.
+     * The live no-data timeout. Two regimes:
      *
-     * [v2.17.0 warm-blackout extend] In 'warm'/'committed' the default is the base (a pc-less MSE
-     * stall = genuine death, reap on time). ONE exception: while a grid-wide band=path blackout is
-     * latched (_rtcProbeGate.suppressed), the shared uplink is KNOWN-saturated — warm MSE arrives in
-     * >5s bursts (frozen-but-fed, 30-60 KB/s still flowing per the field BENCHMARKs), so reaping +
-     * reconnect only burns the scarce uplink (the mse_timeout:0 lesson) and stampedes the whole grid
-     * into a retry storm. There we extend warm to base×ADAPT_MAX_EXTEND (30s) so a frozen-but-fed
-     * stream rides the blackout out; a TRULY dead stream is still reaped within 30s (BOUNDED — not
-     * the ∞ of a global mse_timeout:0), and self-heals when the 300s blackout re-arms. Good/LAN paths
-     * never suppress, so their warm reap stays at the base 5s — zero regression on healthy links.
-     * [v2.18.0] The extend is further gated on video.error == null: a decode-errored (BLACK) element
-     * never self-recovers, so it is reaped at base rather than held black for the whole blackout.
-     * [v2.19.0 byte-aware #1] The extend ALSO fires without any grid latch when the stream is
-     * self-measured frozen-but-fed (_wsBurstyFed: a recent ws inter-chunk gap crossed WS_BURSTY_GAP_MS)
-     * — the pure-MSE narrow-link case where the RTC probe dies too fast to ever latch suppression.
+     * (1) RTC probe live (negotiating/promoted) — the one window where an additive RTC ramp starves the
+     *     warm MSE: extend the base by up to ADAPT_MAX_EXTEND x in proportion to smoothed congestion.
+     *
+     * (2) warm/committed (pc-less MSE) — the base, because a plain MSE stall is genuine death, reap on
+     *     time. Three exceptions extend to base x ADAPT_MAX_EXTEND, each meaning the shared uplink is
+     *     KNOWN-congested so a frozen-but-fed stream should ride out rather than stampede into a storm:
+     *       - _rtcProbeGate.suppressed        grid-wide band=path blackout is latched,
+     *       - _rtcProbeGate.mseReapCongested  the cold-start MSE-reap quorum latched (bridges the gap
+     *                                         before suppression can),
+     *       - _wsBurstyFed()                  this socket is self-measured bursty (no grid latch needed).
+     *     The extend is BOUNDED (a truly dead stream is still reaped within the extended window, never
+     *     the ∞ of a global disable) and self-clearing. Smooth links never trip any exception, so their
+     *     warm reap stays at the tight base (no regression on healthy links).
+     * PITFALL: the video.error guard comes FIRST among the exceptions — a decode-errored (black) element
+     * never self-recovers, so it must reap at base, not be held black for the whole latch.
      * Never returns less than base; 0 (disabled) is honored by the caller's guard.
      */
     _effectiveDisconnectTimeout() {
@@ -1536,27 +1076,18 @@ export class VideoRTC extends HTMLElement {
         if (!base || !this.ADAPTIVE_WATCHDOG) return base;
         const rtcProbing = this._rtcPhase === 'negotiating' || this._rtcPhase === 'promoted';
         if (!rtcProbing) {
-            // [v2.18.0 black-screen guard] The warm-blackout ride-out only pays off while the
+            // Black-screen guard (must precede the extends). The ride-out only pays off while the
             // element is HOLDING its last frame (a benign MSE underrun, video.error == null, which
-            // self-recovers when the burst lands — the 21.95s advance in the field log). A terminal
-            // MediaError (code 3 MEDIA_ERR_DECODE from a corrupt/keyframe-gapped fMP4 fragment on the
-            // saturated uplink) BLACKS the element and is unrecoverable without a fresh source: the
-            // byte trickle keeps feeding the watchdog, so without this we'd hold 30s of BLACK. Reap at
-            // base instead → the card reconnects to a clean keyframe. video.error is unambiguous (set
-            // only on real terminal errors, never on an underrun), so this can't reap a held frame.
+            // self-recovers when the next burst lands). A terminal MediaError (e.g. code 3 DECODE from a
+            // keyframe-gapped fMP4 fragment) BLACKS the element and is unrecoverable without a fresh
+            // source; the byte trickle keeps feeding the watchdog, so without this we would hold the
+            // full extend of BLACK. Reap at base → the card reconnects to a clean keyframe.
+            // PITFALL: video.error is set only on real terminal errors (never on an underrun), so this
+            // never reaps a merely-underrunning held frame.
             if (this.video && this.video.error) return base;
-            if (_rtcProbeGate.suppressed) return base * this.ADAPT_MAX_EXTEND;
-            // [v2.21.0 MSE-reap grid latch] Cold-start bridge: DISTINCT cameras just reaped in quorum
-            // (the shared uplink is choking) but band=path suppression hasn't latched yet and #1 has no
-            // witnessed gap on a fresh socket. Extend so the first wave rides out instead of churning.
-            if (_rtcProbeGate.mseReapCongested) return base * this.ADAPT_MAX_EXTEND;
-            // [BYTE-AWARE WATCHDOG #1] Even with NO grid-wide blackout latch, a stream arriving in
-            // bursts (recent inter-chunk gap >= WS_BURSTY_GAP_MS) is frozen-but-fed on a congested
-            // uplink: reaping + reconnecting only burns the scarce link into a retry storm (the pure-
-            // MSE narrow-link churn of 2026-08-27 14:50-14:52, where no RTC probe ever latched
-            // suppression). Extend it too — bounded by ADAPT_MAX_EXTEND, self-clearing when the link
-            // smooths. Smooth links never trip the gap, so their warm reap stays at the tight base.
-            if (this._wsBurstyFed()) return base * this.ADAPT_MAX_EXTEND;
+            if (_rtcProbeGate.suppressed) return base * this.ADAPT_MAX_EXTEND;      // grid blackout latched
+            if (_rtcProbeGate.mseReapCongested) return base * this.ADAPT_MAX_EXTEND; // cold-start reap quorum
+            if (this._wsBurstyFed()) return base * this.ADAPT_MAX_EXTEND;           // self-measured bursty feed
             return base;
         }
         const mult = 1 + (this.ADAPT_MAX_EXTEND - 1) * Math.max(0, Math.min(1, this._congestion));
@@ -1564,15 +1095,17 @@ export class VideoRTC extends HTMLElement {
     }
 
     /**
-     * [#1 TELEMETRY, v2.20.1 fix] Name the regime that CURRENTLY sets the warm/probe reap timeout —
-     * the exact branch ladder of _effectiveDisconnectTimeout(), as a label. Captured at watchdog ARM
-     * time (not recomputed at fire) so the `ws-reap` line reports what actually held the socket.
-     *   base            = neither hold engaged (residual first-stall gap)
+     * Label naming the regime that CURRENTLY sets the reap timeout — the same branch ladder as
+     * _effectiveDisconnectTimeout(), as a string. Captured at watchdog ARM time (see _feedWatchdog) so
+     * the `ws-reap` line reports what actually held the socket.
+     *   base            = base timeout, no extend engaged
      *   probe-congest   = RTC probe phase, congestion-scaled extend
      *   black           = video.error terminal decode error, fast base reap
-     *   suppressed-hold = band=path grid blackout extend (300s)
-     *   mse-congest-hold= cold-start MSE-reap grid latch extend (60s)  [v2.21.0]
-     *   bursty-hold     = byte-aware #1 self-measured frozen-but-fed extend
+     *   suppressed-hold = band=path grid blackout extend
+     *   mse-congest-hold= cold-start MSE-reap grid-latch extend
+     *   bursty-hold     = self-measured frozen-but-fed (byte-aware) extend
+     * PITFALL: keep this ladder IN THE SAME ORDER as _effectiveDisconnectTimeout — the label must match
+     * the branch that actually selected the timeout.
      */
     _timeoutRegime() {
         const base = this.DISCONNECT_TIMEOUT;
@@ -1586,11 +1119,10 @@ export class VideoRTC extends HTMLElement {
     }
 
     /**
-     * [BW INSTRUMENTATION v2.4.1] Passive metric sampler. Called every 500ms from the getStats
-     * poll; accumulates deltas over METRICS_EMIT_MS and emits a compact `metrics` line to the
-     * card. Side-effect-free w.r.t. the stream — it only observes and logs, so it is safe on
-     * every path (fat LAN included: same numbers, just now visible). Goal: see on real links
-     * whether RTT bufferbloat / rising loss PRECEDES the reverts that collapse mobile sessions.
+     * Passive metric sampler. Called every 500ms from the getStats poll; accumulates deltas over
+     * METRICS_EMIT_MS and emits a compact `metrics` line to the card. Side-effect-free w.r.t. the
+     * stream — it only observes and logs, safe on every path. It also maintains _mRttMin (the
+     * queue-empty RTT floor) that Alg.1/Alg.4 subtract to get standing-queue excess.
      */
     _sampleMetrics(bytes, recv, lost, jit, rtt, jbDelay = -1, jbEmit = -1, nack = -1, path = '') {
         const now = Date.now();
@@ -1613,7 +1145,8 @@ export class VideoRTC extends HTMLElement {
         const dRecv = recv >= 0 && this._mLastRecv >= 0 ? Math.max(0, recv - this._mLastRecv) : -1;
         const lossPct = dLost >= 0 && dRecv >= 0 && (dLost + dRecv) > 0
             ? (100 * dLost / (dLost + dRecv)) : -1;
-        // [TRANSPORT DIAGNOSTICS v2.6.0] windowed deltas for the bufferbloat-vs-fragmentation call.
+        // Transport-diagnostic windowed deltas (jitter-buffer delay, nack, packet size): they separate
+        // bufferbloat from fragmentation in the logs. Diagnostic only.
         const dJbDelay = jbDelay >= 0 && this._mLastJbDelay >= 0 ? Math.max(0, jbDelay - this._mLastJbDelay) : -1;
         const dJbEmit = jbEmit >= 0 && this._mLastJbEmit >= 0 ? Math.max(0, jbEmit - this._mLastJbEmit) : -1;
         const jbufMs = dJbDelay >= 0 && dJbEmit > 0 ? Math.round(1000 * dJbDelay / dJbEmit) : -1;
@@ -1650,7 +1183,7 @@ export class VideoRTC extends HTMLElement {
         // [RTC SERIALIZER — Alg.2] Leave the probe gate on teardown: drop from the queue if we
         // were still waiting our turn, or release the token if we were the active ramp.
         _rtcProbeGate.release(this);
-        _rtcProbeGate.liveDrivers.delete(this);  // [v2.18.0] leave the grid registry
+        _rtcProbeGate.liveDrivers.delete(this);  // leave the grid registry
         this._clearWatchdog();
         this._stopPlaybackSampler();
         if (this._firstFrameTID) {
@@ -1896,17 +1429,15 @@ export class VideoRTC extends HTMLElement {
                             sb.remove(start0, start);
                             ms.setLiveSeekableRange(start, end);
                         }
-                        // STRAND RECOVERY (v2.4.6): currentTime fell BELOW the buffered window —
-                        // either the initial autoplay never started before the 5s window slid past
-                        // currentTime=0 (slow-4G / backgrounded first-frame), or an MSE stall left
-                        // currentTime behind an evicted region. The element then waits forever for
-                        // data that was just removed → permanent freeze, cleared only by a manual
-                        // pause→play (resume() seeks to the live edge). Seek to the live edge ONCE on
-                        // exactly that condition. This is NOT the continuous upstream currentTime=start
-                        // catch-up removed below (that pinned iOS playbackRate to 0.1 → crawl); it
-                        // fires only on the pathology (on a healthy stream currentTime sits at the
-                        // live edge, well above the buffered start), so no crawl. Never overrides a
-                        // user's manual hold.
+                        // Strand recovery: currentTime fell BELOW buffered.start(0) — either autoplay
+                        // never started before the buffer window slid past currentTime=0 (slow-4G /
+                        // backgrounded first frame), or an MSE stall left currentTime behind an evicted
+                        // region. The element then waits forever for data that was just removed →
+                        // permanent freeze. Seek to the live edge ONCE on exactly that condition.
+                        // PITFALL: this is NOT a continuous currentTime=start catch-up (see the note
+                        // below on #910/#884 — that pinned iOS playbackRate and crawled). It fires only
+                        // on the pathology; on a healthy stream currentTime sits at the live edge, well
+                        // above buffered.start, so it never triggers. Never overrides a manual hold.
                         if (!this._manualHold && this.video && !this.video.seeking
                             && this.video.buffered.length) {
                             const lo = this.video.buffered.start(0);
@@ -2037,7 +1568,7 @@ export class VideoRTC extends HTMLElement {
                 pc.close();
                 this.pc = null;
                 if (this.onmessage && typeof this.onmessage['ui_sync'] === 'function') {
-                    // v14.6.12: carry the reason (see _revertToWarmMSE) so the card mirrors it to HA.
+                    // Carry the reason (see _revertToWarmMSE) so the card mirrors it to the HA log.
                     this.onmessage['ui_sync']({ type: 'signal', value: 'rtc_failed', detail: reason });
                 }
             } else {
@@ -2223,11 +1754,11 @@ export class VideoRTC extends HTMLElement {
             if (this._manualHold) return;
             this.pc.getStats().then(stats => {
                 let fd = -1;
-                // [BW INSTRUMENTATION v2.4.1] Harvest passive metrics from the SAME poll: inbound-rtp
-                // (goodput/loss/jitter) + selected candidate-pair RTT. Pure observation — the values
-                // below never feed the promote/commit/revert logic (that stays framesDecoded-only).
+                // Harvest passive metrics from the SAME poll: inbound-rtp (goodput/loss/jitter) +
+                // selected candidate-pair RTT. PITFALL: promote/commit/revert stay framesDecoded-only;
+                // these values feed only the band classifier / adaptive watchdog / diagnostics.
                 let mBytes = -1, mRecv = -1, mLost = -1, mJit = -1, mRtt = -1;
-                // [TRANSPORT DIAGNOSTICS v2.6.0] harvested from the SAME poll (diagnostic only).
+                // Transport-diagnostic fields harvested from the SAME poll (diagnostic only).
                 let mJbDelay = -1, mJbEmit = -1, mNack = -1;
                 let mLocalCandId = '', mRemoteCandId = '';
                 const candMap = {}; // id -> {t: candidateType, p: protocol}
@@ -2411,10 +1942,9 @@ export class VideoRTC extends HTMLElement {
         if (this.pc) { this.pc.close(); this.pc = null; }
         this._setPhase('warm');
         if (this.onmessage && typeof this.onmessage['ui_sync'] === 'function') {
-            // v14.6.12: carry the reason so the card can mirror it to the HA log. Without this a
-            // band abort, a stall revert and an ICE-drop all showed as a bare `mode: rtc -> mse`
-            // — indistinguishable in a field log. `detail` self-identifies the abort ("RTC aborted:
-            // sustained bad band (band=…, …ms)") and every other revert cause.
+            // Carry the reason so the card can mirror it to the HA log. Without it a band abort, a
+            // stall revert and an ICE-drop all show as a bare `mode: rtc -> mse` — indistinguishable.
+            // `detail` self-identifies the cause ("RTC aborted: sustained bad band (band=…, …ms)" etc.).
             this.onmessage['ui_sync']({ type: 'signal', value: 'rtc_failed', detail: why });
         }
     }

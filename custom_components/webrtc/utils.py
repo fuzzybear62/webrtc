@@ -247,9 +247,9 @@ async def websocket_forward(ws_from, ws_to) -> None:
                 await ws_to.ping()
             elif msg.type is aiohttp.WSMsgType.PONG:
                 await ws_to.pong()
-            # FIX: Explicitly handle CLOSE and ERROR to break the loop
-            # This ensures the 'finally' block in __init__.py is executed,
-            # clearing the session from the sensor.
+            # Break the relay loop on CLOSE/ERROR so the caller's `finally` in __init__.py
+            # runs and clears the session from the sensor. Without an explicit break the
+            # loop would spin on terminal frames and the session count would leak.
             elif msg.type is aiohttp.WSMsgType.CLOSE:
                 await ws_to.close()
                 break

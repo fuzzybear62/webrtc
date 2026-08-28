@@ -4,523 +4,29 @@
  * Derived from AlexxIT/WebRTC. Licensed under the MIT License — see LICENSE.
  */
 /**
- * WebRTC Camera Card v14.1.0
+ * WebRTC Camera Card (`<webrtc-camera>`) — the Home Assistant Lovelace element.
  *
- * DESIGN PHILOSOPHY
- * -----------------
- * This card is intentionally built around an EPHEMERAL driver model.
+ * Owns everything the driver (`<video-rtc>`) deliberately does not: the Lovelace lifecycle, the DOM,
+ * the reconnect/backoff loop, the MSE→WebRTC upgrade orchestration across a MAIN + a background SHADOW
+ * driver, and mirroring driver signals into the HA log.
  *
- * The VideoRTC element is treated as disposable state, never as a long-lived object.
- * Every reconnect, stream switch, page navigation or failure results in a full teardown
- * and recreation of the driver.
+ * DESIGN PHILOSOPHY — the driver is EPHEMERAL. VideoRTC is disposable state, never a long-lived object:
+ * every reconnect, stream switch, page navigation, or failure fully tears down and recreates the
+ * driver.
+ * PITFALL: do NOT "optimize" by reusing a driver or its connection across reconnects. Browsers (Safari/
+ * iOS especially) leak steadily on lingering <video>/MediaSource/RTCPeerConnection/WebSocket refs; the
+ * card trades reconnect cost for long-term memory stability, and reuse reintroduces the leak.
  *
- * WHY:
- * - Browsers (especially Safari / iOS) are extremely sensitive to lingering references
- * involving <video>, MediaSource, RTCPeerConnection and WebSocket objects.
- * - Previous legacy implementations reused drivers and connections to optimize latency,
- * but this caused steady and irreversible browser memory growth.
+ * Upgrade model (why there are two drivers): the visible MAIN keeps serving proven MSE while a hidden
+ * SHADOW ramps an RTC probe; the card promotes the shadow to main only after the driver signals
+ * `rtc_sustained` (RTC held gaplessly for RTC_SWAP_PROVE_MS), so an unproven probe never destroys a
+ * working stream. Per-driver signal routing is role-dispatched (_onMainMessage vs
+ * _onPreSwapShadowMessage); all active-mode writes go through _setActiveMode() (single audit point).
  *
- * This implementation deliberately trades reconnect cost for long-term memory stability.
- * Any attempt to "optimize" by reusing the driver will almost certainly reintroduce leaks.
- *
- * CHANGELOG
- * ---------
- * v14.16.0 — [DRIVER CHANGE, pin ?v=2.20.0 → 2.21.0 — needs a PWA hard reload] MSE-reap GRID LATCH — closes
- *   the cold-start reconnect storm. The v14.15.0 telemetry (field 2026-08-27 19:37) proved #1 works, but also
- *   exposed the dominant residual: on a saturated uplink the first wave of MSE sockets bursts data then chokes,
- *   and each reaps at base 5s BEFORE any RTC probe survives ~6s to latch band=path suppression AND before #1 can
- *   witness a >=2.5s gap (a fresh burst-then-silence has no gap to arm on) — 7 of 8 reaps were `base` in the
- *   first ~40s, one camera died 3x, and the churn saturated the uplink hard enough to drop the HA frontend
- *   websocket. Fix (driver): count DISTINCT cameras whose no-data reaps land within 10s; >=2 latches a 60s
- *   grid-wide congestion hold (sliding) that retroactively re-arms every live warm socket, so the first wave
- *   rides out instead of stampeding. Bounded, self-clearing, superseded by band=path suppression once a probe
- *   survives; a single dead camera can't reach quorum and a healthy grid never reaps → zero regression. Also
- *   fixes the `ws-reap` telemetry label: the regime is now captured at watchdog ARM time (19:37:47's
- *   contradictory `ws-reap: 30000ms (base …)` was really a #1 bursty-hold win mislabelled by a lapsed window),
- *   and a reap that engages the latch appends `→ grid-latch N cams`.
- * v14.15.0 — [DRIVER CHANGE, pin ?v=2.19.0 → 2.20.0 — needs a PWA hard reload] byte-aware watchdog (#1)
- *   TELEMETRY. #1 was invisible in the field: the 2026-08-27 15:13 log could not confirm it fired, because
- *   grid suppression latched at +15s and covered every warm ride-out. Now the driver mirrors two diagnostic-
- *   only signals to the HA debug log under distinct keys: `ws-bursty` (a >=2.5s inter-chunk gap ARMED the
- *   frozen-but-fed hold — edge-triggered) and `ws-reap` (a no-data-watchdog reap self-identifying its regime:
- *   base / bursty-hold / suppressed-hold / black). An arm with NO following `base`-regime reap = #1 rode the
- *   burst out. Debug level (needs `logger: logs: custom_components.webrtc.card: debug`). Zero behaviour change.
- * v14.14.0 — [DRIVER CHANGE, pin ?v=2.18.0 → 2.19.0 — needs a PWA hard reload] byte-aware watchdog (#1). The
- *   warm ride-out used to arm ONLY after a prior RTC probe latched a grid-wide blackout. Field 2026-08-27
- *   14:50-14:52 showed the gap: on a link so narrow the RTC probe itself is reaped at 5s (before it can latch
- *   suppression), the warm MSE streams also got only 5s and churned in a pure-MSE reconnect storm (all 4 cams
- *   → `rtc-suppressed: link narrow`, backoff to 20s+). Fix (driver): measure frozen-but-fed DIRECTLY from ws
- *   byte arrival — fMP4 chunks arriving in bursts with >2.5s gaps (despite 30-60 KB/s goodput) mark the stream
- *   bursty-fed for 30s, and the warm reap extends without needing any RTC probe. A smooth stream (LAN / good
- *   4G) never trips the gap → stays at base 5s → zero regression ("non produce danno"). Ordered after the
- *   v14.13.0 black-screen guard, so a bursty-but-BLACK element still reaps fast. Card change is only pin+version.
- * v14.13.0 — [DRIVER CHANGE, pin ?v=2.17.0 → 2.18.0 — needs a PWA hard reload] two field-driven refinements to
- *   the v14.12.0 warm ride-out (grid 2026-08-27 14:28-14:30, new card+driver — Alg.2 serial + 30s ride both
- *   validated on hardware). (1) BLACK-SCREEN GUARD: some cameras went to a BLACK element instead of holding the
- *   last frame ("alcune camere vanno in black screen"). Cause: a terminal MediaError (code 3, corrupt fMP4 on
- *   the saturated uplink) blacks the element and never self-recovers, but the byte trickle keeps feeding the
- *   watchdog → held 30s black. Driver `_effectiveDisconnectTimeout` now reaps at base when `video.error` is set
- *   (a benign underrun, which DOES self-recover, has no error → still held+ridden). (2) RETROACTIVE RE-ARM: the
- *   3 MSE deaths at the blackout-latch boundary (field 49.58/50.40/53.22) were NOT Alg.2 churn — Alg.2 ran one
- *   serial probe and denied the other 3 correctly. They were warm streams whose base(5s) watchdog was armed
- *   just before the latch; `suppress()` now pushes the extend to every live warm stream the instant the
- *   blackout latches (module-level `liveDrivers`). Both are driver-side; card change is only the pin + version.
- * v14.12.0 — [DRIVER CHANGE, pin ?v=2.16.0 → 2.17.0 — needs a PWA hard reload] closes the gap the v14.11.0
- *   retirement left open. That retirement made the watchdog self-configuring ONLY in the RTC-probe phases;
- *   'warm' MSE-only still reaped at a FIXED 5s. Field 2026-08-27 14:04-14:06 — the SAME saturated-4G grid,
- *   now genuinely knob-less (the "no reconnect storms" note on v14.11.0 below was measured on the OLD
- *   mse_timeout:0 sessions, NOT this one) — showed the miss: warm MSE arrived frozen-but-fed (30-60 KB/s
- *   flowing, frames not advancing) → reaped at 5s → reconnect storm (6 deaths/cam, backoff to 23s, flap
- *   8.5/3), each reconnect burning the scarce uplink and turning a fed stream into 23s of dead air. Fix
- *   (driver `_effectiveDisconnectTimeout`, ~4 LOC): extend WARM to base×6 (30s) too, but ONLY while the
- *   grid-wide band=path blackout is latched (`_rtcProbeGate.suppressed`). Self-configuring successor to
- *   mse_timeout:0's ride-out — BOUNDED (30s not ∞ → a truly-dead cam is still reaped), CONDITIONAL
- *   (good/LAN never suppress → warm reap stays 5s, zero regression), keyed on a shipped+validated signal
- *   (v2.15.0's gate). First ~33s of promote-churn stays Alg.2's job (cross-grid serialized ramp). No knob.
- * v14.11.0 — [card-only, no driver change] Retires the per-card `mse_timeout` knob. It was the sole YAML
- *   override of the driver's `DISCONNECT_TIMEOUT` (the MSE no-data watchdog base). The watchdog is now
- *   self-configuring: the driver default (5000ms) is EXTENDED up to 6× while an un-committed RTC probe
- *   starves the warm MSE (_effectiveDisconnectTimeout) and held at base for warm/committed so a dead
- *   MSE stream is still reaped on time — so a fixed per-card number is no longer anyone's job. Field-
- *   validated across a good-4G (all 4 cams promoted to RTC, stable) and a saturated-4G-path session
- *   (2026-08-27): the in-flight-drain grid blackout (v14.10.0) and MSE ride-out both fired correctly with
- *   the watchdog left at its self-adapting default, no reconnect storms. `mse_timeout: 0` (fully disable)
- *   is intentionally NOT preserved — it was unsafe for warm MSE-only (a dead stream never reaped). No
- *   fleet card set the knob, so removal is behaviour-neutral. Driver pin unchanged (?v=2.16.0).
- * v14.10.0 — [DRIVER CHANGE, pin ?v=2.15.0 → 2.16.0 — needs a PWA hard reload] the grid blackout now wins
- *   the RACE. v14.9.0's suppression fired correctly (field 2026-08-27, both `rtc-suppressed` lines seen) but
- *   TOO LATE: 3 cams promoted after it and the streams still collapsed. Two driver gaps, both fixed in
- *   video-rtc.js 2.16.0: (1) the shared gate opened on a SINGLE band=perf sample — but a 4G uplink reads
- *   exc=0 for one poll at the promote instant (a head-fake) before bufferbloat shows, so the gate flung open
- *   and released every camera to parallel ramp BEFORE the canary revealed band=path; the gate now needs ~1.5s
- *   of SUSTAINED perf to open. (2) `suppress()` denied new/queued acquires but couldn't recall a probe already
- *   past the gate; the driver's 500ms poll now DRAINS in-flight un-committed probes the instant the blackout
- *   engages, each self-reverting to warm MSE (emitting `rtc_suppressed` so this card latches at once). Card
- *   side unchanged from v14.9.0 except the pin bump — the existing `_enterGridSuppression` handles the extra
- *   drain signals. committed/warm streams are never touched; LAN (exc≈0) never trips band=path.
- * v14.9.0 — [DRIVER CHANGE, pin ?v=2.14.0 → 2.15.0 — needs a PWA hard reload] band=path RTC suppression
- *   goes GRID-WIDE. v14.8.1 fed rtc-revert churn into the per-card flap score, but a third 4G field log
- *   (2026-08-27) crashed HA anyway with every camera showing `rtc-flap: score=1.0/3` and no `rtc-suppressed`:
- *   the crash was NOT re-probe churn but the INITIAL round — 4 cameras each doing ONE ~7s RTC-over-TURN probe
- *   on a band=path uplink (exc 651→1011ms, rtt 826→1305ms; loss only ~15%, so the loss≥20% severity gate never
- *   fired). The per-card score is structurally blind to that 4-camera aggregate. Fix lives in the driver's
- *   shared gate (video-rtc.js 2.15.0): a band=path abort on ANY camera blacks out RTC probing for the WHOLE
- *   page for 300s. The driver signals `rtc_suppressed`; the new `_enterGridSuppression` reflects it via the
- *   EXISTING A0 latch (`_rtcSuppressed`) — MSE-only, `_stopReprobe`, RED net dot, one throttled `rtc-suppressed`
- *   HA line — self-releasing through `_maybeExpireSuppression` (RTC_RETEST_MS 300s, aligned with the gate). On
- *   LAN band=path never fires (exc≈0), so LAN is untouched. Wired on both the main and shadow signal paths.
- * v14.8.1 — [card-only, no driver/pin change — still needs a PWA hard reload to fetch the new card JS]
- *   A0 suppression now sees rtc-revert CHURN, not just socket deaths. Two 4G field logs (2026-08-27) crashed
- *   HA the same way: a single canary cam kept probing→aborting (band=path)→re-probing→committing→stalling
- *   over TURN, driving bufferbloat (rtt 299ms→7549ms, exc=2900ms) that saturated the shared uplink and
- *   dropped the HA connection — while suppression NEVER latched, because `_noteRtcFlap` only fired on a socket
- *   DEATH within probation and every one of those reverts kept the MSE alive. Fix: `rtc_failed` reverts (the
- *   band=path abort and the pre/post-commit media stalls — NOT the deliberate rtc_rejected quality decision)
- *   now feed the SAME decaying flap score via a shared `_accrueFlap`; a revert with a fresh loss ≥ FLAP_LOSS_PCT
- *   latches MSE-only on the FIRST strike and `_scheduleReprobe` then bails on the latch → the uplink-saturating
- *   re-probe loop stops. Wired on both the main and the shadow rtc_failed paths. In the field trace this would
- *   latch at the 09:41:12 abort (fresh loss 21.3%), killing the re-probe→commit→stall that crashed HA ~20s later.
- * v14.8.0 — [DRIVER CHANGE, pin ?v=2.13.1 → 2.14.0 — needs a PWA hard reload] MSE ride-out (work item B,
- *   first ACTING step). The v14.7.x sensor proved a sustained MSE freeze is detectable while the socket stays
- *   alive (bursty 4G: bytes trickle in, the no-data watchdog never fires, but the <video> is frozen). Until
- *   now the ONLY recovery on that path was the watchdog eventually forcing onclose() → mode:mse->none →
- *   escalating retry storm (attempts #1-#6, backoff 15-21s) — cams never settle. The driver now nudges a
- *   sustained-frozen MSE (~6s of frozen samples) to the live edge non-destructively — recovering the picture
- *   WITHOUT dropping the socket — and only falls back to the watchdog for a genuine underrun (no buffer
- *   ahead). Card side: mirrors the driver's {type:'rideout'} to HA as `mse-rideout` so field logs show the
- *   recovery firing. The `mse_timeout` knob (→ watchdog) stays as the fallback for now; it retires once
- *   ride-out is field-proven to carry lossy 4G on its own. Driver pin ?v=2.14.0.
- * v14.7.1 — [DRIVER CHANGE, pin ?v=2.13.0 → 2.13.1 — needs a PWA hard reload] Playback sampler element-swap
- *   guard. First v14.7.0 field log validated the sensor (it logged `mse-playback: frozen` on esternacancello
- *   / extgate exactly where the log otherwise claimed "stream-stable healthy 20s" — the blind spot is
- *   closed), but exposed two impossible detail lines right after a `mode: mse -> rtc`: `advanced -9.71s` and
- *   `advanced +4.89s`. Cause: onscreenVideo changes identity at promote/revert (MSE this.video ↔ RTC overlay
- *   _rtcVideo) and the sampler was differencing currentTime across two different elements. The driver now
- *   re-primes on element change (discards that one cross-element sample) and clamps the ratio to [0,1].
- *   Card/log unchanged. Still observe-only.
- * v14.7.0 — [DRIVER CHANGE, pin ?v=2.12.1 → 2.13.0 — needs a PWA hard reload] MSE playback-health sensor.
- *   The bad-4G field log looked "healthy" (stream-stable 20s, ~30 KB/s, clean) but the picture was "pessima"
- *   and the network dot stayed WHITE the whole time. Root cause: the only health signal was the no-data
- *   watchdog ("did bytes arrive in 5s"), which bursty 4G satisfies while the buffer-starved <video> is
- *   frozen — and the dot's colour came only from the RTC band verdict, which never exists on an MSE-only
- *   session (no probe). Driver v2.13.0 adds an always-on sampler of the ON-SCREEN currentTime advance vs
- *   wall-clock → flow/stutter/frozen, emitted as ui_sync {type:'playback'}. Card side: the dot now paints
- *   the WORST of {suppression latch, RTC band, MSE playback} so a frozen MSE-only stream goes RED (was
- *   white); the playback transitions are mirrored to the HA log (`mse-playback: …`) so the freeze is finally
- *   visible in the logs you collect. Observe-only for now — does NOT yet drive suppression/reseek (work
- *   item B); this is the missing SENSOR those will read. Net dot legend: green = picture flowing (RTC perf
- *   or MSE flow), yellow = stutter/degraded, RED = frozen / path / MSE-only-suppressed, white = idle only.
- * v14.6.19 — [CARD-ONLY, driver pin unchanged at ?v=2.12.1] network dot: paint RED while the narrow-link
- *   RTC-suppression latch is engaged. The band verdict only exists while an RTC probe polls; on a genuinely
- *   bad link the probe dies ~6s and the camera sits in MSE-only, so band samples stop and the dot decayed to
- *   WHITE exactly when the network was worst (observed on the bad-4G log: "il pallino è quasi sempre bianco").
- *   `_paintNetDot` now gives the `_rtcSuppressed` latch precedence over the (absent) band signal → RED = link
- *   too narrow for RTC, MSE-only. Painted at latch engage / release / manual-refresh reset; the staleness
- *   sweep already routes through the same helper, so RED survives band going stale. Dot legend now: green =
- *   RTC in form, yellow = degraded, RED = path OR MSE-only-suppressed, white = startup/idle only.
- * v14.6.18 — [DRIVER CHANGE, pin ?v=2.12.0 → 2.12.1 — needs a PWA hard reload] Alg.4.1: fix the LAN
- *   regression. The v2.12.0 band primitive (bufferbloat INFLATION = rttEwma / session-min RTT) is scale-
- *   free and EXPLODES at a tiny LAN baseline (min 2-3ms): a few ms of harmless jitter (2ms→7ms) fabricated
- *   infl 3-4×, so the network dot flickered through all colours on every camera and the continuous abort
- *   severity accrued to a false RTC abort across the whole 0%-loss grid, in a loop ("su lan sempre peggio").
- *   Driver v2.12.1 swaps the ratio for the ABSOLUTE standing-queue EXCESS = rttEwma − session-min RTT (ms):
- *   scale-correct (5ms of queue is 5ms → LAN stays green/perf, no abort) while still relative (subtracts the
- *   link's own floor → a real 4G runaway of hundreds of ms still aborts, ~before it storms HA). Card side:
- *   only the metrics token changed (`infl=` → `exc=Nms`); the dot still parses `band=`, so no card logic
- *   change. See webrtc-mobile-collapse-is-rtc-additive memory.
- * v14.6.17 — [DRIVER CHANGE, pin ?v=2.11.0 → 2.12.0 — needs a PWA hard reload] Alg.4: self-calibrating
- *   band + network-state dot. The 20:36 direct-4G log was a "disastro" (lost the HA connection): Alg.2
- *   SERIAL held (only the canary ramped, no cascade — a real win over the 19:37 storm) but the SINGLE
- *   canary still stormed the weak uplink to rtt 3546ms because Alg.3 aborted ~15s late — the canary
- *   never promoted, band sat at 'degr' (rtt 1147ms = 5.7× its floor, loss 15%) accruing NOTHING for
- *   ~10s, flipping to 'path' only once rtt had already run away. Root cause: the band used ABSOLUTE RTT
- *   ceilings, which are both too lenient to catch a bad path early AND wrong for a non-deterministic 4G
- *   (the same link held 4 RTC in another test). Driver v2.12.0 replaces them with a RELATIVE bufferbloat
- *   INFLATION signal (rttEwma / session-min RTT) feeding a CONTINUOUS abort severity — no 'degr' dead-
- *   zone, a runaway gives up in ~2s, and an in-form 4G (infl≈1) now OPENS the gate instead of being
- *   mislabelled degr. Card adds an opt-in `network_indicator: true` dot: white = no fresh sample,
- *   green = perf, yellow = degr, red = path (parsed off the metrics `band=` token). See
- *   webrtc-mobile-collapse-is-rtc-additive memory.
- * v14.6.16 — [DRIVER CHANGE, pin ?v=2.10.0 → 2.11.0 — needs a PWA hard reload] Alg.2 goes band-adaptive.
- *   The serializer no longer holds cameras in a queue on a fat pipe: it uses the FIRST probe as a canary and
- *   serializes ramps only until that probe's Alg.1 band verdict lands (~2s). band=perf → OPEN the gate (no
- *   storm possible on wideband/LAN → drain the queue, ramp every camera in PARALLEL, zero serialization
- *   cost); band=path → stay/return to SERIAL (constrained link → one ramp at a time, storm prevented);
- *   band=degr/'' → unchanged (cautious). Fixes the ~8s/camera convergence penalty the v14.6.15 LAN log
- *   showed (only the first camera reached RTC in a 7s session) while keeping the 4G storm guard intact.
- *   The band is a property of the shared uplink, so one canary verdict generalizes; a later path report
- *   re-arms serialization. Purely driver-side (in _rtcProbeGate); no card wiring, no YAML knob.
- * v14.6.15 — [DRIVER CHANGE, pin ?v=2.9.0 → 2.10.0 — needs a PWA hard reload] Alg.2, cross-grid RTC probe
- *   serializer. One module-level single-flight gate in the driver (_rtcProbeGate), shared by every VideoRTC
- *   on the page — each card's main driver AND its background shadow — so at most ONE RTC probe is ramping at
- *   a time. This is the fix for the simultaneous-ramp "bufferbloat storm": N cameras promoting RTC at once
- *   each fire an uncoordinated GCC bitrate ramp, and on one constrained 4G uplink the N ramps overshoot
- *   together → a grid-wide RTT balloon (Alg.3 then aborts them all in a cascade). Serializing bounds the
- *   double-load peak to MSE(all)+RTC(one) instead of MSE(all)+RTC(N). The token is held from the offer until
- *   the earliest of: promote-settle (~8s gapless, GCC plateaued — the next camera ramps without waiting the
- *   full 180s commit), warm/committed, any failWebRTC path, or a 20s lease backstop. MSE keeps flowing while
- *   a camera waits its turn, so queueing adds ZERO extra load. Purely in the driver — no card wiring — but
- *   the pin bump forces the new driver to load. See webrtc-mobile-collapse-is-rtc-additive memory.
- * v14.6.14 — [DRIVER CHANGE, pin ?v=2.8.0 → 2.9.0 — needs a PWA hard reload] Alg.3, class-driven RTC abort
- *   (the first DECISION to consume the Alg.1 band verdict). The driver retires the v2.7.0 blind abort, which
- *   keyed on absolute jbuf/RTT ceilings and was therefore blind to the pure-LOSS pathology the 2026-08-26
- *   direct-4G logs exposed (esternacancello: RTT pinned 107ms, loss 10-29% — healthy by every ceiling, stream
- *   unusable). Abort now integrates the loss-aware band verdict through a leaky ASYMMETRIC accumulator: each
- *   500ms poll adds time while `band=path`, HOLDS on `band=degr`, and bleeds (slower) while `band=perf`;
- *   reverting to the warm MSE once the integral crosses `mse_abort_hold` (shortened by futility). The
- *   accumulator gives an intrinsic stability window that absorbs verdict flapping and the optimistic opening
- *   verdict. NO-DEAD-CODE: the retired ceilings and their knobs (`mse_abort_jbuf`/`mse_abort_rtt`) are deleted
- *   here and in the driver; surviving knobs `mse_abort` (false = extend-only) and `mse_abort_hold`/
- *   `mse_abort_futility_k`. No card-UI behaviour change.
- * v14.6.13 — [DRIVER CHANGE, pin ?v=2.7.1 → 2.8.0 — needs a PWA hard reload] Alg.1, early band classifier
- *   (first step of the self-configuring rework: parameters like `mse_timeout` must NOT be a user's job, and
- *   one card must work on both 4G and wide-band). Field analysis (2026-08-26) established that the driver's
- *   instrumentation already tells a PERFORMANT link from a non-performant one within ~2s of a probe. The
- *   driver now folds the per-poll RTT + short-window loss ALREADY harvested for the metrics line into a live
- *   verdict — 'perf' | 'degr' | 'path' — surfaced as `band=` on the metrics line. OBSERVE-ONLY: no stream
- *   decision keys on it yet — this ships the instrument so its thresholds can be validated against real
- *   4G/LAN logs BEFORE Alg.2 (serialized ramp) and Alg.3 (class-driven commit) consume it; at that point the
- *   blind step-3 abort it supersedes is removed. No new YAML knobs (thresholds stay internal, by design). No
- *   card behaviour change.
- * v14.6.12 — [DRIVER CHANGE, pin ?v=2.7.0 → 2.7.1 — needs a PWA hard reload] Observability. The driver's
- *   RTC revert now carries its REASON on the `rtc_failed` signal (`detail`); the card mirrors it to the HA
- *   log as `rtc-revert: <why>`. Field logs previously showed every revert — a step-3 abort, a stall, a
- *   firstframe timeout, an ICE drop — as an identical bare `mode: rtc -> mse`, so we could not confirm from
- *   HA logs whether/why an abort fired (the reason was client-console only). Now `rtc-revert` self-identifies
- *   (e.g. "RTC aborted: pathological path (rtt=…, jbuf=… sustained)"), on both the main and shadow paths.
- *   Name-keyed throttle: first revert lands live, a burst collapses to "(repeated N×)" — flood-safe under
- *   the red/green ping-pong storm. No behaviour change; diagnosis only.
- * v14.6.11 — [DRIVER CHANGE, pin ?v=2.6.0 → 2.7.0 — needs a PWA hard reload] Two changes.
- *   (1) [Strato-1 step 3] RTC ABORT propagation. The v2.7.0 driver gives up a non-committing RTC probe
- *   that holds a pathological jitter-buffer/RTT reading (measured cause of the direct-4G collapse =
- *   bufferbloat: jbuf 1500-2100ms, RTT standing ~1.5s, pkt sub-MTU, path srflx/…/udp), reverting to the
- *   warm MSE in a deterministic ~6-9s instead of letting the adaptive watchdog balloon to 30×. The
- *   revert emits the existing `rtc_failed`, so the card's backed-off re-probe loop is the suppression —
- *   no new signal. New per-card knobs (parametric, defaults sane): `mse_abort` (false = classic
- *   extend-only), `mse_abort_jbuf` (1200 ms), `mse_abort_rtt` (5000 ms), `mse_abort_hold` (6000 ms),
- *   `mse_abort_futility_k` (0.5 — a repeatedly-doomed path gives up faster). The driver also fixed the
- *   futility inversion (futility now shortens the abort hold, no longer lengthens the extend).
- *   (2) [FIX] `url_fullscreen` never actually switched to hi-res on ANY platform. The signed WS URL in
- *   _fetchWebsocketURL — the stream the driver really dials — was built without `_fsStreamOverride`, so
- *   the card-path fullscreen swap reached only mode/ice/tunables while the connect URL stayed on the
- *   substream. Now the override is spread into that URL too, so entering fullscreen streams
- *   `url_fullscreen` (desktop / Android PWA). The iOS webkit path still shows the substream (fullscreen
- *   is bound to the <video>; documented limitation, unchanged).
- * v14.6.10 — [DRIVER CHANGE, pin ?v=2.5.0 → 2.6.0 — needs a PWA hard reload] Transport diagnostics.
- *   No behaviour change: the driver `metrics` line now also carries `jbuf`/`nack`/`pkt`/`path` from
- *   the same getStats poll, to settle bufferbloat-vs-fragmentation on the direct-4G path (the
- *   2026-08-26 direct run collapsed to 20s RTT and dropped HA; the SAME grid over a Cloudflare tunnel
- *   rode a transient storm and converged). `path` = selected candidate-pair type+protocol
- *   (srflx/relay/host, udp/tcp) — tests "UDP-to-TURN vs TCP-over-CF" directly; `jbuf` = avg
- *   jitter-buffer delay (bufferbloat tell); `nack` = retransmit requests (loss/frag tell); `pkt` =
- *   avg received packet size (MTU tell). This lands BEFORE Strato-1 step 3 so the abort trigger is
- *   tuned on measured cause, not on the saturating `cong`.
- * v14.6.9 — [DRIVER CHANGE, pin ?v=2.4.6 → 2.5.0 — needs a PWA hard reload] Strato-1: the MSE
- *   no-data watchdog now SELF-ADAPTS. The driver derives a smoothed `congestion` score (rttExcess =
- *   rtt − session-min-rtt, i.e. bufferbloat, reinforced by loss and by recent RTC-promote futility)
- *   and EXTENDS the effective watchdog up to `mse_adapt_max_extend`× the base — never below it — but
- *   only while an un-committed RTC probe is starving the warm MSE (negotiating/promoted). 'warm' /
- *   'committed' keep the tight base, so a dead MSE-only stream is still reaped promptly. This makes
- *   the high/low-band paths diverge from identical code (the substream keeps the base; the main
- *   earns the extension) so the user no longer sets per-card timeouts by hand. Field-validated: the
- *   mse_timeout:0 run proved the socket survives a 21s-rttExcess storm and converges to clean RTC —
- *   the fixed 5s watchdog was the reconnect storm, not the cure. New per-card knobs (all optional,
- *   defaults sane): `mse_adaptive` (false = classic fixed), `mse_adapt_rtt_excess`, `mse_adapt_loss`,
- *   `mse_adapt_max_extend`, `mse_adapt_alpha`. `mse_timeout` remains the base/escape-hatch. The
- *   driver `metrics` line now ends with `cong=N.NN`.
- * v14.6.8 — [card-only, no driver change] Lever B: `url_fullscreen` — a per-card hi-res stream
- *   shown ONLY in fullscreen, so the grid tile can run the light substream while fullscreen gets
- *   the full-resolution main. On the card-fullscreen path (desktop / Android PWA) entering
- *   fullscreen cold-restarts the driver onto `url_fullscreen` and exiting reverts to the configured
- *   substream — fullscreen lives on the .card container, not the <video>, so the inner driver can
- *   be swapped without leaving fullscreen. The iOS webkit path (fullscreen bound to the <video>)
- *   keeps the substream upscaled — a swap there would drop out of fullscreen. Example:
- *   `url: cam_sub` + `url_fullscreen: cam`. No driver change (pin stays ?v=2.4.6).
- * v14.6.7 — [card-only, no driver change] New per-card tunable `mse_timeout` (ms): exposes the
- *   driver's MSE no-data watchdog (`DISCONNECT_TIMEOUT`, default 5000) as YAML config. The watchdog
- *   is fed by binary WS bytes = MSE liveness only, so it governs how long a stalled MSE stream is
- *   tolerated before a teardown+cold-restart. On lossy 4G the 5s default false-fires on transient
- *   TCP stalls that would self-recover, turning a recoverable pause into a reconnect storm; raising
- *   it (e.g. 12000) lets mobile links ride out stalls. `0` EXPLICITLY disables the watchdog. Read
- *   live in the driver, so per-card changes take effect on a card reload — no driver pin bump / PWA
- *   hard reload. Default unchanged (driver still 5000); set it per-camera. Complements the config
- *   cure (multi-cam grid on /stream2 substream) and v14.6.6 anti-lockstep backoff.
- * v14.6.6 — [card-only, no driver change] Anti-lockstep retry backoff. Cameras mounted together
- *   die together on a congested link; the old deterministic backoff (1000*2^n, capped 30s, no
- *   jitter) made all of them re-fire at the identical instant -> simultaneous keyframe bursts ->
- *   the congestion spike recurred -> self-synchronizing collapse that never broke on its own
- *   (observed: 4x MSE-only on weak 4G, all four flapping in step every 5-7s). _scheduleRetry now
- *   floors the delay at 2s (breathing room instead of a 1s hammer) and spreads it across 60-140%
- *   of the target via jitter so the fleet de-syncs after the first collision. The exponential is
- *   capped at 20s BELOW the 30s hard ceiling so jitter keeps room to spread near the top (a cap
- *   applied after jitter would re-collapse every camera onto exactly 30000). Complements the
- *   config-side cure (multi-cam grid on the camera substream) which addresses the raw bandwidth.
- * v14.6.5 — [driver-only fixes, pin ?v=2.4.5 → 2.4.6] (1) MSE strand recovery: a frozen MSE
- *   stream that only started after pressing pause+play — the 5s buffer eviction could strand
- *   currentTime below the buffered window (late initial autoplay, or a stall behind an evicted
- *   region) and the element waited forever for removed data. onmse now seeks to the live edge once
- *   on that condition. (2) No-data watchdog reverted to always 5s: the v2.4.3 phase-aware 2.5s
- *   shortening false-fired on bursty-but-alive MSE over congested 4G and tore down the working MSE
- *   (retry storm), and starved the A0 severity gate; 5s lets 4×MSE settle. No card logic changed —
- *   version bump + pin only.
- * v14.6.4 — [mute fix] Same on-screen-element root cause as v14.6.3: the volume button set
- *   `this.video.muted` directly, so during a promoted RTC stream it muted the hidden MSE while the
- *   audible overlay `_rtcVideo` kept its sound, and the next handoff transition overwrote the
- *   choice. Now routed through the driver's new `setMuted()` (v2.4.5), which mutes the on-screen
- *   element AND records `_mseWanted` so promote/commit/revert restore the intended state. Icon
- *   init, `volumechange` handler, and `hasAudio` also read the on-screen element.
- * v14.6.3 — [play/pause + live-dot fixes] Both bugs had ONE root cause: the card bound the play/
- *   pause button and the live-indicator dot to `this.driver.video` (the MSE element), but during
- *   the reversible-RTC `promoted` phase the on-screen pixels are the overlay `_rtcVideo` while MSE
- *   is hidden underneath. Driver v2.4.4 adds `get onscreenVideo()`; the card now targets it.
- *   (1) PLAY/PAUSE: pause used to call video.pause() on the hidden MSE element → the icon flipped
- *   to ▶ but the visible RTC kept playing. Now the button calls the driver's suspend()/resume()
- *   (chosen semantics "C"): soft-pause the ON-SCREEN element AND hold the commit/revert poll so the
- *   handoff machine can't call play() and auto-resume. Instant freeze/resume (<100ms); decoder+
- *   socket kept warm on purpose — bandwidth teardown stays the off-screen auto-pause's job.
- *   (2) LIVE-DOT: the dot watched the hidden, no-longer-fed MSE element → RED on a perfect RTC
- *   stream, and never recovered because the commit's srcObject swap cancelled the pending rVFC.
- *   The dot now binds to `onscreenVideo`, re-targets when the on-screen element changes
- *   (promote/commit/revert), and re-arms after a source swap. Pin bumps ?v=2.4.3 → 2.4.4.
- * v14.6.2 — [Lever A + D1] Two latency/UX fixes shipped together (pin bumps ?v=2.4.2 → 2.4.3).
- *   LEVER A (driver): the no-data watchdog is now phase-aware. While an un-committed RTC probe is
- *   live (_rtcPhase negotiating/promoted) a doomed probe is declared dead after 2.5s
- *   (NEGOTIATING_DISCONNECT_TIMEOUT) instead of the full 5s DISCONNECT_TIMEOUT. On a narrow link
- *   the additive RTC probe starves the MSE ws, so the old 5s tolerance was a fleet-wide collateral
- *   stall window; halving it during probes shortens the collateral damage without touching the
- *   committed-stream watchdog. Answers the field hypothesis "we wait too long before declaring the
- *   non-MSE attempt dead."
- *   D1 (card): reconnect gap now shows a freeze-frame instead of a black box with a play glyph. The
- *   last decoded frame is captured to a JPEG data URL in _scheduleRetry() (while the dying <video>
- *   is still alive, same instant as _lockHeight) and applied as the NEXT driver's video.poster —
- *   the browser natively shows it until the new stream decodes its first frame, and a poster also
- *   suppresses the empty-state play glyph. One-shot (cleared once applied); Main driver only (the
- *   Shadow negotiates hidden). Opt out with `freeze_frame: false`. Canvas is same-origin/untainted
- *   (same as saveScreenshot). No static poster configured → freeze survives untouched to first frame.
- * v14.6.1 — [A0] Severity trigger for the suppression latch. Field logs of the real "pessima" 4G
- *   pattern showed the cumulative flap score never latched: the 4 cameras die together once per
- *   ~2-min burst (each counts only 1 flap on its own card state) and the 45s decay wiped the score
- *   between bursts → stuck at 1.0/3, RTC never suppressed, all cameras black with no recovery. But
- *   the metrics sampled the instant before each death read loss 35-50% — proof the link is narrow.
- *   Now the card parses loss% from the metrics line; a within-probation death preceded by a FRESH
- *   (≤8s) sample with loss ≥ FLAP_LOSS_PCT (20%) weighs a full FLAP_SUPPRESS_AT → latches on the
- *   FIRST such death instead of never. Decay widened 45s→120s so the slow cumulative path still
- *   accumulates across bursty failures. Card-only, pin stays ?v=2.4.2. Using loss ONLY for the
- *   suppress policy is consistent with v14.5.2 (promote/commit/revert stay framesDecoded-only).
- * v14.6.0 — [A0/B1] History-driven narrow-link RTC suppression + retry-storm damping. Card-only
- *   (driver unchanged, pin stays ?v=2.4.2). Acts on the v14.5.2 field finding (memory
- *   webrtc-mobile-collapse-is-rtc-additive): the multi-camera mobile collapse is RTC-ADDITIVE load,
- *   not MSE concurrency — with RTC on, 4G streams land then die in 5-14s (RTC never promotes,
- *   20-59% loss, MSE starved past the 5s watchdog), while the SAME 4 cameras MSE-only hold ~550KB/s
- *   with zero watchdog trips. Fix, all as CARD state so it survives driver churn:
- *     • [B1] A stream now becomes "healthy" (backoff reset) only after surviving STREAM_PROBATION_MS
- *       (20s). Previously every 5-14s land reset _retryCount → the fixed-looking "retry #1 in 1000ms"
- *       storm. A land that dies within probation lets the exponential backoff CLIMB instead.
- *     • [A0] Each within-probation death is a "flap" feeding a decaying score (FLAP_DECAY_MS 45s).
- *       At FLAP_SUPPRESS_AT (3) we LATCH MSE-only: every new driver is built with 'webrtc' stripped
- *       from its mode and the re-probe loop is silenced, removing the additive RTC load entirely.
- *       Self-releasing: after RTC_RETEST_MS (5min) the next build re-tests full mode; if it flaps
- *       again it re-suppresses. A happy MSE-only stream is left undisturbed (re-test is lazy, at the
- *       next cold start). Fat links never accumulate 3 flaps → behaviour byte-for-byte unchanged.
- *       Opt out with `rtc_adaptive: false`. New HA log lines: rtc-flap / rtc-suppressed (warn) /
- *       rtc-retest / stream-stable.
- * v14.5.3 — Driver v2.4.2 hotfix: onopen() null-mode crash guard. A null this.mode made the
- *   driver throw at ws-open (0-byte channel) and reconnect immediately -> reconnect storm, seen
- *   even on LAN. Card-side unchanged; pin bumped to ?v=2.4.2 (cache-bust).
- * v14.5.2 — Passive bandwidth instrumentation (driver v2.4.1). The card now logs the driver's
- *   compact `metrics` line (RTT + min-baseline, loss%, goodput, jitter, RTC phase) at debug,
- *   bypassing the dedup throttle so each 3s sample lands intact. Diagnostic ONLY — no stream
- *   behaviour changes on any path. First data-gathering step toward history-driven adaptation of
- *   the fixed RTC/retry/watchdog constants: on real links, does RTT bufferbloat / rising loss
- *   PRECEDE the mse->rtc->mse reverts that collapse multi-camera mobile sessions? Enable with
- *   `logger: logs: custom_components.webrtc.card: debug` and read in Settings → System → Logs.
- * v14.5.1 — HA native ICE (#923) cold-start gate: resolve HA's ICE servers BEFORE building the
- *   first driver, so the primary reversible-RTC path relays via Nabu Casa TURN from t=0 (~2s
- *   promote) instead of catching up 30s+ later through a shadow reprobe. Previously the one-shot
- *   fetch raced the cold start and always lost, so the FIRST stream after every (re)load carried
- *   only the 2×STUN default — a remote CGNAT user glancing at a camera for <~35s never reached the
- *   relay. The fetch is now a bounded (300ms), one-flight promise: `set hass` warms it, startStream
- *   awaits the SAME promise on a cold start only (shadow/reprobe/reconnect skip it — already
- *   cached). A `_coldStartInFlight` latch coalesces concurrent `set hass` ticks across the await,
- *   and a post-await re-validation (isConnected/paused/driver) prevents resurrecting a card
- *   detached mid-fetch. Fail-soft: timeout or old HA → 2×STUN default (worst case = prior
- *   behaviour), with the periodic reprobe still the backstop for the rare timeout path. Added cost:
- *   the single WS round-trip (~10ms) on the first frame. Card only; driver unchanged (v2.4.0).
- * v14.5.0 — HA native ICE (#923): the card now also reuses Home Assistant's OWN ICE servers —
- *   the user's `webrtc:` config plus any cloud-provided TURN (Nabu Casa / Homeway) — fetched
- *   once via the native `web_rtc/ice_servers` WS command (pure JS; zero Python; fails soft on
- *   older HA). This is the only way to reach the rotating, non-pasteable Nabu Casa TURN creds,
- *   giving CGNAT / symmetric-NAT users relay for free. Precedence, most specific wins:
- *   per-card `ice_servers` (#952, incl. `[]` opt-out) → HA native ICE (#923) → 2×STUN default
- *   (#915). Logging (card sub-logger): resolved ICE source + HA-fetch outcome at `debug` (`ice` /
- *   `ice-ha`, like the `mode` mirror); a configured-but-malformed per-card `ice_servers` is flagged
- *   at `warning` (`ice-config`, default-visible) instead of being silently dropped. (video-rtc → v2.4.0.)
- * v14.4.1 — ICE defaults (#915): the built-in default now offers TWO independent public STUN
- *   servers (Google + Cloudflare) instead of Google alone, so a blocked/filtered/down provider
- *   no longer kills srflx discovery out-of-the-box. Applies to every camera. `_normalizeIceServers`
- *   now distinguishes an unset `ice_servers` (→ keep default) from an EXPLICIT `ice_servers: []`
- *   (→ zero servers, a documented privacy opt-out); the injection uses `!== null` so `[]` is honored.
- *   A per-card `ice_servers` list still fully REPLACES the default. (video-rtc → v2.4.0.)
- * v14.4.0 — Custom-UI enhancement batch (all gated behind `ui: true`, no effect on the MSE↔RTC
- *   path): (1) #913 — the `.play` control is now a real play/pause toggle: it stays visible and
- *   mirrors the element state (`mdi:play`/`mdi:pause`), so a live stream can be frozen and resumed
- *   (before, it only appeared to resume a pause). (2) #953 — `unmute_in_fullscreen: true` unmutes
- *   while fullscreen and restores the prior muted state on exit (iOS `webkitendfullscreen` +
- *   standard `fullscreenchange`). (3) #924 — `spinner: false` omits the loading spinner entirely;
- *   `spinner_delay: <ms>` defers showing it on a `waiting`, so brief stalls don't flash it.
- *   Also noted: #949 (local PNG poster) already works via the `poster` option (documented).
- * v14.3.4 — Fix iOS 26.1 MSE stutter (#910/#884): the fork had inherited upstream v3.6.1's MSE
- *   live-sync in `video-rtc.js` (`currentTime = start` re-seek + `playbackRate = gap`). On iOS 26.1
- *   WebKit this pins playbackRate to the 0.1 floor near the live edge → video crawls at ~0.1x
- *   ("~1 frame / 3s"). Removed the catch-up: MSE now plays at 1x (pre-3.6.1 behavior). WebRTC
- *   remains the low-latency path; MSE is the reliable fallback.
- * v14.3.3 — Fix `"webrtc-camera" has already been used` on double module load (#932): the
- *   `customElements.define('webrtc-camera')` at the bottom was unconditional while `video-rtc` was
- *   guarded. A second evaluation (swipe-card, scoped registry, service-worker / `?v=` cache-bust
- *   race) threw and aborted load. Now wrapped in `if (!customElements.get('webrtc-camera'))`, which
- *   also de-dupes the `window.customCards` entry.
- * v14.3.2 — Two upstream items: (1) browser-side `ice_servers` (#952) — an optional card option
- *   that replaces the driver's default Google STUN with user-supplied STUN/TURN on every driver
- *   (main + shadow), for CGNAT homes without Nabu Casa; injected where the driver is created,
- *   normalized by `_normalizeIceServers`. (2) `fire-dom-event` from `shortcuts` (#940) — a shortcut
- *   with `service: fire-dom-event` now dispatches `ll-custom` (for browser_mod close_popup etc.)
- *   instead of failing a bogus `fire-dom-event.undefined` service call (fix in ui-interaction.js).
- * v14.3.1 — Fix `tap_action` (#668): the card now EXECUTES the action itself instead of
- *   dispatching a `hass-action` event that nothing catches for a standalone custom card
- *   (so `more-info` etc. silently did nothing). `handleAction` handles more-info
- *   (via `hass-more-info`), navigate (`location-changed`), url, toggle, perform-action /
- *   call-service (`hass.callService`) and fire-dom-event, with entity fallback
- *   action.entity → config.entity → current stream's entity.
- * v14.3.0 — Feature batch: media_player /api/ffmpeg (#942) + volume_entity (#945),
- *   tap_action (#668, pinch/PTZ-safe), live_indicator dot (#922).
- * v14.2.16 — Fix a regression from the always-on server-side logging (v14.2.11): a failed
- *   `system_log.write` popped a user-facing "Impossibile eseguire l'azione system_log.write"
- *   toast — one PER CARD — on the Android companion when resuming from a long lock-screen (the
- *   page-visible lifecycle write fires while the WS is still reconnecting, so it rejects with
- *   unknown_error). `_emitLog` now passes `notifyOnError=false` to `hass.callService` (HA's
- *   frontend defaults it to true and pops the toast itself) and `.catch()`es the returned promise
- *   (the async rejection was never caught by the synchronous try/catch → unhandled rejection).
- *   Diagnostic logging is now truly silent on failure. Also guards `!this._hass`.
- * v14.2.15 — Memory-hygiene pass. (1) Load driver v2.3.8 (MSE blob-URL revoke on teardown) via
- *   the `video-rtc.js?v=` import pin; the manifest bump re-fetches the card and pulls the new
- *   driver past the browser/PWA cache. (2) Store each main driver's `connection-closed` listener
- *   ON the driver (`_connClosedHandler`, via `_attachMainConnClosed`) instead of a single shared
- *   card field, so `_nukeDriver` always removes the exact right listener regardless of call order
- *   (removes a latent correctness fragility — see the `_attachMainConnClosed` docblock).
- * v14.2.14 — Fix a retry-latch deadlock: a recovered camera never reconnected. `_scheduleRetry`
- *   cleared `_retryTimer` BEFORE the `_isReconnecting` guard, so a burst of errors from the same
- *   dying driver (mse-fail → webrtc/offer-fail → ws-close, all within ms) landing inside the backoff
- *   window cancelled the armed retry and then early-returned without rescheduling — stranding the
- *   camera forever (`_isReconnecting` only clears in the timer callback that now never runs). Most
- *   visible at the longer 4000ms+ backoff, where the burst reliably beats the timer. Fix: guard on
- *   `_isReconnecting` FIRST so the pending retry survives the burst; the backoff loop resumes and
- *   the camera recovers when it comes back online. No behaviour change to a healthy stream.
- * v14.2.13 — Fix `_logHA` throttle for the `mode` event. The dedup-throttle keyed only by event
- *   name, so the two startup transitions (`none -> mse`, `mse -> rtc`) collapsed into one 10s
- *   bucket: the MSE→RTC upgrade — the very line v14.2.12 added for app visibility — was delayed up
- *   to 10s and mislabelled `(repeated 1× in 10s)`, and a revert in the same window lost its detail.
- *   `mode` now keys by event+detail so distinct transitions each emit live, while a same-direction
- *   flap still collapses (flood-safe). retry/driver-error keep the event-only key (their detail is
- *   high-cardinality — keying by it would defeat the throttle).
- * v14.2.12 — Field visibility: mirror every mode transition to the HA log. `_setActiveMode()` is
- *   the single choke-point for all mode changes (initial land, shadow swap, direct-RTC, RTC→MSE
- *   revert), but `stream-up` only fired on the initial ui_sync land — so on the HA Companion apps
- *   (no browser console) the fork's defining MSE→RTC upgrade and its reverts were invisible. Added
- *   a `_logHA('debug','mode', 'a -> b')` in `_setActiveMode`; the app log can now answer "did this
- *   camera reach RTC / fall back?". Rare event (once per upgrade/revert) → negligible SD cost. No
- *   behaviour change.
- * v14.2.11 — Removed the card's custom debug GATE for coherence: the server-side lifecycle
- *   mirror (_logHA → custom_components.webrtc.card) is now ALWAYS emitted, at rationalized levels,
- *   and the native HA logger level is the only filter — same model as the JS console and the
- *   Python backend. Dropped the `debug` card option, `_debugEnabled()`, and the missing-entity
- *   warn. Levels: connection-closed / driver-error = warning (shown by default); retry, stream-up,
- *   page-hidden/visible, auto-pause/resume = debug (need custom_components.webrtc.card: debug).
- *   The 10s dedup-throttle still bounds the service-call rate during failure storms.
- * v14.2.10 — Console log-level rationalization (no behaviour change). All routine lifecycle,
- *   negotiation and shadow-upgrade traces moved from info to `console.debug` (hidden at the
- *   browser console's default level, shown with Verbose). `Main Driver Error` reclassified
- *   error → warn (a `no route to host` / `i/o timeout` is a recoverable network transient the
- *   retry loop handles, not a code fault). Kept: the version banner + the two user-action lines
- *   (Hard Reset, Next Stream) at info; connection-closed / auth-failed at warn/error. The native
- *   console level filter now acts as the gate — no custom console gating. Consumes driver v2.3.7.
- *   Backend Python re-levelled in lockstep: per-stream Client/Stream-ended/BENCHMARK traces
- *   info → debug, server `Stream error` error → warning.
- * v14.2.9 — Debug events now log under a dedicated sub-logger `custom_components.webrtc.card`
- *   (was `custom_components.webrtc`). Lets you raise ONLY the card events to info without also
- *   un-muting the backend proxy's own chatty info logging (handshake/benchmark/counters).
- * v14.2.8 — Warn once on the console when `debug` points to a non-existent HA entity_id, so a
- *   typo'd / not-yet-created helper doesn't look like broken logging. Debug still stays off.
- * v14.2.7 — Field-debug pack (no streaming-behaviour change on the happy path). Three additions
- *   aimed at diagnosing stream loss on the HA mobile app, where no browser console exists:
- *   (1) LAYOUT: on a retry the card now LOCKS its rendered height (_lockHeight) until the new
- *   stream is healthy, then releases it. Previously a retry removed the <video>, the card
- *   collapsed to ~0, and in a Sections/Masonry view HA re-packed the whole section — reflowing
- *   (and disturbing) every sibling camera. (2) STATUS: a connection error now shows a localized
- *   generic ("Reconnecting…") instead of the raw driver string; the raw reason is kept in the
- *   console and the tooltip. (3) LOGGING: opt-in `debug` (true | an entity_id) mirrors the
- *   stream lifecycle (errors, closes+reason, retries, recovery, visibility) to home-assistant.log
- *   via system_log.write, dedup-throttled to avoid flooding. Consumes driver v2.3.6 (adds
- *   connection-closed `detail.reason`). Off by default → existing cards are byte-for-byte unaffected.
- * v14.2.6 — [SMELL #2/#3] Message-handler role split + _activeMode setter. The driver's
- *   overloaded rtc_* signals are now hard-dispatched on the receiver's role
- *   (_onPreSwapShadowMessage vs _onMainMessage) instead of branch-order + a "never fall
- *   through" convention; also corrects post-swap 'error' routing. All _activeMode writes go
- *   through _setActiveMode() (single audit point + transition log). No streaming behaviour
- *   change on either reference net beyond the post-swap error fix. Driver unchanged (v2.3.5).
- * v14.2.5 — Driver RTC refactor (driver v2.3.5), no card behaviour change. Consumes a driver
- *   whose RTC handoff is now an explicit `_rtcPhase` state machine and whose dead legacy
- *   (non-reversible) path was removed. The vestigial `newDriver.reversible = true` assignment
- *   is dropped (the driver no longer reads it — the reversible flow is its only RTC path).
- * v14.2.4 — Tunable RTC knobs. New per-card YAML options `rtc_swap_prove_ms` (default 30000,
- *   raised from 20000) and `firstframe_timeout` (default 120000, lowered from 600000) are
- *   injected into the driver in startStream(). Defaults revised per the good-vs-badass-net
- *   log analysis: both changes only affect degraded paths, not the clean direct-upgrade path.
- * v14.2.3 — Prove-gated shadow swap. The background shadow no longer swaps in at its 2s RTC
- *   PROMOTE; the working MSE main stays visible until the shadow's RTC has held gaplessly for
- *   RTC_SWAP_PROVE_MS (~20s), signalled by `rtc_sustained` from the driver. On throttled paths
- *   the shadow stalls before proving and is reaped (no black tile, no swap/revert churn, backoff
- *   escalates normally); on good paths it swaps cleanly. Swap logic extracted to
- *   _promoteShadowToMain().
+ * Version history and field-validation notes: RELEASE.md. File:line map: ARCHITECTURE.md.
+ * The `?v=` query on the driver import below is the cache-bust pin — bump it on any driver change so
+ * the PWA/service worker fetches the new module. PITFALL: a driver change additionally needs a hard
+ * reload on the HA PWA; bumping the pin alone does not force the service worker to drop the old module.
  */
 
 import {VideoRTC} from './video-rtc.js?v=2.21.0';
@@ -611,10 +117,10 @@ class WebRTCCamera extends HTMLElement {
 
         // [RTC RE-PROBE] Periodic background WebRTC re-probe while settled on MSE.
         // The initial _upgradeTimer is a single fast attempt right after MSE lands;
-        // this loop is the long-term safety net. Since a failed WebRTC no longer
-        // tears down MSE (driver v2.2.14 #6), a stream that started on MSE because
-        // WebRTC was momentarily unavailable (UDP briefly blocked, TURN down, ICE
-        // timeout) can still be upgraded minutes later, without ever disturbing the
+        // this loop is the long-term safety net. Because a failed WebRTC probe no longer
+        // tears down MSE, a stream that started on MSE because WebRTC was momentarily
+        // unavailable (UDP briefly blocked, TURN down, ICE timeout) can still be upgraded
+        // minutes later, without ever disturbing the
         // live MSE picture. Attempts back off (30s, 60s, 120s ... capped at 10min)
         // so a permanently WebRTC-incapable network settles to one cheap probe every
         // 10 minutes. Opt out with `rtc_reprobe: false`.
@@ -622,30 +128,26 @@ class WebRTCCamera extends HTMLElement {
         this._reprobeDelay = 0;      // current backoff delay in ms (0 = loop idle)
         this._activeMode = null;     // last negotiated main-driver transport: 'mse' | 'rtc'
 
-        // [A0/B1] Narrow-link RTC suppression + retry-storm damping. Pure CARD state, so it
-        // survives the driver's per-reconnect teardown (the learning must outlive the churn).
-        // Signal: a stream that reaches media then dies within STREAM_PROBATION_MS is a "flap".
-        // On constrained mobile the reversible RTC negotiation + MSE keep-warm is ADDITIVE load
-        // that starves the MSE feed past the 5s no-data-watchdog seconds after it lands (validated
-        // 2026-08-25: MSE-only 4G holds ~550KB/s with 0 watchdog trips; RTC-on 4G = reconnect
-        // storm, RTC never even promotes, 20-59% loss). Flaps feed a decaying score; past
-        // FLAP_SUPPRESS_AT we LATCH _rtcSuppressed → every new driver is built MSE-only and the
-        // re-probe loop is silenced (A0), and the retry-backoff reset is withheld until a stream
-        // survives probation (B1) so the storm slows instead of hammering at 1000ms. The latch
-        // is self-releasing (RTC_RETEST_MS). Fat links never accumulate enough flaps to latch, so
-        // their behaviour is byte-for-byte unchanged. Opt out entirely with `rtc_adaptive: false`.
+        // [A0/B1] Narrow-link RTC suppression + retry-storm damping. Pure CARD state, so the learning
+        // survives the driver's per-reconnect teardown (it must outlive the churn).
+        // Signal: a stream that reaches media then dies within STREAM_PROBATION_MS is a "flap". On a
+        // constrained mobile link the reversible RTC negotiation + MSE keep-warm is ADDITIVE load that
+        // starves the MSE feed past the no-data watchdog seconds after it lands (a 4G link that holds
+        // MSE-only cleanly collapses into a reconnect storm once RTC is added). Flaps feed a decaying
+        // score; past FLAP_SUPPRESS_AT we LATCH _rtcSuppressed → every new driver is built MSE-only and
+        // the re-probe loop is silenced (A0), and the retry-backoff reset is withheld until a stream
+        // survives probation (B1) so the storm slows instead of hammering at 1000ms. Self-releasing
+        // (RTC_RETEST_MS). Fat links never accumulate enough flaps to latch (unchanged behaviour). Opt
+        // out with `rtc_adaptive: false`.
         //
-        // [A0 v14.6.1] Severity trigger. Field logs of the real "pessima" pattern (2026-08-25) show
-        // the cumulative score alone never latches: the 4 cameras die *together* once per ~2-min
-        // burst (each camera counts only 1 flap on its own state) and the 45s decay wiped the score
-        // between bursts → stuck at 1.0/3 forever, RTC never suppressed. But the metrics sampled the
-        // instant before each death read loss 35-50% — unambiguous proof the link is narrow. So a
-        // within-probation death preceded by a FRESH high-loss sample (_lastLossPct ≥ FLAP_LOSS_PCT)
-        // now weighs a full FLAP_SUPPRESS_AT → latches on the FIRST such death; the decaying score is
-        // kept as the slow path for moderate degradation (decay widened 45s→120s so bursty-but-
-        // repeated failures accumulate instead of resetting). Using loss ONLY for the suppress policy
-        // is consistent with the v14.5.2 principle: promote/commit/revert stay framesDecoded-only;
-        // the metrics feed adaptation, which is exactly this. See webrtc-mobile-collapse-is-rtc-additive.
+        // Two independent latch paths, because the cumulative score alone is too slow on the worst
+        // links (cameras die together in ~2-min bursts, each counting only 1 flap, and the score decays
+        // between bursts → never reaches FLAP_SUPPRESS_AT):
+        //   FAST — a within-probation death preceded by a FRESH high-loss sample (_lastLossPct >=
+        //          FLAP_LOSS_PCT) weighs a full FLAP_SUPPRESS_AT → latches on the FIRST such death.
+        //   SLOW — the decaying score still catches moderate, repeated degradation.
+        // PITFALL: the suppress POLICY reads loss, never framesDecoded — promote/commit/revert stay
+        // framesDecoded-only; the metrics feed adaptation only. See webrtc-mobile-collapse-is-rtc-additive.
         this._healthyTimer = null;   // [B1] probation timer; on fire → confirm healthy, reset backoff
         this._streamUpAt = 0;        // when the current media mode landed (ms)
         this._flapScore = 0;         // decaying count of within-probation stream deaths
@@ -1157,8 +659,8 @@ class WebRTCCamera extends HTMLElement {
 
         // [RESILIENCE] Now that the shadow is the live main, wire its connection-closed to the
         // global retry. Pre-swap shadows deliberately have no such listener (they must fail
-        // silently); without re-attaching it here a genuine ws death after the swap would go
-        // unhandled (the old webrtc-only shadow froze black in exactly this gap).
+        // silently). PITFALL: without re-attaching it here a genuine ws death after the swap goes
+        // unhandled and the promoted stream freezes black in exactly this gap.
         this._attachMainConnClosed(newDriver);
 
         // [AUDIO] The shadow was force-muted for background negotiation. Restore the configured
@@ -1228,7 +730,7 @@ class WebRTCCamera extends HTMLElement {
             // schedule the next attempt. rtc_rejected (a quality decision) is stable for this
             // connection, so stop reprobing; rtc_failed is a transient failure worth retrying.
             if (msg.value === 'rtc_failed' || msg.value === 'rtc_rejected') {
-                // [OBSERVABILITY, v14.6.12] Mirror the shadow probe's revert reason (abort/stall/
+                // [OBSERVABILITY] Mirror the shadow probe's revert reason (abort/stall/
                 // ICE) to the HA log, same as the main path — otherwise a shadow step-3 abort is
                 // invisible (the shadow never touches the visible mode line).
                 if (msg.value === 'rtc_failed' && msg.detail) {
@@ -1272,7 +774,7 @@ class WebRTCCamera extends HTMLElement {
             // [A0-grid] Shared probe gate blacked out RTC grid-wide after a band=path abort (this
             // camera's own abort, or a denied acquire because another camera tripped it). MSE-only.
             if (msg.value === 'rtc_suppressed') { this._enterGridSuppression(msg.detail); return; }
-            // [#1 TELEMETRY, v14.15.0] Byte-aware-watchdog milestones from the driver. Diagnostic
+            // [byte-aware-watchdog telemetry] Milestones from the driver's WS-bursty watchdog. Diagnostic
             // only — mirror to the HA log under distinct event keys (they must NOT share _logHA's
             // 10s name-throttle: an arm and a reap seconds apart must both land). Debug level:
             // needs `logger: logs: custom_components.webrtc.card: debug`, like the metrics samples.
@@ -1295,7 +797,7 @@ class WebRTCCamera extends HTMLElement {
                 console.debug(`[WebRTC Camera] ${reason}. Cancelling upgrade.`);
                 this.setStatus(null, null, reason);
 
-                // [OBSERVABILITY, v14.6.12] Mirror the driver's revert REASON to the HA log. The
+                // [OBSERVABILITY] Mirror the driver's revert REASON to the HA log. The
                 // `mode: rtc -> mse` line that follows says a revert happened but not why; the detail
                 // string self-identifies the cause — a step-3 abort ("RTC aborted: pathological
                 // path …"), a stall, a firstframe timeout or an ICE drop — so field logs are
@@ -1633,10 +1135,10 @@ class WebRTCCamera extends HTMLElement {
 
     // [A0 — revert churn] A doomed RTC probe that REVERTS to warm MSE (band=path abort, or a pre/
     // post-commit media stall) keeps the MSE stream alive, so it never reached _noteRtcFlap (which
-    // only fires on a socket DEATH). Field logs (2026-08-27, 4G) proved this is the exact hole that
-    // crashes HA: a single canary that keeps probing→aborting→re-probing→committing→stalling burns
-    // the shared uplink (RTC-over-TURN, bufferbloat rtt→7.5s) unchecked because nothing counted the
-    // churn. Feed those reverts into the SAME decaying score so a link that can't hold RTC latches
+    // only fires on a socket DEATH). PITFALL: without this path a single canary that keeps
+    // probing→aborting→re-probing→committing→stalling burns the shared uplink (RTC-over-TURN,
+    // bufferbloat rtt→multi-second) unchecked, because nothing counts the churn — the failure mode
+    // that overloads HA. Feed those reverts into the SAME decaying score so a link that can't hold RTC latches
     // MSE-only and stops re-probing. rtc_rejected (a deliberate quality<MSE decision, link is fine)
     // does NOT come here — only rtc_failed (RTC could not deliver). The freshness/loss severity gate
     // in _accrueFlap keeps a healthy link that fails RTC for a non-bandwidth reason (ICE/firstframe)
@@ -1849,17 +1351,16 @@ class WebRTCCamera extends HTMLElement {
         // full webrtc+mse set and promotes WebRTC REVERSIBLY (keeps its own MSE warm on a 2nd
         // <video>, snaps back on an RTC stall). This makes the shadow a self-protecting driver:
         // when it promotes we swap it in and, if its RTC later stalls, it reverts to ITS OWN
-        // warm MSE instead of freezing black. The old webrtc-only shadow, once swapped in, had
-        // no MSE fallback and no connection-closed listener, so a stall on a flaky network left
-        // it frozen. The extra background MSE stream is acceptable (LAN-side; the constrained
-        // camera->go2rtc path carries one feed regardless). The reversible handoff is now the
-        // driver's ONLY RTC path (the legacy irreversible branch was removed in driver v2.3.5),
-        // so there is no per-driver flag to set here any more.
-        // [A0] Under the narrow-link latch, strip 'webrtc' so this driver is MSE-only: the
-        // reversible RTC negotiation + MSE keep-warm is the additive load proven to starve MSE on
-        // constrained mobile (MSE-only 4G holds ~550KB/s, 0 watchdog trips; RTC-on 4G never
-        // promotes, 20-59% loss, MSE dies <5s → storm). The latch is card state so it holds across
-        // driver churn; it clears itself after RTC_RETEST_MS. Fat links never reach the latch.
+        // warm MSE instead of freezing black. PITFALL: a webrtc-only shadow, once swapped in, has
+        // no MSE fallback and no connection-closed listener, so a stall on a flaky network leaves
+        // it frozen — always drive the reversible path. The extra background MSE stream is
+        // acceptable (LAN-side; the constrained camera->go2rtc path carries one feed regardless).
+        // The reversible handoff is the driver's ONLY RTC path, so there is no per-driver flag here.
+        // [A0] Under the narrow-link latch, strip 'webrtc' so this driver is MSE-only. Rationale:
+        // the reversible RTC negotiation + MSE keep-warm is ADDITIVE uplink load that starves the
+        // MSE feed on constrained mobile — a narrow link holds MSE-only but collapses once the RTC
+        // probe runs concurrently. The latch is card state so it holds across driver churn; it
+        // clears itself after RTC_RETEST_MS. Fat links never reach the latch. (See RELEASE.md.)
         newDriver.mode = this._rtcSuppressed
             ? this._stripWebrtc(effectiveConfig.mode)
             : effectiveConfig.mode;
@@ -1904,15 +1405,13 @@ class WebRTCCamera extends HTMLElement {
         if (Number.isFinite(proveMs) && proveMs > 0) newDriver.RTC_SWAP_PROVE_MS = proveMs;
         const firstFrameMs = Number(effectiveConfig.firstframe_timeout);
         if (Number.isFinite(firstFrameMs) && firstFrameMs > 0) newDriver.FIRSTFRAME_TIMEOUT = firstFrameMs;
-        // [MSE no-data watchdog] No longer per-card tunable (was `mse_timeout`, retired v14.11.0). The
-        // driver's `DISCONNECT_TIMEOUT` base (5s) is self-configuring — the adaptive block below and
-        // `_effectiveDisconnectTimeout` in the driver extend it during RTC probing and hold it at base
-        // for warm/committed, so a fixed per-card number is no longer anyone's job.
-        // [TUNABLE] Adaptive MSE watchdog (Strato-1, driver v2.5.0). The watchdog above self-adapts:
-        // it EXTENDS (never shortens) up to `mse_adapt_max_extend`× the base while an RTC probe is
-        // congesting the warm MSE, driven by rttExcess/loss. These knobs exist for tuning even
-        // though the loop auto-adapts; the driver defaults are sane. `mse_adaptive: false` pins the
-        // classic fixed watchdog. Driver change → served under the bumped ?v=2.5.0 pin.
+        // MSE no-data watchdog: intentionally NOT per-card tunable. The driver's DISCONNECT_TIMEOUT
+        // base (5s) is self-configuring — _effectiveDisconnectTimeout extends it during RTC probing /
+        // congestion and holds it at base otherwise, so a fixed per-card number is no longer needed.
+        // Adaptive-watchdog knobs (below) exist for tuning even though the loop auto-adapts; the driver
+        // defaults are sane. The watchdog EXTENDS (never shortens) up to `mse_adapt_max_extend`x base
+        // while an RTC probe congests the warm MSE, driven by rttExcess/loss. `mse_adaptive: false`
+        // pins the classic fixed watchdog.
         if (effectiveConfig.mse_adaptive !== undefined) {
             newDriver.ADAPTIVE_WATCHDOG = effectiveConfig.mse_adaptive !== false;
         }
@@ -1924,12 +1423,11 @@ class WebRTCCamera extends HTMLElement {
         if (Number.isFinite(adaptMaxExtend) && adaptMaxExtend >= 1) newDriver.ADAPT_MAX_EXTEND = adaptMaxExtend;
         const adaptAlpha = Number(effectiveConfig.mse_adapt_alpha);
         if (Number.isFinite(adaptAlpha) && adaptAlpha > 0 && adaptAlpha <= 1) newDriver.ADAPT_EWMA_ALPHA = adaptAlpha;
-        // [TUNABLE] RTC abort (Alg.3, driver v2.9.0). Gives up a non-committing RTC probe once the
-        // band verdict (Alg.1) integrates enough sustained-bad time (`mse_abort_hold` ms, shortened by
-        // futility) — a deterministic teardown instead of babying it via the adaptive extend. The band
-        // verdict already folds BOTH rttExcess and loss, so the former blind jbuf/RTT ceiling knobs
-        // (`mse_abort_jbuf`/`mse_abort_rtt`) are RETIRED — the internal band thresholds are the tuning
-        // surface now. `mse_abort: false` pins the classic (extend-only) behaviour.
+        // RTC abort (Alg.3): give up a non-committing RTC probe once the band severity (Alg.1) integrates
+        // enough sustained-bad time (`mse_abort_hold` ms, shortened by futility) — a deterministic
+        // teardown instead of babying it via the adaptive extend. The band severity folds BOTH rttExcess
+        // and loss, so there are no separate jbuf/RTT ceiling knobs; the internal band thresholds are the
+        // tuning surface. `mse_abort: false` pins the classic (extend-only) behaviour.
         if (effectiveConfig.mse_abort !== undefined) {
             newDriver.RTC_ABORT_ENABLED = effectiveConfig.mse_abort !== false;
         }
@@ -1952,19 +1450,15 @@ class WebRTCCamera extends HTMLElement {
 
         // Driver → UI messaging is intentionally minimal; the driver never touches the UI.
         //
-        // [SMELL #2 FIX, v14.2.6] The three driver signals (rtc_sustained / rtc_failed /
-        // rtc_rejected) are OVERLOADED — the same name means opposite things for a background
-        // shadow probe vs the live main. This used to be disambiguated inside one handler purely
-        // by branch order plus a fragile "never fall through" convention. We now hard-dispatch on
-        // the receiver's role, so a shadow's message can NEVER be processed as a main's.
-        //
-        // Discriminator = the RUNTIME predicate `this.shadowDriver === newDriver`, NOT the
-        // construction-time `isShadowMode`: a shadow that swaps in keeps its shadow-built closure
-        // but is thereafter the live main (shadowDriver is cleared in _promoteShadowToMain), so
-        // from that point its messages must be handled as a main's. Using the runtime predicate
-        // also corrects a latent case — a post-swap driver emitting an 'error' now takes the main
-        // error path (keep a healthy stream) instead of the shadow path (self-nuke as "Failed
-        // Shadow" without a proper retry).
+        // The three driver signals (rtc_sustained / rtc_failed / rtc_rejected) are OVERLOADED — the
+        // same name means opposite things for a background shadow probe vs the live main. We hard-
+        // dispatch on the receiver's role (_onMainMessage vs _onPreSwapShadowMessage) so a shadow's
+        // message can NEVER be processed as a main's.
+        // PITFALL: the discriminator is the RUNTIME predicate `this.shadowDriver === newDriver`, NOT the
+        // construction-time `isShadowMode`. A shadow that swaps in keeps its shadow-built closure but is
+        // thereafter the live main (shadowDriver is cleared in _promoteShadowToMain), so from that point
+        // its messages must be handled as a main's — including an 'error', which must take the main path
+        // (keep the healthy stream) instead of the shadow path (self-nuke without a proper retry).
         newDriver.onmessage = {
             ui_sync: (msg) => {
                 // [BW INSTRUMENTATION] Metric lines are diagnostic and driver-cadence-gated (3s);
@@ -1984,8 +1478,8 @@ class WebRTCCamera extends HTMLElement {
                 // [MSE PLAYBACK HEALTH] The driver reports whether the ON-SCREEN picture is actually
                 // advancing (flow/stutter/frozen) — the truth the viewer sees, independent of RTC.
                 // MAIN driver only: a shadow's video is hidden, so its playback is not what's shown.
-                // Feeds the network dot (fills the MSE-only gap where the dot used to stay white) and
-                // the HA log (a freeze was previously invisible — socket alive, no band verdict).
+                // Feeds the network dot (the only health signal on an MSE-only session, where no RTC
+                // probe polls so there is no band verdict) and the HA log (a socket-alive freeze).
                 if (msg.type === 'playback') {
                     if (this.shadowDriver === newDriver) return;
                     // Driver heartbeats the verdict every ~2s (keeps the dot fresh); log only when it
@@ -2022,10 +1516,11 @@ class WebRTCCamera extends HTMLElement {
                 originalOnPcVideo.call(newDriver, video);
             }
             
-            // FIX: Only update UI to 'RTC' if the driver actually accepted the stream.
+            // Only flip the UI to 'RTC' if the driver actually holds a peer connection (newDriver.pc):
+            // onpcvideo can fire before the stream is truly accepted.
             if (newDriver.pc) {
-                
-                // [PHANTOM FIX] Also cancel upgrade timer here if spontaneous WebRTC happens
+
+                // Cancel the upgrade timer here too, in case WebRTC came up spontaneously (no probe).
                 if (this._upgradeTimer) {
                     clearTimeout(this._upgradeTimer);
                     this._upgradeTimer = null;
@@ -2546,7 +2041,7 @@ class WebRTCCamera extends HTMLElement {
         const pipIcon = root.querySelector('.pictureinpicture');
 
         // Apply initial icon state — reflect the AUDIBLE (on-screen) element, which during a
-        // promoted RTC stream is the overlay, not the hidden MSE this.video (v14.6.4).
+        // promoted RTC stream is the overlay, not the hidden MSE this.video.
         volBtn.icon = ((this.driver && this.driver.onscreenVideo) || video).muted
             ? 'mdi:volume-mute' : 'mdi:volume-high';
 
@@ -2570,21 +2065,21 @@ class WebRTCCamera extends HTMLElement {
         // A pending delayed spinner must not fire after this UI is torn down/rebuilt.
         signal.addEventListener('abort', clearSpinnerTimer);
 
-        // #913: play/pause toggle. Under `ui: true` the button stays visible (like the other
-        // controls). Driven by the driver's suspend()/resume() (v2.4.4) so it acts on the ON-SCREEN
-        // element, not the hidden MSE one: the old code called video.pause() on this.video, which
-        // during a promoted RTC stream froze the invisible MSE while the visible overlay kept
-        // playing — the icon flipped but the picture didn't stop. The icon is set explicitly here
-        // (the pause may land on _rtcVideo, whose events don't bubble through this.video); the
-        // this.video listeners below still catch external play/pause (fullscreen, PiP).
+        // #913: play/pause toggle, kept visible under `ui: true` like the other controls.
+        // Acts through driver.suspend()/resume() so play/pause hits driver.onscreenVideo — during
+        // a promoted RTC stream the on-screen element is _rtcVideo, not the hidden this.video.
+        // PITFALL: pausing this.video directly would freeze the invisible MSE while the visible
+        // overlay kept playing (icon flips, picture doesn't). The icon is set explicitly because a
+        // pause landing on _rtcVideo does not bubble a 'pause' event through this.video; the
+        // listeners below still catch external play/pause (fullscreen, PiP).
         const onScreen = () => (this.driver && this.driver.onscreenVideo) || video;
         playBtn.icon = onScreen().paused ? 'mdi:play' : 'mdi:pause';
         video.addEventListener('play', () => { playBtn.icon = 'mdi:pause'; }, {signal});
         video.addEventListener('pause', () => { playBtn.icon = 'mdi:play'; }, {signal});
         video.addEventListener('loadeddata', () => volBtn.style.display = this.hasAudio ? 'block' : 'none', {signal});
-        // Reflect the on-screen (audible) element, not this.video: during promoted RTC the driver
-        // force-mutes this.video to kill echo, so reading video.muted here would show 'mute' while
-        // the overlay is actually audible (v14.6.4). External changes (fullscreen) still fire here.
+        // Reflect the on-screen (audible) element, not this.video. PITFALL: during promoted RTC the
+        // driver force-mutes this.video to kill echo, so reading this.video.muted here would show
+        // 'mute' while the overlay is actually audible. External changes (fullscreen) still fire here.
         video.addEventListener('volumechange', () => {
              volBtn.icon = onScreen().muted ? 'mdi:volume-mute' : 'mdi:volume-high';
         }, {signal});
@@ -2596,11 +2091,11 @@ class WebRTCCamera extends HTMLElement {
             const {icon} = ev.target;
             if (icon === 'mdi:play') { this.driver.resume(); playBtn.icon = 'mdi:pause'; }
             else if (icon === 'mdi:pause') { this.driver.suspend(); playBtn.icon = 'mdi:play'; }
-            // Route through the driver so it mutes the ON-SCREEN element and records the desired
-            // state in _mseWanted, which promote/commit/revert restore (v14.6.4). Old code set
-            // this.video.muted directly — muted the hidden MSE during a promoted RTC stream, and
-            // the next handoff overwrote the choice. Icon is set explicitly (the mute may land on
-            // _rtcVideo, whose volumechange doesn't bubble through this.video).
+            // Route through driver.setMuted so it mutes the ON-SCREEN element and records the
+            // desired state in _mseWanted, which promote/commit/revert restore across handoffs.
+            // PITFALL: setting this.video.muted directly mutes the hidden MSE during a promoted RTC
+            // stream and the next handoff overwrites the choice. Icon is set explicitly because a
+            // mute landing on _rtcVideo does not bubble 'volumechange' through this.video.
             else if (icon === 'mdi:volume-mute') { this.driver.setMuted(false); volBtn.icon = 'mdi:volume-high'; }
             else if (icon === 'mdi:volume-high') { this.driver.setMuted(true); volBtn.icon = 'mdi:volume-mute'; }
             else if (icon === 'mdi:floppy') this.saveScreenshot();
@@ -2661,14 +2156,12 @@ class WebRTCCamera extends HTMLElement {
         // UI-only liveness dot. Uses requestVideoFrameCallback (fires per PRESENTED frame, so it
         // also catches a silent freeze that emits no 'waiting') plus a 500ms watchdog.
         //
-        // v14.6.3 FIX: bind to the driver's `onscreenVideo` (the element actually on screen), not
-        // this.driver.video. During a promoted RTC stream the pixels come from the overlay
-        // (_rtcVideo) while the MSE this.video is hidden and no longer fed — the old code watched
-        // that stalled MSE element and drove the dot RED on a perfectly live RTC stream. It also
-        // never recovered: the commit swaps this.video.srcObject on the SAME element, which cancels
-        // the pending rVFC, so beat stopped re-arming. arm() now re-targets whenever the on-screen
-        // element changes (promote/commit/revert) AND re-arms after a same-element source swap, so
-        // the chain survives every handoff transition.
+        // arm() binds the rVFC to driver.onscreenVideo — the element actually on screen — and
+        // re-targets on every handoff transition. PITFALL: binding to this.video would drive the
+        // dot RED during a promoted RTC stream, where the pixels come from the _rtcVideo overlay
+        // while the hidden this.video is stalled and no longer fed. PITFALL: the commit swaps
+        // srcObject on the SAME on-screen element, which cancels the outstanding rVFC; without the
+        // loadeddata re-arm below the beat would stop and never recover.
         if (this._liveTimer) { clearInterval(this._liveTimer); this._liveTimer = null; }
         if (this.config.live_indicator === true) {
             const dot = root.querySelector('.live-dot');
@@ -2730,8 +2223,8 @@ class WebRTCCamera extends HTMLElement {
     //   • the narrow-link SUPPRESSION latch → red (MSE-only forced; strong "network bad");
     //   • the RTC band verdict (perf/degr/path) parsed off the metrics line — only while a probe polls;
     //   • the MSE PLAYBACK verdict (flow/stutter/frozen) — the on-screen currentTime-advance, which is
-    //     the ONLY signal on an MSE-only session (no probe → no band) and the one that caught the
-    //     "socket alive but picture frozen" case that used to leave the dot white when it was worst.
+    //     the ONLY signal on an MSE-only session (no probe → no band) and catches the
+    //     "socket alive but picture frozen" case that band metrics alone miss.
     // Severity: white(0) < green(1) < yellow(2) < red(3). No class → white. No-op if the dot is absent.
     _paintNetDot() {
         const dot = this.shadowRoot && this.shadowRoot.querySelector('.net-dot');

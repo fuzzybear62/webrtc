@@ -270,7 +270,8 @@ class WebSocketView(HomeAssistantView):
         if "poster" in params:
             return await ws_poster(hass, params)
 
-        # FIX: Added heartbeat=30 to kill zombie connections that fail to send FIN packet
+        # heartbeat=30: ping every 30s so a client that dies without sending a FIN
+        # (mobile tab killed, network dropped) is reaped instead of lingering as a zombie.
         ws_server = web.WebSocketResponse(autoclose=False, autoping=False, heartbeat=30)
         ws_server.set_cookie(HLS_COOKIE, HLS_SESSION)
         await ws_server.prepare(request)

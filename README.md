@@ -27,6 +27,7 @@ the [go2rtc](https://github.com/AlexxIT/go2rtc) streaming server.
 * [Custom card](#custom-card)
 * [Fork card options](#fork-card-options)
 * [Diagnostic sensors](#diagnostic-sensors)
+* [Upstream issues & PRs addressed](#upstream-issues--prs-addressed)
 * [Templates](#templates)
 * [Two-way audio](#two-way-audio)
 * [Snapshots to Telegram](#snapshots-to-telegram)
@@ -82,6 +83,38 @@ behaviour; you never need them to benefit from it.
 Unlike upstream, this fork also **creates two diagnostic sensors** so you can watch, at a glance, how
 many cameras are streaming and whether the background upgrade path is working — see
 [Diagnostic sensors](#diagnostic-sensors).
+
+### Keeping the picture alive: sustained sessions & weak links
+
+The reversible upgrade above is about *reaching* the fast path. The second half of this fork is about
+*staying up* — keeping a picture on screen through hours-long sessions and through genuinely bad
+networks (a phone on 4G, several cameras sharing one saturated uplink, a Wi-Fi repeater that drops
+packets). **All of this is automatic and needs no configuration** — the options in
+[Fork card options](#fork-card-options) only *tune* it; a plain card gets all of it.
+
+- **A congested MSE stream is nursed, not killed.** Upstream tears the WebSocket down after a fixed
+  no-data timeout and reconnects — which, on an already-saturated link, just adds load and can spiral
+  into a reconnect storm across every camera on the page. This fork instead **measures the link** and,
+  while it is congested, *extends* the patience window and rides out short blackouts (a grid brown-out,
+  a repeater hiccup) rather than reconnecting. A stream that is merely slow is left alone; only a stream
+  that is genuinely dead is reaped.
+- **A frozen-but-fed picture is nudged back to live** instead of being torn down. If the socket is
+  still delivering bytes but the picture has stalled at the buffer edge, the card seeks it to the live
+  edge — a non-destructive recovery that avoids a full reconnect.
+- **Weak mobile links are protected from the upgrade itself.** On a narrow link, the background WebRTC
+  probe (and its keep-warm MSE) is *additive* uplink load that can starve the very MSE feed you are
+  watching. If the fork sees a camera repeatedly reach for WebRTC and fall back, it **latches that
+  camera to MSE-only** for a while, stopping the probing that was doing the harm. It re-tests later; a
+  healthy link never triggers the latch.
+- **Cameras cooperate instead of competing.** WebRTC probes across all cameras on the page are
+  **serialized** through a shared gate, so a wall of tiles doesn't fire a dozen simultaneous
+  negotiations into one uplink. And if any camera's probe reveals the *path itself* is blacked out, RTC
+  is briefly suppressed **grid-wide** so the others don't repeat the same doomed attempt.
+
+The net effect: on a clean LAN you get seamless sub-second WebRTC; on a pathological link you get a
+stubborn, self-throttling MSE picture that stays up instead of flickering — from the **same card, with
+no per-network tuning.** The full list of upstream bugs and PRs this fork folds in is in
+[Upstream issues & PRs addressed](#upstream-issues--prs-addressed).
 
 ## go2rtc
 
@@ -618,6 +651,58 @@ cameras are closed).
   commits to WebRTC eventually closes its proxy connection (the video then flows peer-to-peer, off the
   proxy), so a committed-WebRTC tile can read as **0** here even though you can see it — that is
   expected.
+
+## Upstream issues & PRs addressed
+
+Upstream [AlexxIT/WebRTC](https://github.com/AlexxIT/WebRTC) has not merged a PR or triaged an issue in
+roughly nine months. This fork carries fixes for the outstanding reports that matter in production. The
+table below summarizes each upstream report and how this fork resolves it.
+
+Status legend: **fixed** (root-caused and resolved here) · **mitigated** (symptom removed; root cause is
+outside the card, e.g. a codec limit) · **already immune** (fork's modern code never had the bug).
+
+### Crashes & stream stability
+
+| Upstream | Symptom | In this fork |
+|---|---|---|
+| [#886](https://github.com/AlexxIT/WebRTC/issues/886), [#901](https://github.com/AlexxIT/WebRTC/issues/901), [#933](https://github.com/AlexxIT/WebRTC/issues/933), PR [#938](https://github.com/AlexxIT/WebRTC/pull/938) | `InvalidStateError` / constant buffering & freezing on Safari and multi-camera dashboards | **fixed** — the whole MSE `updateend` block (including the unguarded `sb.buffered` access upstream leaves exposed) is wrapped so a teardown race can't throw. |
+| [#910](https://github.com/AlexxIT/WebRTC/issues/910), [#884](https://github.com/AlexxIT/WebRTC/issues/884) | ~1 frame / 3 s crawl on iOS 26.1 after upstream 3.6→3.6.1 | **fixed** — removed the inherited live-sync `playbackRate` catch-up whose 0.1× floor pins the picture near the live edge on iOS WebKit; MSE plays at 1×, buffer trim kept. |
+| [#871](https://github.com/AlexxIT/WebRTC/issues/871) | Black screen when WebRTC can't re-init after an MSE switch | **mitigated** — root cause is a real codec limit (H265/AAC can't traverse WebRTC); the fork removes the *symptom* by reverting to the warm MSE stream instead of leaving a frozen overlay. |
+
+### Home Assistant compatibility regressions
+
+| Upstream | Symptom | In this fork |
+|---|---|---|
+| [#897](https://github.com/AlexxIT/WebRTC/issues/897) | `cannot import name 'SUPPORT_PLAY_MEDIA'` breaks the `media_player` platform on HA 2025.11 | **already immune** — uses the modern `MediaPlayerEntityFeature.PLAY_MEDIA` enum, no `SUPPORT_*` imports. |
+| [#926](https://github.com/AlexxIT/WebRTC/issues/926), [#927](https://github.com/AlexxIT/WebRTC/issues/927), [#930](https://github.com/AlexxIT/WebRTC/issues/930) | `'LovelaceData' object is not subscriptable` on HA 2026.2 | **already immune** — dual-path resource lookup handles both the old dict and the new `LovelaceData` object. |
+
+### Networking, auth & ICE
+
+| Upstream | What it adds / fixes | In this fork |
+|---|---|---|
+| PR [#956](https://github.com/AlexxIT/WebRTC/pull/956) | Reject invalid/expired stream signatures with **403, not 401**, so HA's login-ban middleware can't IP-ban a reconnecting client | **fixed** — matters more here than upstream: the aggressive shadow + re-probe reconnect pattern makes a 401-triggered self-ban far likelier. |
+| PR [#961](https://github.com/AlexxIT/WebRTC/pull/961) | Guard `ws_poster` against a `None` image (TypeError) | **fixed**. |
+| PR [#923](https://github.com/AlexxIT/WebRTC/pull/923) | Use the ICE servers Home Assistant already configures (incl. rotating Nabu Casa TURN) | **fixed**, reimplemented as pure JS via HA's native `web_rtc/ice_servers` WS command — no fragile internal Python import. The only way to use rotating Nabu Casa TURN credentials. See [`ice_servers`](#browser-side-ice-servers-ice_servers). |
+| [#952](https://github.com/AlexxIT/WebRTC/issues/952) | Browser-side configurable `ice_servers` (your own STUN/TURN) | **fixed** — see [`ice_servers`](#browser-side-ice-servers-ice_servers). |
+| [#915](https://github.com/AlexxIT/WebRTC/issues/915) | Default STUN unreachable for some users | **fixed** — the built-in default now offers **two** independent public STUN servers (Google + Cloudflare) so a single blocked provider isn't fatal. |
+
+### Card & media-player features folded in
+
+| Upstream | Feature | In this fork |
+|---|---|---|
+| PR [#668](https://github.com/AlexxIT/WebRTC/pull/668) | `tap_action` on the video | **integrated** (and corrected to actually dispatch the action from a standalone card) — see [Card UI additions](#card-ui-additions-tap_action-and-live_indicator). Note the stream-based caveat there. |
+| PR [#922](https://github.com/AlexxIT/WebRTC/pull/922) | `live_indicator` liveness dot | **integrated** (visual dot only) — see [Card UI additions](#card-ui-additions-tap_action-and-live_indicator). |
+| PR [#951](https://github.com/AlexxIT/WebRTC/pull/951) | Fall back to muted autoplay only on `NotAllowedError` | **integrated** — other play errors are logged, not silently muted. |
+| PR [#942](https://github.com/AlexxIT/WebRTC/pull/942) | Fix `media_player.play_media` via go2rtc `/api/ffmpeg` | **integrated** — removes the misleading "can't find consumer" on codec mismatch. |
+| PR [#945](https://github.com/AlexxIT/WebRTC/pull/945) | `media_player` `volume_entity` | **integrated**. |
+| PR [#940](https://github.com/AlexxIT/WebRTC/pull/940) | `fire-dom-event` from `shortcuts` | **integrated**. |
+| [#932](https://github.com/AlexxIT/WebRTC/issues/932) | `"webrtc-camera" has already been used` on double load | **fixed** — the card's `customElements.define` is now guarded (this was a fork-side bug too). |
+| PR [#916](https://github.com/AlexxIT/WebRTC/pull/916) | Update go2rtc to 1.9.13 | **superseded** — fork ships go2rtc 1.9.14. |
+
+A few niche upstream PRs ([#890](https://github.com/AlexxIT/WebRTC/pull/890) per-stream icons,
+[#954](https://github.com/AlexxIT/WebRTC/pull/954), [#622](https://github.com/AlexxIT/WebRTC/pull/622))
+are deferred or declined as niche or fragile. Because these are upstream reports on a repository
+this fork does not own, "fixed" means *fixed here* — the fork cannot close them on GitHub.
 
 ## Templates
 
