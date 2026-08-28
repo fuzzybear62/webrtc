@@ -928,20 +928,43 @@ Events are emitted at rationalized levels — recoverable anomalies at `warning`
 routine lifecycle at `debug` (filtered out unless you ask for it). This is the same discipline the browser
 console follows (`console.warn`/`console.error` show by default; `console.debug` needs "Verbose").
 
-**What it logs** (logger `custom_components.webrtc.card`, one line per event, prefixed with the camera `url`):
+**What it logs** (logger `custom_components.webrtc.card`, one line per event, prefixed with the camera `url`).
+Events that signal a real anomaly are emitted at **`warning`** (shown by default); routine lifecycle and
+telemetry are at **`debug`** (filtered out until you lower the level).
 
-| Event | Level | Meaning |
-|---|---|---|
-| `connection-closed` | warning | The stream dropped. The reason is included: `ws-close` (server/network closed the socket), `no-data-watchdog` (the picture froze — 5s of silence with the socket still open, the classic weak-link symptom), or `ws-error`. |
-| `driver-error` | warning | go2rtc reported an error (e.g. `no route to host`, `i/o timeout`). Recoverable — the retry loop handles it. |
-| `retry` | debug | A reconnect was scheduled, with the attempt number and back-off delay. |
-| `stream-up` | debug | The stream (re)connected, with the transport (`mse` / `webrtc` / …). |
-| `mode` | debug | A mode transition, e.g. `mse -> rtc` (the background WebRTC upgrade succeeded) or `rtc -> mse` (RTC stalled and reverted). This is the **only** app-visible signal that a camera reached — or fell back from — WebRTC: `stream-up` only reports the *initial* transport, while the shadow swap and direct-RTC upgrades happen later. |
-| `page-hidden` / `page-visible` | debug | The tab/app went to the background or came back. **Key for mobile:** if losses line up with `page-hidden`, the app is being backgrounded (or handing off 5G↔Wi-Fi), not a camera fault. |
-| `auto-pause` / `auto-resume` | debug | Only with `background: false` — the card tore down / restarted a scrolled-away camera. |
+*Anomalies — `warning` level, visible by default:*
+
+| Event | Meaning |
+|---|---|
+| `connection-closed` | The stream dropped. The reason is included: `ws-close` (server/network closed the socket), `no-data-watchdog` (the picture froze — silence with the socket still open, the classic weak-link symptom), or `ws-error`. |
+| `driver-error` | go2rtc reported an error (e.g. `no route to host`, `i/o timeout`). Recoverable — the retry loop handles it. |
+| `rtc-revert` | A promoted WebRTC feed stalled and the card fell back to the warm MSE stream. Detail carries the reason. Frequent reverts on one camera = a WebRTC path that connects but can't sustain. |
+| `rtc-suppressed` | WebRTC probing was suppressed because the *path itself* is blacked out — either this camera aborted on a sustained bad band, or another camera tripped the **grid-wide** suppression. The tile stays on MSE until the window elapses. |
+| `mse-playback` (frozen) | The MSE picture stalled at the buffer edge (frozen-but-fed). Emitted at `warning` only for the `frozen` state; the paired recovery is `mse-rideout`. |
+| `mse-rideout` | Non-destructive recovery: a frozen-but-fed picture was seeked back to the live edge instead of reconnecting. |
+| `ice-config` | Your `ice_servers` config had no valid entries and was ignored (falling back to the defaults). |
+
+*Lifecycle & telemetry — `debug` level, needs the override below:*
+
+| Event | Meaning |
+|---|---|
+| `stream-up` | The stream (re)connected, with the transport (`mse` / `webrtc` / …). |
+| `mode` | A mode transition, e.g. `mse -> rtc` (background WebRTC upgrade succeeded) or `rtc -> mse` (RTC reverted). The **only** app-visible signal that a camera reached — or fell back from — WebRTC: `stream-up` reports only the *initial* transport, while the shadow swap and direct-RTC upgrades happen later. |
+| `retry` | A reconnect was scheduled, with the attempt number and back-off delay. |
+| `stream-stable` | The stream cleared its probation window and is considered healthy. |
+| `rtc-flap` | A camera reached WebRTC and reverted repeatedly; the fork is about to latch it to MSE-only (the weak-link protection). |
+| `rtc-retest` | A suppression / MSE-only window elapsed and full WebRTC mode is being re-tested. |
+| `ws-bursty` / `ws-reap` | Byte-aware watchdog milestones on a narrow link: the self-measured inter-chunk gap grew (`ws-bursty` armed) or a warm socket was extended/reaped (`ws-reap`). Pure diagnostics for storm analysis. |
+| `metrics` | Periodic link sample — the measured bandwidth band and congestion estimate the resilience stack is acting on. |
+| `mse-playback` (non-frozen) | Routine MSE playback-health transitions (e.g. back to `playing`). |
+| `ice` / `ice-ha` | Which ICE servers were used (`ice`) and how many Home Assistant supplied (`ice-ha`). |
+| `page-hidden` / `page-visible` | The tab/app went to the background or came back. **Key for mobile:** if losses line up with `page-hidden`, the app is being backgrounded (or handing off 5G↔Wi-Fi), not a camera fault. |
+| `auto-pause` / `auto-resume` | Only with `background: false` — the card tore down / restarted a scrolled-away camera. |
 
 Repeated identical events are **throttled**: the first logs immediately, further ones in a 10-second
 window are counted and flushed once as `(repeated N× in 10s)`, so a flapping camera can't flood the log.
+(The `ws-bursty` / `ws-reap` telemetry pair is exempt from the name-throttle so an arm and its reap, seconds
+apart, both land.)
 
 The card's events log under their **own** sub-logger, `custom_components.webrtc.card`, separate from the
 integration's backend logger `custom_components.webrtc`. The two `warning` events (`connection-closed`,
@@ -967,6 +990,39 @@ with no configuration. If you also want the surrounding lifecycle, add the
 then watch the log. A run of `connection-closed: no-data-watchdog` → `retry` → `stream-up` is the network
 dropping and the card recovering; the same run *immediately after* a `page-hidden` points at the app
 backgrounding instead.
+
+### Browser console (where a console exists)
+
+On desktop and Android Chrome you also have the **browser console**, which carries far more detail than the
+HA mirror — the driver's per-connection state machine, WebRTC phase transitions and the congestion stack.
+(The HA-app WebView has no console; that is exactly why the mirror above exists. Use the console when you
+*can* — it is the richer surface — and the HA log when you can't.)
+
+Instrumentation is split across **two prefixes**, so you can filter the console on either:
+
+- **`[WebRTC Camera] …`** — the **card**: version banner, cold-start vs shadow decisions, shadow-swap /
+  direct-RTC upgrades, hard resets, auto-pause/resume, auth failures.
+- **`[VideoRTC:<clientId>] …`** — the **driver**, one instance per connection (`<clientId>` is a short id;
+  during a shadow upgrade you will see **two** ids — the visible MSE driver and the background probe — which
+  is how you tell the shadow apart from the live stream). Carries: `Mode: MSE/WebRTC/MJPEG/HLS/MP4`, RTC
+  phase transitions (`RTC phase X -> Y`), `RTC promoted … MSE kept warm` / `RTC stable … committing` /
+  `reverting to warm MSE`, the `No-data watchdog fired (…ms silent, phase=…, cong=…)` line, `MSE ride-out
+  reseek …`, `ICE Error` / `SDP Error`, and the shared **probe-gate** / **MSE-reap grid latch** messages
+  (`RTC probe gate SUPPRESSED grid-wide …`, `MSE-reap grid latch ENGAGED …`).
+
+Console **level maps to severity the same way as the HA mirror**: `console.warn` / `console.error` (real
+anomalies, auth failures) show at the default level; the routine lifecycle uses `console.debug`, which most
+browsers hide until you enable **Verbose** (Chrome DevTools → Console → Levels ▾ → Verbose). So:
+
+1. First confirm the banner **`[WebRTC Camera] v14.16.0`** (info). If the version is old after an update,
+   the service worker served a stale bundle — hard-reload (Cmd/Ctrl+Shift+R). See
+   [the cache note in Debug](#debug).
+2. To watch a mode/upgrade play out, enable **Verbose** and filter on `VideoRTC` (driver) or `WebRTC Camera`
+   (card). A healthy upgrade reads: `Mode: MSE` → `RTC promoted … MSE kept warm` → `RTC stable … committing`;
+   a rejected one ends `RTC Rejected (Priority < MSE) — staying on MSE` or `reverting to warm MSE`.
+
+There is **no debug card option** on the console side either — the levels are the only switch, exactly as
+in the browser's own convention. Nothing needs to be enabled in the card config.
 
 ## Companion add-on: cameras behind Wi-Fi repeaters (`no route to host`)
 
