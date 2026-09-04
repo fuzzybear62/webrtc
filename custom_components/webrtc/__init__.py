@@ -155,10 +155,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry):
-    server = hass.data[DOMAIN]
+    server = hass.data.get(DOMAIN)
+    # Only the managed-binary path forwarded the SENSOR platform; unload it
+    # symmetrically so a reload does not hit "already been setup!".
+    unload_ok = True
     if isinstance(server, Server):
+        unload_ok = await hass.config_entries.async_unload_platforms(
+            entry, [Platform.SENSOR]
+        )
         server.stop()
-    return True
+    return unload_ok
 
 
 async def ws_connect(hass: HomeAssistant, params: dict) -> str:

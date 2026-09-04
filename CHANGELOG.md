@@ -8,6 +8,16 @@ upstream integration without touching your config entry, entity IDs, or dashboar
 The format follows [Keep a Changelog](https://keepachangelog.com/). Detailed per-version engineering
 notes are maintained privately and are intentionally not part of the public tree.
 
+## [14.16.1] — 2026-09-04
+
+### Fixed
+
+- **Reloading the integration no longer crashes with "Config entry … for webrtc.sensor has already
+  been setup!".** The managed-go2rtc path forwards a diagnostic `sensor` platform on setup but the
+  unload handler never removed it, so the next setup (any reload — options change, HACS update, or a
+  manual reload while a camera was unreachable) re-forwarded onto the still-registered platform and
+  raised. Unload is now symmetric with setup and reloads cleanly.
+
 ## [14.16.0] — 2026-08-28 — first public release
 
 First public release of the fork. To migrate: remove the AlexxIT/WebRTC source in HACS, add
