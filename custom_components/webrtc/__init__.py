@@ -278,7 +278,13 @@ class WebSocketView(HomeAssistantView):
 
         # heartbeat=30: ping every 30s so a client that dies without sending a FIN
         # (mobile tab killed, network dropped) is reaped instead of lingering as a zombie.
-        ws_server = web.WebSocketResponse(autoclose=False, autoping=False, heartbeat=30)
+        # compress=False: fMP4/H.264 is already compressed, so permessage-deflate only burns
+        # executor CPU; worse, aiohttp shields async-compressed sends (>5KB), and cancelling the
+        # relay on teardown leaves the shielded write to fail on the closing transport, logged
+        # as "Error doing job: ClientConnectionResetError exception in shielded future".
+        ws_server = web.WebSocketResponse(
+            autoclose=False, autoping=False, heartbeat=30, compress=False
+        )
         ws_server.set_cookie(HLS_COOKIE, HLS_SESSION)
         await ws_server.prepare(request)
 

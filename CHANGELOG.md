@@ -8,6 +8,18 @@ upstream integration without touching your config entry, entity IDs, or dashboar
 The format follows [Keep a Changelog](https://keepachangelog.com/). Detailed per-version engineering
 notes are maintained privately and are intentionally not part of the public tree.
 
+## [14.16.2] — 2026-09-24
+
+### Fixed
+
+- **No more `Error doing job: ClientConnectionResetError exception in shielded future` in the HA
+  log when a stream closes.** The browser-side stream websocket negotiated permessage-deflate, so
+  every video chunk was deflate-compressed in an executor behind an `asyncio.shield`; when the card
+  closed (view switch, app closed, network drop) the relay was cancelled but the shielded write
+  still ran against the closing connection and raised an unretrieved error. Compression is now
+  disabled on the stream websocket — the video is already compressed, so this also saves the CPU
+  that was spent deflating it for no gain.
+
 ## [14.16.1] — 2026-09-04
 
 ### Fixed
