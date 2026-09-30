@@ -8,6 +8,24 @@ upstream integration without touching your config entry, entity IDs, or dashboar
 The format follows [Keep a Changelog](https://keepachangelog.com/). Detailed per-version engineering
 notes are maintained privately and are intentionally not part of the public tree.
 
+## [14.17.0] — 2026-09-30
+
+### Changed
+
+- **A card hidden by the dashboard stops streaming, even with `background: true`.** A visibility
+  condition (or a conditional card) hides the card with `display:none` but keeps it mounted, so it
+  kept retrying its source forever — e.g. cameras on a power line that is switched off, flooding the
+  log every ~15s. The card now watches its own layout: at zero width it pauses (same teardown as the
+  `background: false` auto-pause, after the usual 5s debounce) and restarts on its own as soon as the
+  dashboard shows it again, wherever it is on the page. Scrolling away or backgrounding the app is
+  unchanged: with `background: true` the stream keeps running, as before.
+- **An unreachable source is logged on the transition, not on every attempt.** When a stream never
+  comes up (camera off / unreachable), the card logs one `source-unreachable` WARNING after about two
+  failed attempts, drops the per-attempt `driver-error` / `connection-closed` lines to debug, and logs
+  one `source-back` INFO (with the outage length) when the stream lands. The retry cadence is
+  unchanged, so a camera that comes back is picked up within the normal backoff (≤ ~30s).
+  Multi-line errors (ffmpeg stderr) are compacted to their first and last line.
+
 ## [14.16.2] — 2026-09-24
 
 ### Fixed

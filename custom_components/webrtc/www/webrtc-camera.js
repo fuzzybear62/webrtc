@@ -182,6 +182,17 @@ class WebRTCCamera extends HTMLElement {
         this._pauseTimer = null;   // debounce so a quick scroll/flick doesn't tear down
         this._io = null;           // IntersectionObserver instance
         this._visAbort = null;     // AbortController for the document visibilitychange listener
+        // [HIDDEN-PAUSE] Card laid out at zero width = hidden by the dashboard (a visibility
+        // condition / conditional card sets display:none on an ancestor but keeps the card mounted).
+        // Watched by a ResizeObserver in EVERY mode, `background: true` included.
+        this._layoutHidden = false;
+        this._ro = null;           // ResizeObserver on the ha-card
+
+        // [SOURCE-DOWN LOG] Transition-only logging for a source that never comes up (camera
+        // powered off / unreachable). The retry cadence is untouched — only the log level changes.
+        this._sourceDown = false;  // WARNING already emitted, still down
+        this._downFails = 0;       // pre-healthy failures since the last stream-up
+        this._downSince = 0;       // Date.now() of the first of those failures
 
         // [DEBUG LOGGING] Dedup state for the opt-in Home Assistant server-side log. null until
         // the first _logHA() call. Keyed by event name → {last, count, level, detail, timer}.
@@ -190,7 +201,7 @@ class WebRTCCamera extends HTMLElement {
         // (correlates stream loss with the mobile app backgrounding / 5G handoff).
         this._logVisAbort = null;
 
-        console.info('[WebRTC Camera] v14.16.0');
+        console.info('[WebRTC Camera] v14.17.0');
     }
 
     setConfig(config) {
@@ -261,15 +272,32 @@ class WebRTCCamera extends HTMLElement {
         this._setupDebugVisibilityLog();
     }
 
-    // [AUTO-PAUSE] Wire (or re-wire) the off-screen + tab-hidden observers.
-    // Only active when the user opts in with `background: false`; otherwise the
-    // stream runs 24/7 as before. Fully idempotent so a live config edit or a
-    // re-attach never stacks duplicate observers/listeners.
+    // [AUTO-PAUSE] Wire (or re-wire) the visibility observers. Fully idempotent so a live
+    // config edit or a re-attach never stacks duplicate observers/listeners.
+    //  - ALWAYS: [HIDDEN-PAUSE] a ResizeObserver on the ha-card. Zero width = the dashboard hid
+    //    the card (display:none on an ancestor); pausing then costs no reactivity, since nothing
+    //    is on screen, and stops a hidden card retrying a powered-off source forever. It fires
+    //    on the 0 <-> width transition regardless of scroll position, so the stream resumes as
+    //    soon as the card is shown again, even below the fold.
+    //  - `background: false` only: off-screen (IntersectionObserver) + tab-hidden pause.
+    //    `background: true` (default) keeps streaming while scrolled away / backgrounded.
     _setupVisibility() {
         // Always clear any previous wiring first.
         this._teardownVisibility();
 
-        // Opt-in only. `background: true` (default) => never auto-pause.
+        const card = this.shadowRoot && this.shadowRoot.querySelector('.card');
+        if (card && typeof ResizeObserver !== 'undefined') {
+            this._ro = new ResizeObserver((entries) => {
+                const e = entries[entries.length - 1];
+                const hidden = e.contentRect.width === 0;
+                if (hidden === this._layoutHidden) return;
+                this._layoutHidden = hidden;
+                this._evaluateVisibility();
+            });
+            this._ro.observe(card);
+        }
+
+        // Off-screen / tab-hidden pause: opt-in only.
         if (this.config.background !== false) return;
 
         // Off-screen detection on the host element. `intersection` (0..1) is the
@@ -297,6 +325,10 @@ class WebRTCCamera extends HTMLElement {
     }
 
     _teardownVisibility() {
+        if (this._ro) {
+            this._ro.disconnect();
+            this._ro = null;
+        }
         if (this._io) {
             this._io.disconnect();
             this._io = null;
@@ -314,7 +346,9 @@ class WebRTCCamera extends HTMLElement {
     // [AUTO-PAUSE] Decide whether the stream should be running and act on it,
     // debounced so a quick scroll-past or tab flick never tears the stream down.
     _evaluateVisibility() {
-        const shouldStream = !this._docHidden && !this._offScreen;
+        // _docHidden/_offScreen only ever turn true under `background: false` (their observers
+        // are opt-in); _layoutHidden applies in every mode.
+        const shouldStream = !this._layoutHidden && !this._docHidden && !this._offScreen;
 
         if (shouldStream) {
             // Became watchable again: cancel any pending pause, resume if paused.
@@ -340,8 +374,9 @@ class WebRTCCamera extends HTMLElement {
     // burning bandwidth and hold the decoder.
     _pauseStream() {
         if (this._paused) return;
-        console.debug('[WebRTC Camera] Auto-pause: off-screen/hidden, tearing down stream');
-        this._logHA('debug', 'auto-pause', 'off-screen/hidden');
+        const why = this._layoutHidden ? 'hidden by dashboard' : 'off-screen/hidden';
+        console.debug(`[WebRTC Camera] Auto-pause: ${why}, tearing down stream`);
+        this._logHA('debug', 'auto-pause', why);
         this._paused = true;
 
         // Kill every pending timer so nothing revives the stream while paused.
@@ -822,7 +857,9 @@ class WebRTCCamera extends HTMLElement {
         switch (msg.type) {
             case 'error':
                 console.warn(`[WebRTC Camera] Main Driver Error: ${msg.value}`);
-                this._logHA('warning', 'driver-error', msg.value);
+                this._logHA(this._sourceDown ? 'debug' : 'warning', 'driver-error',
+                    this._compactError(msg.value));
+                if (!this._streamHealthy) this._noteSourceFailure(msg.value);
                 // Show a localized generic to the user; keep the raw reason in the console (above)
                 // and the tooltip. The raw strings ("no route to host", "i/o timeout") are noise
                 // on-screen and, arriving in bursts on a flaky path, made the status flicker.
@@ -871,8 +908,39 @@ class WebRTCCamera extends HTMLElement {
                 // now sizes the card) and log the recovery.
                 this._unlockHeight();
                 this._logHA('debug', 'stream-up', msg.type);
+                this._noteSourceUp();
                 break;
         }
+    }
+
+    // [SOURCE-DOWN LOG] Collapse a multi-line driver error (ffmpeg dumps its whole stderr) to
+    // "first line … last line": the stage that failed + the actual cause.
+    _compactError(value) {
+        const lines = String(value).split('\n').map((l) => l.trim()).filter(Boolean);
+        return lines.length > 1 ? `${lines[0]} … ${lines[lines.length - 1]}` : (lines[0] || '');
+    }
+
+    // [SOURCE-DOWN LOG] A failure before the stream ever came up. One attempt fails in several
+    // pieces (mse error, webrtc/offer error, ws-close), so the WARNING fires after a few pieces
+    // (≈ 2 attempts), not on a single transient miss. From then on the per-attempt events drop
+    // to debug until _noteSourceUp. Retry/backoff is NOT affected: resume latency stays the
+    // normal backoff (≤ ~30s), which is what the log reduction must not trade away.
+    _noteSourceFailure(detail) {
+        if (this._downFails === 0) this._downSince = Date.now();
+        this._downFails++;
+        if (this._sourceDown || this._downFails < 3) return;
+        this._sourceDown = true;
+        this._logHA('warning', 'source-unreachable',
+            `${this._compactError(detail)} — retrying quietly until it is back`);
+    }
+
+    _noteSourceUp() {
+        if (this._sourceDown) {
+            const secs = Math.round((Date.now() - this._downSince) / 1000);
+            this._logHA('info', 'source-back', `stream up after ${secs}s`);
+        }
+        this._sourceDown = false;
+        this._downFails = 0;
     }
 
     // [RESILIENCE] Attach the main driver's connection-closed → global retry handler.
@@ -885,7 +953,8 @@ class WebRTCCamera extends HTMLElement {
         const handler = (e) => {
             const reason = (e && e.detail && e.detail.reason) || 'closed';
             console.warn(`[WebRTC Camera] Main Driver Connection Closed (${reason})`);
-            this._logHA('warning', 'connection-closed', reason);
+            this._logHA(this._sourceDown ? 'debug' : 'warning', 'connection-closed', reason);
+            if (!this._streamHealthy) this._noteSourceFailure(`connection closed (${reason})`);
             this._scheduleRetry();
         };
         driver._connClosedHandler = handler;
